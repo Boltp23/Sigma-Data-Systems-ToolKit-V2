@@ -1795,6 +1795,9 @@ function Invoke-ProfileRebuild {
                 Write-Host '  Network (server) redirection: the files are on the server. The new profile gets them back when the folder-redirection' -ForegroundColor Cyan
                 Write-Host '  Group Policy applies - user on the office network, gpupdate /force, then sign out/in (can take 2 sign-ins).' -ForegroundColor Cyan
                 Write-Host '  Do NOT clear the Offline Files (CSC) cache - it may hold changes not yet synced to the server (check Sync Center).' -ForegroundColor DarkYellow
+                $newSid = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.LocalPath -ieq $dst }).SID
+                if ($newSid) { $null = Show-FolderRedirectionSource -Sid $newSid -Account (Split-Path $dst -Leaf) }
+                Write-Host '  If the redirection is NOT wanted: stop the GPO for this user first, then use "Folder redirection - point back to local".' -ForegroundColor Cyan
             }
             if ($redirTargets | Where-Object { $_.Target -match 'OneDrive' }) { Write-Host '  OneDrive redirection: sign the user in to OneDrive and turn on folder backup - files re-sync from the cloud.' -ForegroundColor Cyan }
         }
@@ -1866,6 +1869,83 @@ function Invoke-ProfileRebuild {
     }
 }
 
+function Get-FolderRedirectionSource {
+    # Finds which GPO(s) redirect folders for a user and WHICH GROUP grants them "Apply group policy".
+    # Uses only ADSI + SYSVOL (no RSAT / GroupPolicy module needed). Works for domain users only.
+    param([Parameter(Mandatory)][string]$Sid)
+    $fdCse = '{25537BA6-77A8-11D2-9B6C-0000F8080861}'
+    $applyRight = 'edacfd8f-ffb3-11d1-b41d-00a0c968f939'
+    $out = @()
+    try { $cs = Get-CimInstance Win32_ComputerSystem; if (-not $cs.PartOfDomain) { return $out }; $dom = $cs.Domain } catch { return $out }
+    # 1. GPOs this PC last applied to the user (Group Policy state)
+    $applied = @{}
+    Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\$Sid\GPO-List" -ErrorAction SilentlyContinue | ForEach-Object {
+        $g = Get-ItemProperty $_.PSPath
+        if ("$($g.Extensions)" -match [regex]::Escape($fdCse)) { $applied[("$($g.GPOName)").ToUpper()] = "$($g.DisplayName)" }
+    }
+    # 2. Every GPO in SYSVOL that has folder redirection configured
+    $cands = @{}
+    Get-ChildItem "\\$dom\SYSVOL\$dom\Policies" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        if (Get-ChildItem (Join-Path $_.FullName 'User\Documents & Settings') -Filter 'fdeploy*.ini' -ErrorAction SilentlyContinue) { $cands[$_.Name.ToUpper()] = $_.FullName }
+    }
+    foreach ($k in $applied.Keys) { if (-not $cands.ContainsKey($k)) { $cands[$k] = $null } }
+    # 3. The user's groups (nested, via tokenGroups)
+    $userGroups = @{}; $userName = $Sid
+    try {
+        $u = [adsi]"LDAP://<SID=$Sid>"; $userName = "$($u.sAMAccountName)"
+        $u.RefreshCache(@('tokenGroups'))
+        foreach ($b in $u.Properties['tokenGroups']) { $gs = (New-Object Security.Principal.SecurityIdentifier($b, 0)).Value; $userGroups[$gs] = $true }
+        $userGroups[$Sid] = $true
+        $userGroups['S-1-5-11'] = $true   # Authenticated Users
+    } catch {}
+    $root = try { ([adsi]"LDAP://RootDSE").defaultNamingContext } catch { $null }
+    foreach ($guid in $cands.Keys) {
+        $name = $applied[$guid]; $via = @(); $status = ''
+        if ($root) {
+            try {
+                $g = [adsi]"LDAP://CN=$guid,CN=Policies,CN=System,$root"
+                if (-not $name) { $name = "$($g.displayName)" }
+                $flags = [int]"$($g.flags)"; $status = @{0='Enabled';1='User settings disabled';2='Computer settings disabled';3='All settings disabled'}[$flags]
+                foreach ($ace in $g.psbase.ObjectSecurity.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+                    if ($ace.AccessControlType -ne 'Allow' -or "$($ace.ObjectType)" -ne $applyRight) { continue }
+                    $s = $ace.IdentityReference.Value
+                    if ($userGroups.ContainsKey($s)) { $via += try { (New-Object Security.Principal.SecurityIdentifier($s)).Translate([Security.Principal.NTAccount]).Value } catch { $s } }
+                }
+            } catch {}
+        }
+        $paths = ''
+        if ($cands[$guid]) {
+            $ini = Get-ChildItem (Join-Path $cands[$guid] 'User\Documents & Settings') -Filter 'fdeploy*.ini' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($ini) { $paths = ((Get-Content $ini.FullName -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*s-1-|=\\\\|\\\\' } | ForEach-Object { ($_ -split '=', 2)[-1] } | Where-Object { $_ -match '^\\\\' } | Select-Object -Unique) -join '; ') }
+        }
+        $out += [pscustomobject]@{
+            GPO = $(if ($name) { $name } else { $guid }); Guid = $guid; GpoStatus = $status
+            AppliedToUserLastTime = $applied.ContainsKey($guid)
+            AppliesVia = $(if ($via) { ($via | Select-Object -Unique) -join ', ' } elseif ($userGroups.Count) { '(user not in filter)' } else { '(could not read AD)' })
+            Targets = $paths
+        }
+    }
+    $out | Sort-Object @{e={$_.AppliedToUserLastTime}; Descending=$true}, @{e={$_.AppliesVia -notmatch '^\('}; Descending=$true}
+}
+
+function Show-FolderRedirectionSource([string]$Sid, [string]$Account) {
+    Write-Sub "Which GPO / group redirects folders for $Account"
+    $src = @(Get-FolderRedirectionSource -Sid $Sid)
+    if (-not $src) { Write-Host '  No folder-redirection GPO found (not domain-joined, SYSVOL unreachable, or none configured).' -ForegroundColor DarkGray; return $src }
+    $src | Format-Table GPO, GpoStatus, AppliedToUserLastTime, AppliesVia, Targets -AutoSize -Wrap
+    $hit = @($src | Where-Object { $_.AppliedToUserLastTime -or $_.AppliesVia -notmatch '^\(' })
+    foreach ($h in $hit) {
+        Write-Host "  -> '$($h.GPO)' applies to $Account via: $($h.AppliesVia)" -ForegroundColor Yellow
+        if ($h.GPO -match 'SBS|Small Business') { Write-Host '     Legacy SBS policy - if folders should not be redirected, remove the user from that group (or retire the GPO).' -ForegroundColor Yellow }
+    }
+    if ($hit) {
+        Write-Host '  To stop it for this user: remove them from the group above in AD Users & Computers (or add a Deny "Apply group policy"' -ForegroundColor Cyan
+        Write-Host '  for them on the GPO''s Delegation tab). Then point folders back (this option) and sign out/in.' -ForegroundColor Cyan
+        Write-Host '  GPO Policy Removal default = "Leave folder in new location" - unlinking alone does NOT bring folders back.' -ForegroundColor DarkYellow
+    }
+    return $src
+}
+
 function Invoke-FolderRedirectionReset {
     Write-Title 'Folder redirection - show source GPO / point folders back to the local profile'
     Write-Host '  Use when a user''s Desktop/Documents are redirected to a server share and should not be.' -ForegroundColor Gray
@@ -1895,14 +1975,9 @@ function Invoke-FolderRedirectionReset {
         Write-Sub "Folder locations for $($p.Account)"
         $rows | Format-Table Folder, Target, Redirected -AutoSize -Wrap
         $red = @($rows | Where-Object Redirected)
-        if (-not $red) { Write-Host '  Nothing is redirected to a network share.' -ForegroundColor Green; return }
-
-        Write-Sub 'Which GPO is doing it'
-        if ($p.Loaded) { Write-Host '  As the USER run:  gpresult /h C:\temp\gp.html  -> "Folder Redirection" shows the winning GPO.' -ForegroundColor Cyan }
-        Write-Host '  On a DC (finds every GPO with folder redirection):' -ForegroundColor Cyan
-        Write-Host '    Get-GPO -All | ? { (Get-GPOReport -Guid $_.Id -ReportType Xml) -match ''FolderRedirection'' } | ft DisplayName, ModificationTime, GpoStatus' -ForegroundColor Gray
-        Write-Host '  Check the policy''s "Policy Removal" setting: "Leave the folder in the new location" (default) means removing the GPO' -ForegroundColor DarkYellow
-        Write-Host '  does NOT bring folders back for existing users - that is what this option fixes.' -ForegroundColor DarkYellow
+        $null = Show-FolderRedirectionSource -Sid $p.SID -Account $p.Account
+        if (-not $red) { Write-Host '  Nothing is redirected to a network share right now (a GPO listed above as applying will redirect at next sign-in).' -ForegroundColor Green; return }
+        Write-Host '  Manual cross-check: as the user  gpresult /h C:\temp\gp.html  ("Folder Redirection" section).' -ForegroundColor DarkGray
 
         if (-not (Confirm-Change "Point $(($red.Folder) -join ', ') for $($p.Account) back to $($p.LocalPath) (copy files from the server first if you choose).")) { return }
         $copy = Read-YesNo '  Copy the files from the server locations into the local folders first?' $true
@@ -2803,7 +2878,15 @@ function Invoke-SlowLogoffDiag {
     }
     Out-Section 'Mapped network drives (loaded users)' $drives
     Out-Section 'Folder redirection to network (loaded users)' $redir
-    if ($redir) { Add-Hit 'LOW' 'Folders are redirected to a network share - a slow/offline server makes Explorer and sign-out lag (check Offline Files sync too).' }
+    if ($redir) {
+        Add-Hit 'LOW' 'Folders are redirected to a network share - a slow/offline server makes Explorer and sign-out lag (check Offline Files sync too).'
+        foreach ($k in $loaded) {
+            $acct = try { (New-Object Security.Principal.SecurityIdentifier($k.PSChildName)).Translate([Security.Principal.NTAccount]).Value } catch { $k.PSChildName }
+            if (-not ($redir | Where-Object { $_.User -eq $acct })) { continue }
+            $src = @(Show-FolderRedirectionSource -Sid $k.PSChildName -Account $acct)
+            foreach ($h in ($src | Where-Object { $_.AppliedToUserLastTime -or $_.AppliesVia -notmatch '^\(' })) { Add-Hit 'MEDIUM' "$acct folders redirected by GPO '$($h.GPO)' via $($h.AppliesVia) - confirm this is still wanted (legacy SBS policies often linger)." }
+        }
+    }
 
     # 8. Logoff scripts (GPO + local) and logoff-related policy
     $machScripts = @()
@@ -3504,7 +3587,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Installed software inventory (CSV)';                                            Action = { Invoke-SoftwareInventory } }
     @{ Test='slow'; Text = 'User profiles - size, last use (stale / temp profiles)';                        Action = { Invoke-UserProfiles } }
     @{               Text = '[!] Rebuild a corrupted user profile (back up, reset, restore data)';            Action = { Invoke-ProfileRebuild } }
-    @{               Text = '[!] Folder redirection - find GPO / point Desktop+Documents back to local (copy data)'; Action = { Invoke-FolderRedirectionReset } }
+    @{               Text = '[!] Folder redirection - which GPO/group applies it, point folders back to local (copy data)'; Action = { Invoke-FolderRedirectionReset } }
     @{ Test='slow'; Text = 'Migration inventory (full machine discovery)';                                  Action = { Invoke-MigrationInventory } }
     @{ Test='safe'; Text = 'Install provenance for a program (when/how/by whom)';                           Action = { Invoke-InstallProvenance } }
     @{ Test='safe'; Text = '.NET / Node.js / Java / Python / VC++ runtime versions';                         Action = { Invoke-DotNetVersion } }

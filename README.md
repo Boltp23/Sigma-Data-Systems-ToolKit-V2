@@ -207,7 +207,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 67. Installed software inventory (CSV)
 68. User profiles - size, last use (stale / temp profiles)
 69. [!] Rebuild a corrupted user profile (back up, reset, restore data)
-70. [!] Folder redirection - find GPO / point Desktop+Documents back to local (copy data)
+70. [!] Folder redirection - which GPO/group applies it, point folders back to local (copy data)
 71. Migration inventory (full machine discovery)
 72. Install provenance for a program (when/how/by whom)
 73. .NET / Node.js / Java / Python / VC++ runtime versions
