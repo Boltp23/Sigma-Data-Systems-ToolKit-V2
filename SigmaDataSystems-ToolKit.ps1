@@ -3708,6 +3708,7 @@ $Script:Menu = @(
     @{               Text = 'M365: Direct Send / connectors (scanner connector, RejectDirectSend)';            Action = { Invoke-M365 'DirectSend' } }
     @{               Text = 'M365: top inbound sender / outbound recipient domains (90 days)';                Action = { Invoke-M365TopDomains } }
     @{               Text = 'M365: mailbox permissions (Full Access / Send As / Send on Behalf)';             Action = { Invoke-M365Simple 'Mailbox permissions' 'MailboxPermissions' -OfferAll } }
+    @{               Text = '[!] M365: calendar permissions - grant / view / remove (bulk, adds to their Outlook)'; Action = { Invoke-M365 'CalendarPermissions' } }
     @{               Text = 'M365: mailbox sizes, quotas, archive status';                                   Action = { Invoke-M365 'MailboxSizes' } }
     @{               Text = 'M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe';    Action = { Invoke-M365Simple 'Mobile devices' 'MobileDevices' -AskUser } }
     @{               Text = 'M365: unified audit log search (user / operation / IP, up to 180 days)';          Action = { Invoke-M365 'AuditSearch' } }
@@ -16503,6 +16504,109 @@ switch ($Action) {
     $rows | Sort-Object SizeGB -Descending | Select-Object -First 40 | Format-Table -AutoSize
     Save-Csv ($rows | Sort-Object SizeGB -Descending) 'MailboxSizes' | Out-Null
     Write-Host '  Over ~45 GB of a 50 GB quota: enable the archive (and auto-expanding archive) or clean up.' -ForegroundColor DarkGray
+}
+
+# ======================================================================== EXCHANGE: CALENDAR PERMISSIONS
+'CalendarPermissions' {
+    Connect-EXO
+    Write-H 'Calendar permissions'
+    Write-Host '  1. Grant / change a user''s access to one or more calendars (sharing invite adds it to their Outlook)'
+    Write-Host '  2. View who has access to one or more calendars'
+    Write-Host '  3. Remove a user''s access from one or more calendars'
+    $mode = Ask 'Choose' '1'
+    if ($mode -notin '1', '2', '3') { break }
+
+    $ownersRaw = Ask 'Calendar OWNER mailbox(es) - separate several with commas, spaces or semicolons' $UserPrincipalName
+    $owners = @("$ownersRaw" -split '[,;\s]+' | Where-Object { $_ } | Select-Object -Unique)
+    if (-not $owners) { Write-Host '  No calendar owners entered.' -ForegroundColor Yellow; break }
+
+    # The calendar folder name is localized (Calendrier, Kalender...), so look it up per mailbox.
+    function Get-CalendarFolderId([string]$Owner) {
+        $n = (Get-MailboxFolderStatistics -Identity $Owner -FolderScope Calendar -ErrorAction Stop | Where-Object { $_.FolderType -eq 'Calendar' } | Select-Object -First 1).Name
+        if (-not $n) { $n = 'Calendar' }
+        return "${Owner}:\$n"
+    }
+    function Get-CalendarRows([string[]]$Owners, [string]$OnlyUser) {
+        foreach ($o in $Owners) {
+            try {
+                $id = Get-CalendarFolderId $o
+                $perms = if ($OnlyUser) { Get-MailboxFolderPermission -Identity $id -User $OnlyUser -ErrorAction SilentlyContinue } else { Get-MailboxFolderPermission -Identity $id -ErrorAction Stop }
+                foreach ($p in @($perms)) { if ($p) { [pscustomobject]@{ Owner = $o; User = "$($p.User)"; AccessRights = ($p.AccessRights -join ','); SharingFlags = ($p.SharingPermissionFlags -join ',') } } }
+            } catch { [pscustomobject]@{ Owner = $o; User = ''; AccessRights = "ERROR: $($_.Exception.Message)"; SharingFlags = '' } }
+        }
+    }
+
+    switch ($mode) {
+        '1' {
+            $delegate = Ask 'Give access TO (user UPN)' ''
+            if (-not $delegate) { break }
+            Write-Host '  Access level:'
+            Write-Host '    1. AvailabilityOnly  - free/busy only'
+            Write-Host '    2. LimitedDetails    - free/busy + subject + location'
+            Write-Host '    3. Reviewer          - read everything (read-only)'
+            Write-Host '    4. Editor            - read, create, change, delete'
+            Write-Host '    5. Editor + Delegate - Editor, and also receives their meeting requests'
+            $lvl = Ask 'Choose' '3'
+            $rights = switch ($lvl) { '1' { 'AvailabilityOnly' } '2' { 'LimitedDetails' } '4' { 'Editor' } '5' { 'Editor' } default { 'Reviewer' } }
+            $flags = if ($lvl -eq '5') { 'Delegate' } else { $null }
+            if ($flags -and ((Ask 'Can the delegate also see PRIVATE items? Y/N' 'N') -match '^[Yy]')) { $flags = 'Delegate,CanViewPrivateItems' }
+            $notify = (Ask 'Send a sharing invitation so the calendar shows up in their Outlook? Y/N' 'Y') -match '^[Yy]'
+            if (-not (AskYes "Give $delegate '$rights$(if ($flags) { " + $flags" })' on $($owners.Count) calendar(s): $($owners -join ', ')")) { break }
+
+            $rows = foreach ($o in $owners) {
+                $result = ''
+                try {
+                    $id = Get-CalendarFolderId $o
+                    $p = @{ Identity = $id; User = $delegate; AccessRights = $rights; ErrorAction = 'Stop' }
+                    if ($notify) { $p.SendNotificationToUser = $true }
+                    $existing = Get-MailboxFolderPermission -Identity $id -User $delegate -ErrorAction SilentlyContinue
+                    if ($flags) { $p.SharingPermissionFlags = $flags }
+                    elseif ($existing -and ($existing.SharingPermissionFlags -join '') -notmatch '^(None)?$') { $p.SharingPermissionFlags = 'None' }
+                    if ($existing) { Set-MailboxFolderPermission @p | Out-Null; $result = "Updated (was $($existing.AccessRights -join ','))" }
+                    else { Add-MailboxFolderPermission @p | Out-Null; $result = 'Added' }
+                    Write-Host ("  {0,-8} {1}" -f $(if ($existing) { 'UPDATED' } else { 'ADDED' }), $o) -ForegroundColor Green
+                } catch {
+                    $result = "FAILED: $($_.Exception.Message)"
+                    Write-Host ("  FAILED   {0} : {1}" -f $o, $_.Exception.Message) -ForegroundColor Red
+                }
+                [pscustomobject]@{ Owner = $o; User = $delegate; AccessRights = $rights; SharingFlags = "$flags"; InviteSent = $notify; Result = $result }
+            }
+            Write-H "Check: $delegate on each calendar"
+            Get-CalendarRows $owners $delegate | Format-Table -AutoSize
+            Save-Csv $rows "CalendarPermissions_Grant_$($delegate -replace '[^\w]','_')" | Out-Null
+            if ($notify) {
+                Write-Host "  $delegate gets one sharing email per calendar (usually within a few minutes, up to ~30). Accept adds it under Shared Calendars." -ForegroundColor Cyan
+                Write-Host '  Not arrived? Check Junk / Other, or add it directly: Outlook > Calendar > Add Calendar > From Address Book.' -ForegroundColor DarkGray
+            } else {
+                Write-Host '  No invite sent - the user adds each one in Outlook: Calendar > Add Calendar > From Address Book.' -ForegroundColor Cyan
+            }
+        }
+        '2' {
+            Write-H "Calendar permissions on $($owners.Count) calendar(s)"
+            $rows = @(Get-CalendarRows $owners '')
+            $rows | Format-Table -AutoSize
+            Write-Host '  Default = everyone in the organization; Anonymous = external / unauthenticated.' -ForegroundColor DarkGray
+            if ($rows) { Save-Csv $rows 'CalendarPermissions' | Out-Null }
+        }
+        '3' {
+            $delegate = Ask 'Remove access for (user UPN)' ''
+            if (-not $delegate) { break }
+            if (-not (AskYes "Remove $delegate's access from $($owners.Count) calendar(s): $($owners -join ', ')")) { break }
+            $rows = foreach ($o in $owners) {
+                $result = ''
+                try {
+                    $id = Get-CalendarFolderId $o
+                    if (Get-MailboxFolderPermission -Identity $id -User $delegate -ErrorAction SilentlyContinue) {
+                        Remove-MailboxFolderPermission -Identity $id -User $delegate -Confirm:$false -ErrorAction Stop
+                        $result = 'Removed'; Write-Host "  REMOVED  $o" -ForegroundColor Green
+                    } else { $result = 'No access to remove'; Write-Host "  NONE     $o" -ForegroundColor DarkGray }
+                } catch { $result = "FAILED: $($_.Exception.Message)"; Write-Host "  FAILED   $o : $($_.Exception.Message)" -ForegroundColor Red }
+                [pscustomobject]@{ Owner = $o; User = $delegate; Result = $result }
+            }
+            Save-Csv $rows "CalendarPermissions_Remove_$($delegate -replace '[^\w]','_')" | Out-Null
+            Write-Host '  The shared calendar may stay listed in their Outlook until they remove it (right-click > Delete Calendar).' -ForegroundColor DarkGray
+        }
+    }
 }
 
 # ======================================================================== EXCHANGE: AUDIT LOG

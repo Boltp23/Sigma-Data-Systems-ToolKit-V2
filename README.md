@@ -2,7 +2,7 @@
 
 *Prepared by [Sigma Data Systems Inc.](https://sigmadatainc.com/)*
 
-<!-- AUTO-VERSION -->**Current version: v2.0** | 129 options | updated 2026-10-02<!-- /AUTO-VERSION -->
+<!-- AUTO-VERSION -->**Current version: v2.0** | 130 options | updated 2026-10-02<!-- /AUTO-VERSION -->
 
 ```
   _____ _____ _____ __  __            _____       _______
@@ -14,7 +14,7 @@
 ```
 
 One PowerShell file you can copy to any Windows workstation or server and run.
-It opens a numbered menu of **129 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
+It opens a numbered menu of **130 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
 Each option either checks something and writes a report, or makes a fix after asking you to confirm.
 
 - **One file, nothing to install.** 34 longer scripts (plus 2 data files) are built into the file as plain, readable text.
@@ -92,7 +92,7 @@ The home screen shows the banner, a line about the machine (host, domain, OS, ad
 | Type | Does |
 |---|---|
 | A section letter (`A`, `C`, `D`...) | Open that section |
-| Any option number (`1`-`129`) | Run that option directly, from any screen |
+| Any option number (`1`-`130`) | Run that option directly, from any screen |
 | `ALL` | List every option |
 | `B` | Back to the section list |
 | `O` | Change the output folder |
@@ -110,7 +110,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 ## All options
 
 <!-- AUTO-OPTIONS:START -->
-<details><summary><b>Quick index of all 129 options</b> (auto-generated from the script, 2026-10-02)</summary>
+<details><summary><b>Quick index of all 130 options</b> (auto-generated from the script, 2026-10-02)</summary>
 
 **A. SYSTEM HEALTH**
 
@@ -258,27 +258,28 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 106. M365: Direct Send / connectors (scanner connector, RejectDirectSend)
 107. M365: top inbound sender / outbound recipient domains (90 days)
 108. M365: mailbox permissions (Full Access / Send As / Send on Behalf)
-109. M365: mailbox sizes, quotas, archive status
-110. M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe
-111. M365: unified audit log search (user / operation / IP, up to 180 days)
-112. M365: sign-in log for a user (IPs, countries, legacy protocols)
-113. M365: MFA registration report (admins without MFA flagged)
-114. M365: stale / never-used / guest / disabled-but-licensed accounts
-115. M365: admin role members (Global Admin count check)
-116. M365: license report (subscriptions, who has what, wasted licenses)
-117. [!] M365: assign / remove licenses (users, group-based, remove direct)
-118. [!] M365: create a new user (random temp password, license, groups)
-119. M365: app consent audit + admin-consent link (risky app permissions)
-120. M365: app registration secrets / certificates expiring soon
-121. M365: Intune devices (compliance, stale, BitLocker key missing in Entra)
-122. M365: OneDrive folder sharing / permissions for a user
-123. [!] M365: exclude a SharePoint site from a retention policy
-124. M365: tenant hardening audit (legacy auth, forwarding, audit log, Defender, alerts)
-125. M365: security posture audit (134 checks, license-aware, client HTML report)
-126. M365: remediation plan from a posture audit (technical + client summary)
-127. [!] M365: create app registration for unattended automation (cert auth)
-128. [!] THIS PC: force a Hybrid Entra ID join attempt
-129. [!] THIS PC: back up BitLocker recovery key to Entra ID
+109. [!] M365: calendar permissions - grant / view / remove (bulk, adds to their Outlook)
+110. M365: mailbox sizes, quotas, archive status
+111. M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe
+112. M365: unified audit log search (user / operation / IP, up to 180 days)
+113. M365: sign-in log for a user (IPs, countries, legacy protocols)
+114. M365: MFA registration report (admins without MFA flagged)
+115. M365: stale / never-used / guest / disabled-but-licensed accounts
+116. M365: admin role members (Global Admin count check)
+117. M365: license report (subscriptions, who has what, wasted licenses)
+118. [!] M365: assign / remove licenses (users, group-based, remove direct)
+119. [!] M365: create a new user (random temp password, license, groups)
+120. M365: app consent audit + admin-consent link (risky app permissions)
+121. M365: app registration secrets / certificates expiring soon
+122. M365: Intune devices (compliance, stale, BitLocker key missing in Entra)
+123. M365: OneDrive folder sharing / permissions for a user
+124. [!] M365: exclude a SharePoint site from a retention policy
+125. M365: tenant hardening audit (legacy auth, forwarding, audit log, Defender, alerts)
+126. M365: security posture audit (134 checks, license-aware, client HTML report)
+127. M365: remediation plan from a posture audit (technical + client summary)
+128. [!] M365: create app registration for unattended automation (cert auth)
+129. [!] THIS PC: force a Hybrid Entra ID join attempt
+130. [!] THIS PC: back up BitLocker recovery key to Entra ID
 
 </details>
 <!-- AUTO-OPTIONS:END -->
