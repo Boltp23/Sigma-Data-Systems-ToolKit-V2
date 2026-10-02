@@ -1932,7 +1932,7 @@ function Show-FolderRedirectionSource([string]$Sid, [string]$Account) {
     Write-Sub "Which GPO / group redirects folders for $Account"
     $src = @(Get-FolderRedirectionSource -Sid $Sid)
     if (-not $src) { Write-Host '  No folder-redirection GPO found (not domain-joined, SYSVOL unreachable, or none configured).' -ForegroundColor DarkGray; return $src }
-    $src | Format-Table GPO, GpoStatus, AppliedToUserLastTime, AppliesVia, Targets -AutoSize -Wrap
+    $src | Format-Table GPO, GpoStatus, AppliedToUserLastTime, AppliesVia, Targets -AutoSize -Wrap | Out-Host
     $hit = @($src | Where-Object { $_.AppliedToUserLastTime -or $_.AppliesVia -notmatch '^\(' })
     foreach ($h in $hit) {
         Write-Host "  -> '$($h.GPO)' applies to $Account via: $($h.AppliesVia)" -ForegroundColor Yellow
@@ -2068,6 +2068,84 @@ function Invoke-SfcDism {
     Write-Host '  SFC /scannow...' -ForegroundColor Cyan
     sfc.exe /scannow 2>&1 | ForEach-Object { ($_ -replace "`0", '') } | Where-Object { $_.Trim() } | Tee-Object -FilePath $log -Append | Write-Host
     Write-Host "  Log: $log  (SFC details: C:\Windows\Logs\CBS\CBS.log)" -ForegroundColor Green
+}
+
+function Invoke-PostUpdateBlackScreen {
+    Write-Title 'Black screen / stuck sign-in after a Windows Update (AppReadiness, Explorer, pending servicing)'
+    $since = (Get-Date).AddDays(-2)
+    $hits = New-Object System.Collections.ArrayList
+    Write-Sub 'Recent reboots and how long the PC had been up before them'
+    $up = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'EventLog'; Id = 6013; StartTime = (Get-Date).AddDays(-14) } -ErrorAction SilentlyContinue |
+        ForEach-Object { [pscustomobject]@{ Time = $_.TimeCreated; UptimeDays = [math]::Round([int]($_.Properties[4].Value)/86400, 1) } } | Sort-Object Time
+    $maxUp = ($up | Measure-Object UptimeDays -Maximum).Maximum
+    if ($maxUp) { Write-Host "  Longest uptime seen in the last 14 days: $maxUp days" }
+    if ($maxUp -ge 30) { [void]$hits.Add("PC ran $maxUp days without a reboot - months of staged updates applied at once (slow, multiple reboots, heavy first sign-in).") }
+    Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'User32'; Id = 1074; StartTime = $since } -ErrorAction SilentlyContinue |
+        Select-Object -First 8 TimeCreated, @{n='By';e={($_.Properties[0].Value -split '\\')[-1]}}, @{n='User';e={$_.Properties[6].Value}}, @{n='Type';e={$_.Properties[4].Value}} | Format-Table -AutoSize | Out-Host
+
+    Write-Sub 'Updates installed by servicing in the last 2 days'
+    Get-WinEvent -FilterHashtable @{ LogName = 'Setup'; StartTime = $since } -ErrorAction SilentlyContinue |
+        ForEach-Object { if ($_.ToXml() -match '(KB\d{6,8})') { [pscustomobject]@{ Time = $_.TimeCreated; KB = $Matches[1]; Id = $_.Id } } } |
+        Sort-Object KB -Unique | Format-Table -AutoSize | Out-Host
+    $pend = @()
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pend += 'CBS' }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pend += 'Windows Update' }
+    if ($pend) { [void]$hits.Add("Another reboot is still pending ($($pend -join ', ')) - do a full RESTART (not Shut down) so servicing can finish.") }
+    $hb = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -ErrorAction SilentlyContinue).HiberbootEnabled
+    if ($hb -eq 1) { Write-Host '  Fast Startup is ON - "Shut down" does not fully restart Windows; use Restart.' -ForegroundColor DarkYellow }
+
+    Write-Sub 'AppReadiness (prepares apps at first sign-in after an update - the usual cause of a black screen)'
+    $ar = Get-Service AppReadiness -ErrorAction SilentlyContinue
+    if ($ar) { Write-Host "  AppReadiness service: $($ar.Status)" }
+    $arEv = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7011, 10029; StartTime = $since } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'AppReadiness' })
+    if ($arEv) {
+        Write-Host "  AppReadiness timeout/hang events: $($arEv.Count) (first $($arEv[-1].TimeCreated), last $($arEv[0].TimeCreated))" -ForegroundColor Yellow
+        [void]$hits.Add("AppReadiness is hung ($($arEv.Count) timeout events) - Explorer/Start can't load, so users get a black screen after sign-in.")
+    }
+    $arLog = Get-WinEvent -LogName 'Microsoft-Windows-AppReadiness/Admin' -MaxEvents 200 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -ge $since -and $_.Level -le 2 }
+    if ($arLog) { $arLog | Select-Object -First 8 TimeCreated, Id, @{n='Message';e={($_.Message -split "`n")[0]}} | Format-Table -AutoSize -Wrap | Out-Host }
+
+    Write-Sub 'Signed-in sessions and whether Explorer is running in them'
+    $sess = Get-CimInstance Win32_Process -Filter "Name='winlogon.exe'" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty SessionId -Unique
+    $exp = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue
+    foreach ($s in $sess) {
+        $e = $exp | Where-Object SessionId -eq $s | Select-Object -First 1
+        $own = if ($e) { $o = Invoke-CimMethod -InputObject $e -MethodName GetOwner -ErrorAction SilentlyContinue; "$($o.Domain)\$($o.User)" } else { '' }
+        $logon = Get-CimInstance Win32_Process -Filter "Name='LogonUI.exe' AND SessionId=$s" -ErrorAction SilentlyContinue
+        Write-Host ("  Session {0}: Explorer {1} {2} {3}" -f $s, $(if ($e) { 'RUNNING' } else { 'NOT running' }), $own, $(if ($logon) { '(at sign-in screen)' } else { '' }))
+        if (-not $e -and -not $logon -and $s -ne 0) { [void]$hits.Add("Session $s is signed in but Explorer is not running - that is the black screen.") }
+    }
+    $os = Get-CimInstance Win32_OperatingSystem
+    $memPct = [math]::Round((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize) * 100)
+    if ($memPct -ge 90) { [void]$hits.Add("RAM is $memPct% used of $([math]::Round($os.TotalVisibleMemorySize/1MB,1)) GB - first sign-in after updates will be very slow.") }
+    $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($gpu) { Write-Host "  Graphics: $($gpu.Name) driver $($gpu.DriverVersion)" -ForegroundColor Gray }
+
+    Write-Sub 'LIKELY CAUSES'
+    if ($hits.Count) { $hits | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow } } else { Write-Host '  Nothing obvious from here.' -ForegroundColor Green }
+    Write-Host "`n  At the PC: Ctrl+Shift+Esc > Run new task > explorer.exe brings the desktop back for that session." -ForegroundColor Cyan
+
+    Write-Host "`n  Fixes (each asks first):" -ForegroundColor Cyan
+    Write-Host '   1. Restart the AppReadiness service (kills it if hung)'
+    Write-Host '   2. Re-register the Start menu / shell apps for all users (StartMenuExperienceHost, ShellExperienceHost, Search)'
+    Write-Host '   3. Full restart now (not Shut down) so pending servicing finishes'
+    $pick = Read-List '  Fix numbers (comma separated, blank = none)' ''
+    foreach ($p in $pick) {
+        switch ($p) {
+            '1' { if (Confirm-Change 'Stop (force) and start the AppReadiness service.') {
+                    $svc = Get-CimInstance Win32_Service -Filter "Name='AppReadiness'"
+                    if ($svc.ProcessId) { Stop-Process -Id $svc.ProcessId -Force -ErrorAction SilentlyContinue }
+                    Stop-Service AppReadiness -Force -ErrorAction SilentlyContinue; Start-Sleep 2; Start-Service AppReadiness -ErrorAction SilentlyContinue
+                    Write-Host "  AppReadiness: $((Get-Service AppReadiness).Status). Have the user sign out/in (or start explorer.exe from Task Manager)." -ForegroundColor Green } }
+            '2' { if (Confirm-Change 'Re-register Start menu / shell / search system apps for all users.') {
+                    foreach ($n in 'Microsoft.Windows.StartMenuExperienceHost', 'Microsoft.Windows.ShellExperienceHost', 'MicrosoftWindows.Client.CBS', 'Microsoft.Windows.Search', 'Microsoft.UI.Xaml.CBS') {
+                        Get-AppxPackage -AllUsers -Name $n -ErrorAction SilentlyContinue | ForEach-Object {
+                            try { Add-AppxPackage -Register (Join-Path $_.InstallLocation 'AppxManifest.xml') -DisableDevelopmentMode -ForceApplicationShutdown -ErrorAction Stop; Write-Host "  Re-registered $($_.Name)" -ForegroundColor Green }
+                            catch { Write-Host "  $($_.Exception.Message)" -ForegroundColor DarkYellow } } }
+                    Write-Host '  Note: registration from an admin/SYSTEM session applies to that account; for the user, sign them out/in afterwards.' -ForegroundColor Gray } }
+            '3' { if (Confirm-Change 'Restart this PC NOW (users lose unsaved work).') { & shutdown.exe /r /t 5 /c 'SDSI ToolKit: restart to finish Windows Update' } }
+        }
+    }
 }
 
 function Invoke-SpoolerReset {
@@ -3595,6 +3673,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Time sync (w32time) check / resync';                                            Action = { Invoke-TimeSync } }
     @{ Section = 'QUICK FIXES' }
     @{               Text = '[!] Print spooler reset (clear stuck jobs)';                                    Action = { Invoke-SpoolerReset } }
+    @{ Test='safe'; Text = 'Black screen / stuck sign-in after Windows Update (AppReadiness, Explorer) - diagnose + fix'; Action = { Invoke-PostUpdateBlackScreen } }
     @{               Text = '[!] Microsoft Teams cache clear (classic + new)';                               Action = { Invoke-TeamsCacheClear } }
     @{               Text = '[!] Office quick / online repair';                                              Action = { Invoke-OfficeRepair } }
     @{ Test='safe'; Text = 'Outlook stuck on "Loading Profile" - diagnose + fix';                          Action = { Invoke-OutlookLoadingProfile } }
