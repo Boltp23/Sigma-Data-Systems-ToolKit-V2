@@ -1712,6 +1712,151 @@ function Invoke-SoftwareInventory {
     Write-Host "  $(@($rows).Count) programs saved to $out" -ForegroundColor Green
 }
 
+function Invoke-ProfileRebuild {
+    Write-Title 'Rebuild a corrupted Windows user profile (back up -> reset -> copy data back)'
+    Write-Host '  Step 1 RESET : user signed out -> old profile renamed to <name>.old_<date>, its registry entry removed (exported first).' -ForegroundColor Gray
+    Write-Host '                 The user then signs in and gets a brand-new profile.' -ForegroundColor Gray
+    Write-Host '  Step 2 RESTORE: copies files, bookmarks, signatures, Sticky Notes from the .old folder into the new profile' -ForegroundColor Gray
+    Write-Host '                 and lists the old mapped drives / printers.' -ForegroundColor Gray
+    $mode = (Read-Default '  1 = RESET a profile, 2 = RESTORE data into the new profile, blank = cancel' '').ToString()
+    if (-not $mode) { return }
+    $plKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    $dir = Get-OutDir 'ProfileRebuild'; $stamp = Get-Stamp
+
+    if ($mode -eq '1') {
+        $profs = @(Get-CimInstance Win32_UserProfile | Where-Object { -not $_.Special -and $_.LocalPath -like '*\Users\*' } | Sort-Object LastUseTime -Descending)
+        for ($i = 0; $i -lt $profs.Count; $i++) {
+            $u = try { (New-Object Security.Principal.SecurityIdentifier($profs[$i].SID)).Translate([Security.Principal.NTAccount]).Value } catch { $profs[$i].SID }
+            $profs[$i] | Add-Member NoteProperty Account $u -Force
+            Write-Host ("   {0,2}. {1,-35} {2,-30} Loaded: {3,-5} LastUse: {4}" -f ($i + 1), $u, $profs[$i].LocalPath, $profs[$i].Loaded, $profs[$i].LastUseTime)
+        }
+        $n = Read-Int '  Profile number to RESET (0 = cancel)' 0
+        if ($n -lt 1 -or $n -gt $profs.Count) { return }
+        $p = $profs[$n - 1]
+        if ($p.LocalPath -ieq $env:USERPROFILE) { Write-Host '  You are signed in as this user - run this from a different admin account.' -ForegroundColor Red; return }
+        if ($p.Loaded) {
+            Write-Host "  $($p.Account) is still loaded (signed in, or a process is holding the registry)." -ForegroundColor Red
+            Write-Host '  Sign the user out (or restart the PC and sign in ONLY as an admin), then run this again.' -ForegroundColor Yellow
+            return
+        }
+        $sizeGB = [math]::Round(((Get-ChildItem $p.LocalPath -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum)/1GB, 2)
+        $free = [math]::Round((Get-PSDrive ($p.LocalPath.Substring(0,1))).Free/1GB, 1)
+        Write-Host "  Profile size: $sizeGB GB   Free on drive: $free GB (renaming needs no extra space; restoring copies the data)" -ForegroundColor Gray
+        $newName = "$($p.LocalPath).old_$stamp"
+        if (-not (Confirm-Change "Reset profile of $($p.Account): rename $($p.LocalPath) -> $newName and remove its ProfileList registry key (backup in $dir).")) { return }
+        & reg.exe export ("HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" + $p.SID) "$dir\ProfileList_$($p.SID)_$stamp.reg" /y | Out-Null
+        try { Rename-Item -LiteralPath $p.LocalPath -NewName (Split-Path $newName -Leaf) -ErrorAction Stop }
+        catch {
+            Write-Host "  Rename FAILED: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host '  Something still has files open in the profile. Restart the PC, sign in ONLY as an admin, and run this again. Nothing was changed.' -ForegroundColor Yellow
+            return
+        }
+        $guid = (Get-ItemProperty "$plKey\$($p.SID)" -ErrorAction SilentlyContinue).Guid
+        Remove-Item "$plKey\$($p.SID)" -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem $plKey -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like "$($p.SID).bak" } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        if ($guid) { Remove-Item "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileGuid\$guid" -Recurse -Force -ErrorAction SilentlyContinue }
+        "$($p.Account)|$($p.SID)|$newName|$(Get-Date)" | Add-Content "$dir\ProfileRebuild_log.txt"
+        Write-Host "`n  Done. Old profile is now: $newName" -ForegroundColor Green
+        Write-Host '  NEXT: have the user sign in (domain users need line-of-sight to a DC / VPN). Windows builds a new profile.' -ForegroundColor Cyan
+        Write-Host '  Once they reach the desktop, run this option again and pick 2 = RESTORE.' -ForegroundColor Cyan
+        return
+    }
+
+    if ($mode -eq '2') {
+        $olds = @(Get-ChildItem (Split-Path $env:PUBLIC -Parent) -Directory -Filter '*.old_*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+        if (-not $olds) { Write-Host '  No <name>.old_<date> profile folders found under C:\Users.' -ForegroundColor Red; return }
+        for ($i = 0; $i -lt $olds.Count; $i++) { Write-Host ("   {0,2}. {1}" -f ($i + 1), $olds[$i].FullName) }
+        $n = Read-Int '  Old profile to restore FROM (0 = cancel)' 1
+        if ($n -lt 1 -or $n -gt $olds.Count) { return }
+        $src = $olds[$n - 1].FullName
+        $guess = Join-Path (Split-Path $src -Parent) (($olds[$n - 1].Name) -replace '\.old_\d{8}_\d{6}$', '')
+        $dst = Read-Default '  New profile to restore INTO' $guess
+        if (-not (Test-Path $dst)) { Write-Host "  $dst does not exist yet - the user must sign in once first." -ForegroundColor Red; return }
+
+        # Read the old registry hive: folder redirection (OneDrive), mapped drives, printers
+        $hive = 'HKU\SDSI_OldProfile'; $redirected = @(); $info = @()
+        if (Test-Path "$src\NTUSER.DAT") {
+            & reg.exe load $hive "$src\NTUSER.DAT" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $sf = Get-ItemProperty 'Registry::HKEY_USERS\SDSI_OldProfile\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction SilentlyContinue
+                foreach ($k in @{ Desktop = 'Desktop'; Personal = 'Documents'; 'My Pictures' = 'Pictures' }.GetEnumerator()) { if ("$($sf.($k.Key))" -match 'OneDrive|^\\\\') { $redirected += $k.Value } }
+                Get-ChildItem 'Registry::HKEY_USERS\SDSI_OldProfile\Network' -ErrorAction SilentlyContinue | ForEach-Object { $info += [pscustomobject]@{ Type = 'Mapped drive'; Item = "$($_.PSChildName): -> $((Get-ItemProperty $_.PSPath).RemotePath)" } }
+                Get-ChildItem 'Registry::HKEY_USERS\SDSI_OldProfile\Printers\Connections' -ErrorAction SilentlyContinue | ForEach-Object { $info += [pscustomobject]@{ Type = 'Printer'; Item = ($_.PSChildName -replace ',', '\') } }
+                $defPrn = (Get-ItemProperty 'Registry::HKEY_USERS\SDSI_OldProfile\Software\Microsoft\Windows NT\CurrentVersion\Windows' -ErrorAction SilentlyContinue).Device
+                if ($defPrn) { $info += [pscustomobject]@{ Type = 'Default printer'; Item = ($defPrn -split ',')[0] } }
+                $sf = $null; [gc]::Collect(); Start-Sleep 1
+                & reg.exe unload $hive 2>$null | Out-Null
+            } else { Write-Host '  Could not load the old NTUSER.DAT (corrupt or in use) - skipping drive/printer list.' -ForegroundColor DarkYellow }
+        }
+        if ($redirected) { Write-Host "  Old profile had $($redirected -join ', ') redirected to OneDrive/network - NOT copied (sign in to OneDrive and it re-syncs)." -ForegroundColor Yellow }
+        $oneDrive = Get-ChildItem $src -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue
+        if ($oneDrive) { Write-Host "  Skipping $($oneDrive.Name -join ', ') - OneDrive will re-sync it. (Copy manually only if there were un-synced files.)" -ForegroundColor Yellow }
+
+        $items = @(
+            'Desktop','Documents','Downloads','Pictures','Music','Videos','Favorites','Links','Contacts'
+            'AppData\Roaming\Microsoft\Signatures'
+            'AppData\Roaming\Microsoft\Templates'
+            'AppData\Roaming\Microsoft\UProof'
+            'AppData\Roaming\Microsoft\Proof'
+            'AppData\Local\Microsoft\Edge\User Data\Default\Bookmarks'
+            'AppData\Local\Google\Chrome\User Data\Default\Bookmarks'
+            'AppData\Local\Packages\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe\LocalState'
+            'AppData\Roaming\Microsoft\Sticky Notes'
+        ) | Where-Object { $redirected -notcontains $_ }
+        $pst = Get-ChildItem $src -Recurse -Filter *.pst -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\OneDrive' }
+        # Full browser data (all profiles, extensions, history, settings) - optional
+        $browsers = @(
+            [pscustomobject]@{ Name = 'Chrome';  Proc = 'chrome';  Rel = 'AppData\Local\Google\Chrome\User Data' }
+            [pscustomobject]@{ Name = 'Edge';    Proc = 'msedge';  Rel = 'AppData\Local\Microsoft\Edge\User Data' }
+            [pscustomobject]@{ Name = 'Firefox'; Proc = 'firefox'; Rel = 'AppData\Roaming\Mozilla\Firefox' }
+        ) | Where-Object { Test-Path -LiteralPath (Join-Path $src $_.Rel) }
+        $fullBrowser = $false
+        if ($browsers) {
+            Write-Host "`n  Browser data found in the old profile: $($browsers.Name -join ', ')" -ForegroundColor Gray
+            Write-Host '  FULL copy = every browser profile, extensions, history, settings, open tabs (caches skipped).' -ForegroundColor Gray
+            Write-Host '  Chrome/Edge saved passwords usually do NOT survive (Windows ties them to the old profile) - use browser sync for those.' -ForegroundColor DarkYellow
+            Write-Host '  Firefox saved passwords DO carry over.  No = bookmarks only (Chrome/Edge default profile).' -ForegroundColor Gray
+            $fullBrowser = Read-YesNo '  Copy FULL browser data?' $true
+            if ($fullBrowser) { $items = $items | Where-Object { $_ -notmatch '\\Bookmarks$' } }
+        }
+        Write-Host "`n  Will copy (only what exists): $($items -join '; ')$(if ($fullBrowser) { '; FULL ' + ($browsers.Name -join '/') + ' browser data' })" -ForegroundColor Gray
+        if ($pst) { Write-Host "  PST files found (copied to the same relative place; re-attach in Outlook): $($pst.Name -join ', ')" -ForegroundColor Gray }
+        if (-not (Confirm-Change "Copy user data from $src into $dst (nothing in $src is deleted; ask the user to close Edge/Chrome/Sticky Notes first).")) { return }
+        $logf = "$dir\Restore_$((Split-Path $dst -Leaf))_$stamp.log"
+        foreach ($it in $items) {
+            $s = Join-Path $src $it; $d = Join-Path $dst $it
+            if (Test-Path -LiteralPath $s -PathType Container) {
+                & robocopy.exe $s $d /E /XJ /R:1 /W:1 /COPY:DAT /DCOPY:T /XF desktop.ini /NP /NFL /NDL /LOG+:"$logf" | Out-Null
+                Write-Host "  Copied $it" -ForegroundColor Green
+            } elseif (Test-Path -LiteralPath $s -PathType Leaf) {
+                Ensure-Dir (Split-Path $d -Parent) | Out-Null
+                if (Test-Path -LiteralPath $d) { Copy-Item -LiteralPath $d "$d.new_$stamp" -Force }
+                Copy-Item -LiteralPath $s $d -Force; Write-Host "  Copied $it" -ForegroundColor Green
+            }
+        }
+        if ($fullBrowser) {
+            $dstUser = Split-Path $dst -Leaf
+            $running = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $browsers.Proc -contains ($_.Name -replace '\.exe$','') } |
+                Where-Object { $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue; $o.User -ieq $dstUser })
+            if ($running -and (Confirm-Change "Close $(@($running.Name | Sort-Object -Unique) -join ', ') for $dstUser (browser must be closed to copy its data).")) {
+                $running | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep 2
+            }
+            foreach ($b in $browsers) {
+                $s = Join-Path $src $b.Rel; $d = Join-Path $dst $b.Rel
+                & robocopy.exe $s $d /E /XJ /R:1 /W:1 /COPY:DAT /DCOPY:T /NP /NFL /NDL /LOG+:"$logf" /XD 'Cache' 'Code Cache' 'GPUCache' 'ShaderCache' 'GrShaderCache' 'GraphiteDawnCache' 'DawnCache' 'DawnWebGPUCache' 'CacheStorage' 'ScriptCache' 'Crashpad' 'cache2' 'startupCache' /XF 'lock' 'parent.lock' 'LOCK' 'SingletonLock' 'SingletonCookie' 'SingletonSocket' | Out-Null
+                if ($LASTEXITCODE -lt 8) { Write-Host "  Copied FULL $($b.Name) data" -ForegroundColor Green } else { Write-Host "  $($b.Name) copy had errors (exit $LASTEXITCODE) - see $logf" -ForegroundColor Red }
+            }
+            Write-Host '  Have the user open each browser and check bookmarks/extensions; if Chrome/Edge passwords are blank, sign in to browser sync.' -ForegroundColor Cyan
+        }
+        foreach ($f in $pst) { $rel = $f.FullName.Substring($src.Length).TrimStart('\'); $d = Join-Path $dst $rel; Ensure-Dir (Split-Path $d -Parent) | Out-Null; Copy-Item -LiteralPath $f.FullName $d -Force; Write-Host "  Copied $rel" -ForegroundColor Green }
+        Write-Sub 'Re-create these for the user (from the OLD profile)'
+        if ($info) { $info | Format-Table -AutoSize -Wrap; $info | Export-Csv "$dir\OldDrivesPrinters_$((Split-Path $dst -Leaf))_$stamp.csv" -NoTypeInformation } else { Write-Host '  None recorded (or GPO maps them automatically).' }
+        Write-Host "`n  Restore log: $logf" -ForegroundColor Green
+        Write-Host '  Then: sign in to OneDrive + Outlook (new Outlook profile builds automatically for M365), check browser bookmarks,' -ForegroundColor Cyan
+        Write-Host "  re-attach any PSTs. Keep $src for a couple of weeks, then delete it." -ForegroundColor Cyan
+    }
+}
+
 function Invoke-UserProfiles {
     Write-Title 'User profiles - size and last use'
     $sizes = Read-YesNo 'Calculate profile sizes (can be slow)?' $true
@@ -1825,6 +1970,122 @@ function Invoke-TeamsCacheClear {
         Start-Sleep -Seconds 3
         foreach ($p in $paths) { if (Test-Path $p) { Remove-Item "$p\*" -Recurse -Force -ErrorAction SilentlyContinue; Write-Host "  Cleared $p" -ForegroundColor Green } }
         Write-Host '  Start Teams again - first launch will be slower while it rebuilds.' -ForegroundColor DarkGray
+    }
+}
+
+function Invoke-OutlookLoadingProfile {
+    Write-Title 'Outlook stuck on "Loading Profile" - diagnose + fix'
+    # Work on the signed-in user (the ToolKit usually runs elevated as a different admin account)
+    $exp = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $owner = if ($exp) { Invoke-CimMethod -InputObject $exp -MethodName GetOwner -ErrorAction SilentlyContinue } else { $null }
+    $acct = if ($owner -and $owner.User) { "$($owner.Domain)\$($owner.User)" } else { "$env:USERDOMAIN\$env:USERNAME" }
+    $sid = try { (New-Object Security.Principal.NTAccount($acct)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { $null }
+    $hku = if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) { "Registry::HKEY_USERS\$sid" } else { 'HKCU:' }
+    $prof = if ($sid) { (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue).LocalPath } else { $env:USERPROFILE }
+    Write-Host "  Signed-in user: $acct   Profile: $prof" -ForegroundColor Gray
+    $off = "$hku\Software\Microsoft\Office\16.0"
+    $hits = New-Object System.Collections.ArrayList
+
+    Write-Sub 'Outlook processes'
+    $ol = Get-CimInstance Win32_Process -Filter "Name='OUTLOOK.EXE'" -ErrorAction SilentlyContinue
+    if ($ol) {
+        $ol | ForEach-Object { $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+            [pscustomobject]@{ PID = $_.ProcessId; User = "$($o.Domain)\$($o.User)"; Started = $_.CreationDate; CommandLine = $_.CommandLine } } | Format-Table -AutoSize -Wrap
+        if (@($ol).Count -gt 1) { [void]$hits.Add('More than one OUTLOOK.EXE running - a hung background copy blocks the profile. Kill them all and retry.') }
+    } else { Write-Host '  Outlook is not running.' }
+
+    Write-Sub 'Compatibility mode / run-as-admin flags on OUTLOOK.EXE'
+    $layers = foreach ($root in "$hku\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers", 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers') {
+        $p = Get-ItemProperty $root -ErrorAction SilentlyContinue
+        if ($p) { $p.PSObject.Properties | Where-Object { $_.Name -match 'OUTLOOK\.EXE$' } | ForEach-Object { [pscustomobject]@{ Key = $root -replace '^Registry::',''; Exe = $_.Name; Flags = $_.Value } } }
+    }
+    if ($layers) { $layers | Format-Table -AutoSize -Wrap; [void]$hits.Add('OUTLOOK.EXE has compatibility / run-as-admin flags - a classic "Loading Profile" hang. Remove them (fix option 1).') } else { Write-Host '  None (good).' }
+
+    Write-Sub 'Microsoft 365 sign-in broker (WAM / AAD.BrokerPlugin)'
+    $bp = Get-AppxPackage -AllUsers -Name Microsoft.AAD.BrokerPlugin -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($bp) { Write-Host "  BrokerPlugin $($bp.Version)  Status: $($bp.Status)" } else { Write-Host '  Microsoft.AAD.BrokerPlugin NOT found - Microsoft 365 sign-in cannot work.' -ForegroundColor Red; [void]$hits.Add('AAD BrokerPlugin missing - re-register it (fix option 2).') }
+    $bpErr = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-AppModel-State'; StartTime = (Get-Date).AddDays(-7) } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'AAD\.BrokerPlugin' }
+    $aadErr = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-AAD/Operational'; Level = 2; StartTime = (Get-Date).AddDays(-2) } -MaxEvents 200 -ErrorAction SilentlyContinue
+    if ($bpErr) { [void]$hits.Add("BrokerPlugin settings write failures x$(@($bpErr).Count) in 7 days - the sign-in broker's local data is likely corrupt (fix option 2).") }
+    if ($aadErr) { Write-Host "  AAD/Operational errors (48h): $(@($aadErr).Count)"; $aadErr | Select-Object -First 5 TimeCreated, Id, @{n='Message';e={($_.Message -split "`n")[0..1] -join ' '}} | Format-Table -AutoSize -Wrap; if (@($aadErr).Count -ge 5) { [void]$hits.Add("Many Entra sign-in errors (AAD/Operational x$(@($aadErr).Count)) - token/broker problem (fix option 2).") } }
+    $ds = (& dsregcmd /status) 2>$null
+    $prt = ($ds | Select-String 'AzureAdPrt\s*:\s*(\w+)').Matches.Groups[1].Value
+    if ($prt) { Write-Host "  AzureAdPrt: $prt  (from the context this ran in)" }
+
+    Write-Sub 'Outlook profiles / OST / PST'
+    $profKey = "$off\Outlook\Profiles"
+    $profiles = @(Get-ChildItem $profKey -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
+    $def = (Get-ItemProperty "$off\Outlook" -ErrorAction SilentlyContinue).DefaultProfile
+    Write-Host "  Profiles: $(if ($profiles) { $profiles -join ', ' } else { '(none)' })   Default: $def"
+    if ($prof) {
+        Get-ChildItem "$prof\AppData\Local\Microsoft\Outlook" -Include *.ost, *.pst -Recurse -ErrorAction SilentlyContinue |
+            Select-Object Name, @{n='GB';e={[math]::Round($_.Length/1GB,2)}}, LastWriteTime | Format-Table -AutoSize
+        $big = Get-ChildItem "$prof\AppData\Local\Microsoft\Outlook" -Include *.ost, *.pst -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 45GB }
+        if ($big) { [void]$hits.Add('An OST/PST is over 45 GB - near the 50 GB limit; Outlook can hang opening it.') }
+    }
+
+    Write-Sub 'Add-ins set to load at startup'
+    $addins = foreach ($r in "$hku\Software\Microsoft\Office\Outlook\Addins", 'HKLM:\SOFTWARE\Microsoft\Office\Outlook\Addins', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\Outlook\Addins') {
+        Get-ChildItem $r -ErrorAction SilentlyContinue | ForEach-Object { $p = Get-ItemProperty $_.PSPath; if ($p.LoadBehavior -eq 3) { [pscustomobject]@{ AddIn = $_.PSChildName; Name = $p.FriendlyName } } }
+    }
+    if ($addins) { $addins | Format-Table -AutoSize } else { Write-Host '  None found in registry.' }
+
+    Write-Sub 'Hardware graphics acceleration (hangs after graphics driver changes)'
+    $hw = (Get-ItemProperty "$off\Common\Graphics" -ErrorAction SilentlyContinue).DisableHardwareAcceleration
+    Write-Host "  DisableHardwareAcceleration = $(if ($null -eq $hw) { '(not set = acceleration ON)' } else { $hw })"
+
+    Write-Sub 'Connectivity to Microsoft 365'
+    foreach ($h in 'outlook.office365.com', 'login.microsoftonline.com', 'autodiscover-s.outlook.com') {
+        $t = Test-NetConnection $h -Port 443 -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
+        Write-Host ("  {0,-32} {1}" -f $h, $(if ($t.TcpTestSucceeded) { 'OK' } else { 'FAILED' })) -ForegroundColor $(if ($t.TcpTestSucceeded) { 'Green' } else { 'Red' })
+        if (-not $t.TcpTestSucceeded) { [void]$hits.Add("Cannot reach $h on 443 - check DNS / proxy / firewall.") }
+    }
+
+    Write-Sub 'LIKELY CAUSES'
+    if ($hits.Count) { $hits | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow } } else { Write-Host '  Nothing obvious - try options 3-5 in order.' -ForegroundColor Green }
+
+    Write-Host "`n  Fixes (Outlook is closed first; each asks before changing anything):" -ForegroundColor Cyan
+    Write-Host '   1. Remove compatibility / run-as-admin flags from OUTLOOK.EXE'
+    Write-Host '   2. Repair Microsoft 365 sign-in (re-register AAD BrokerPlugin + clear Office identity cache) - user signs in again'
+    Write-Host '   3. Turn off Outlook hardware graphics acceleration'
+    Write-Host '   4. Start Outlook in Safe Mode (no add-ins) / reset navigation pane (/resetnavpane)'
+    Write-Host '   5. Rename the OST so it rebuilds (re-downloads mail)'
+    Write-Host '   6. Create a new Outlook profile (opens Mail control panel)'
+    $pick = Read-List '  Pick fix numbers (comma separated, blank = none)' ''
+    if (-not $pick) { return }
+    $stopOutlook = { Get-Process OUTLOOK -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep 2 }
+    foreach ($p in $pick) {
+        switch ($p) {
+            '1' { if (Confirm-Change 'Delete AppCompat Layers values for OUTLOOK.EXE.') {
+                    foreach ($l in $layers) { Remove-ItemProperty -Path ("Registry::" + ($l.Key -replace '^HKLM:\\','HKEY_LOCAL_MACHINE\')) -Name $l.Exe -ErrorAction SilentlyContinue }
+                    Write-Host '  Compatibility flags removed.' -ForegroundColor Green } }
+            '2' { if (Confirm-Change "Close Outlook/Office, re-register AAD BrokerPlugin, clear Office identity cache for $acct (user must sign in to Office again).") {
+                    & $stopOutlook
+                    if ($prof) {
+                        foreach ($d in "$prof\AppData\Local\Microsoft\IdentityCache", "$prof\AppData\Local\Microsoft\OneAuth", "$prof\AppData\Local\Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\AC\TokenBroker\Accounts") {
+                            if (Test-Path $d) { Rename-Item $d "$(Split-Path $d -Leaf).old_$(Get-Stamp)" -ErrorAction SilentlyContinue; Write-Host "  Renamed $d" } }
+                    }
+                    Remove-Item "$off\Common\Identity\Identities\*" -Recurse -Force -ErrorAction SilentlyContinue
+                    $pkg = Get-AppxPackage -AllUsers -Name Microsoft.AAD.BrokerPlugin -ErrorAction SilentlyContinue | Select-Object -First 1
+                    $man = if ($pkg) { Join-Path $pkg.InstallLocation 'AppxManifest.xml' } else { "$env:SystemRoot\SystemApps\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\AppxManifest.xml" }
+                    if ($acct -ieq "$env:USERDOMAIN\$env:USERNAME") { Add-AppxPackage -Register $man -DisableDevelopmentMode -ForceApplicationShutdown -ErrorAction SilentlyContinue; Write-Host '  BrokerPlugin re-registered.' -ForegroundColor Green }
+                    else { Write-Host "  Re-register must run AS THE USER: Add-AppxPackage -Register `"$man`" -DisableDevelopmentMode -ForceApplicationShutdown" -ForegroundColor DarkYellow }
+                    Write-Host '  Have the user open Outlook and sign in when prompted.' -ForegroundColor Green } }
+            '3' { if (Confirm-Change 'Set Office DisableHardwareAcceleration = 1 for the signed-in user.') {
+                    New-Item "$off\Common\Graphics" -Force | Out-Null; Set-ItemProperty "$off\Common\Graphics" -Name DisableHardwareAcceleration -Value 1 -Type DWord
+                    Write-Host '  Hardware acceleration OFF.' -ForegroundColor Green } }
+            '4' { & $stopOutlook; $exe = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE' -ErrorAction SilentlyContinue).'(default)'
+                  if (-not $exe) { Write-Host '  OUTLOOK.EXE not found.' -ForegroundColor Red; break }
+                  $sw = if (Read-YesNo '  Also reset the navigation pane (/resetnavpane)?' $false) { '/safe /resetnavpane' } else { '/safe' }
+                  Write-Host "  Run AS THE USER (not elevated): `"$exe`" $sw" -ForegroundColor Cyan
+                  if ($acct -ieq "$env:USERDOMAIN\$env:USERNAME" -and -not (Test-IsAdmin)) { Start-Process $exe $sw } }
+            '5' { if (Confirm-Change 'Close Outlook and rename every .ost so Outlook rebuilds it (mail re-downloads from Microsoft 365).') {
+                    & $stopOutlook
+                    Get-ChildItem "$prof\AppData\Local\Microsoft\Outlook" -Filter *.ost -ErrorAction SilentlyContinue | ForEach-Object { Rename-Item $_.FullName "$($_.Name).old_$(Get-Stamp)"; Write-Host "  Renamed $($_.Name)" } } }
+            '6' { Write-Host '  Opening Mail control panel - Show Profiles > Add, then set "Always use this profile".' -ForegroundColor Cyan
+                  $mlcfg = Get-ChildItem "${env:ProgramFiles}\Microsoft Office\root\Office16\MLCFG32.CPL", "${env:ProgramFiles(x86)}\Microsoft Office\root\Office16\MLCFG32.CPL" -ErrorAction SilentlyContinue | Select-Object -First 1
+                  if ($mlcfg) { Start-Process control.exe "`"$($mlcfg.FullName)`"" } else { Start-Process control.exe 'mlcfg32.cpl' } }
+        }
     }
 }
 
@@ -3171,6 +3432,7 @@ $Script:Menu = @(
     @{ Section = 'SOFTWARE / INVENTORY / USERS' }
     @{ Test='safe'; Text = 'Installed software inventory (CSV)';                                            Action = { Invoke-SoftwareInventory } }
     @{ Test='slow'; Text = 'User profiles - size, last use (stale / temp profiles)';                        Action = { Invoke-UserProfiles } }
+    @{               Text = '[!] Rebuild a corrupted user profile (back up, reset, restore data)';            Action = { Invoke-ProfileRebuild } }
     @{ Test='slow'; Text = 'Migration inventory (full machine discovery)';                                  Action = { Invoke-MigrationInventory } }
     @{ Test='safe'; Text = 'Install provenance for a program (when/how/by whom)';                           Action = { Invoke-InstallProvenance } }
     @{ Test='safe'; Text = '.NET / Node.js / Java / Python / VC++ runtime versions';                         Action = { Invoke-DotNetVersion } }
@@ -3180,6 +3442,7 @@ $Script:Menu = @(
     @{               Text = '[!] Print spooler reset (clear stuck jobs)';                                    Action = { Invoke-SpoolerReset } }
     @{               Text = '[!] Microsoft Teams cache clear (classic + new)';                               Action = { Invoke-TeamsCacheClear } }
     @{               Text = '[!] Office quick / online repair';                                              Action = { Invoke-OfficeRepair } }
+    @{ Test='safe'; Text = 'Outlook stuck on "Loading Profile" - diagnose + fix';                          Action = { Invoke-OutlookLoadingProfile } }
     @{               Text = '[!] OneDrive reset';                                                            Action = { Invoke-OneDriveReset } }
     @{ Test='safe'; Text = 'OneDrive "can''t open file" errors (0x8007007A / cloud provider) - diagnose + repair'; Action = { Invoke-OneDriveFileAccess } }
     @{               Text = '[!] Repair .zip association / reset default browser (per user)';               Action = { Invoke-ZipBrowserRepair } }
