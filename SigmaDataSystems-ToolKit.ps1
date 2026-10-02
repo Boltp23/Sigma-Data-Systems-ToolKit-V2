@@ -1043,6 +1043,43 @@ function Invoke-RemoveBloatware {
     }
 }
 
+function Invoke-WUDriverBlock {
+    Write-Title 'Windows Update driver updates - block / allow'
+    $wuKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $dsKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching'
+    $mdKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching'
+    $cur = [pscustomobject]@{
+        ExcludeWUDriversInQualityUpdate = (Get-ItemProperty $wuKey -ErrorAction SilentlyContinue).ExcludeWUDriversInQualityUpdate
+        SearchOrderConfig               = (Get-ItemProperty $dsKey -ErrorAction SilentlyContinue).SearchOrderConfig
+        DontSearchWindowsUpdate_Policy  = (Get-ItemProperty $mdKey -ErrorAction SilentlyContinue).DontSearchWindowsUpdate
+    }
+    Write-Sub 'Current settings (1 / 0 / 1 = drivers blocked)'
+    $cur | Format-List
+    Write-Sub 'Drivers installed by Windows Update (last 60 days)'
+    try {
+        $s = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+        $n = $s.GetTotalHistoryCount()
+        if ($n -gt 0) { $s.QueryHistory(0, [math]::Min($n, 300)) | Where-Object { $_.Date -ge (Get-Date).AddDays(-60) -and $_.Title -match 'Driver|Firmware' } |
+            Select-Object @{n='Date';e={$_.Date.ToLocalTime()}}, Title | Format-Table -AutoSize -Wrap }
+    } catch { Write-Host '  Could not read Windows Update history.' -ForegroundColor DarkGray }
+    $mode = (Read-Default '  B = block driver updates, A = allow again, blank = no change' '').ToString().ToUpper()
+    if ($mode -eq 'B') {
+        if (-not (Confirm-Change 'Stop Windows Update and automatic device installs from downloading drivers (OEM tools like Dell Command Update still work).')) { return }
+        foreach ($k in $wuKey, $dsKey, $mdKey) { if (-not (Test-Path $k)) { New-Item $k -Force | Out-Null } }
+        Set-ItemProperty $wuKey -Name ExcludeWUDriversInQualityUpdate -Value 1 -Type DWord
+        Set-ItemProperty $dsKey -Name SearchOrderConfig -Value 0 -Type DWord
+        Set-ItemProperty $mdKey -Name DontSearchWindowsUpdate -Value 1 -Type DWord
+        Write-Host '  Driver updates from Windows Update are now BLOCKED. Install drivers with the OEM tool (Dell Command Update, Lenovo Vantage, HP Image Assistant).' -ForegroundColor Green
+        Write-Host '  Note: an RMM/Intune/GPO policy can override these values - set it there too for a permanent fleet setting.' -ForegroundColor DarkYellow
+    } elseif ($mode -eq 'A') {
+        if (-not (Confirm-Change 'Allow Windows Update to install drivers again.')) { return }
+        Remove-ItemProperty $wuKey -Name ExcludeWUDriversInQualityUpdate -ErrorAction SilentlyContinue
+        Set-ItemProperty $dsKey -Name SearchOrderConfig -Value 1 -Type DWord -ErrorAction SilentlyContinue
+        Remove-ItemProperty $mdKey -Name DontSearchWindowsUpdate -ErrorAction SilentlyContinue
+        Write-Host '  Windows Update driver updates ALLOWED again.' -ForegroundColor Green
+    } else { Write-Host '  No change made.' -ForegroundColor DarkGray }
+}
+
 function Invoke-PowerSettings {
     Write-Title '[!] Power settings - never sleep / hibernate / turn off display or disks'
     Write-Host '  Current active scheme:'; powercfg /getactivescheme
@@ -2327,6 +2364,217 @@ function Invoke-BootPerformance {
         Select-Object TimeCreated, Id, @{n='Message';e={($_.Message -split "`n")[0]}} | Format-Table -AutoSize -Wrap
 }
 
+function Invoke-SlowLogoffDiag {
+    Write-Title 'Slow sign-out / logoff / shutdown + general lag diagnostics'
+    $days  = Read-Int '  How many days back to look' 7
+    $since = (Get-Date).AddDays(-$days)
+    $dir = Get-OutDir 'SlowLogoff'; $stamp = Get-Stamp
+    $report = Join-Path $dir "SlowLogoff_$($env:COMPUTERNAME)_$stamp.txt"
+    $findings = New-Object System.Collections.ArrayList
+    function Add-Hit([string]$Sev, [string]$Text) { [void]$findings.Add([pscustomobject]@{ Severity = $Sev; Finding = $Text }) }
+    function Get-EvData($e) { $d = @{}; try { ([xml]$e.ToXml()).Event.EventData.Data | ForEach-Object { if ($_.Name) { $d[$_.Name] = $_.'#text' } } } catch {}; $d }
+    $log = New-Object System.Collections.ArrayList
+    function Out-Section([string]$Title, $Data) {
+        Write-Sub $Title
+        $txt = if ($null -eq $Data -or @($Data).Count -eq 0) { '  (nothing found)' } else { ($Data | Format-Table -AutoSize -Wrap | Out-String -Width 220).TrimEnd() }
+        Write-Host $txt
+        [void]$log.Add("`r`n--- $Title ---`r`n$txt")
+    }
+
+    # 1. Uptime, memory, CPU
+    $os = Get-CimInstance Win32_OperatingSystem
+    $upDays = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
+    $memPct = [math]::Round((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize) * 100)
+    $cpu = (Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
+    $sys = [pscustomobject]@{ UptimeDays = $upDays; RAMUsedPct = $memPct; RAMTotalGB = [math]::Round($os.TotalVisibleMemorySize/1MB,1); CPUPct = $cpu; LastBoot = $os.LastBootUpTime }
+    Out-Section 'Uptime / memory / CPU' $sys
+    if ($upDays -ge 14) { Add-Hit 'MEDIUM' "Up $upDays days without a reboot - a full restart often clears logoff hangs and lag." }
+    if ($memPct -ge 90) { Add-Hit 'HIGH' "RAM is $memPct% used - machine is paging; see top memory processes." }
+    if ($cpu -ge 85)    { Add-Hit 'HIGH' "CPU is at $cpu% right now - see top CPU processes." }
+
+    # 2. Top processes
+    $procs = Get-Process -IncludeUserName -ErrorAction SilentlyContinue
+    if (-not $procs) { $procs = Get-Process }
+    Out-Section 'Top 15 processes by memory' ($procs | Sort-Object WorkingSet64 -Descending | Select-Object -First 15 Name, Id, SessionId, UserName, @{n='MemMB';e={[math]::Round($_.WorkingSet64/1MB)}}, @{n='CPUsec';e={[math]::Round($_.CPU)}}, Handles)
+    Out-Section 'Top 10 processes by total CPU time' ($procs | Sort-Object CPU -Descending | Select-Object -First 10 Name, Id, SessionId, @{n='CPUsec';e={[math]::Round($_.CPU)}}, @{n='MemMB';e={[math]::Round($_.WorkingSet64/1MB)}})
+    $leaky = $procs | Where-Object { $_.Handles -gt 20000 }
+    foreach ($p in $leaky) { Add-Hit 'MEDIUM' "$($p.Name) (PID $($p.Id)) has $($p.Handles) handles - possible handle leak; restart that app." }
+    $notResp = $procs | Where-Object { $_.MainWindowHandle -ne 0 -and -not $_.Responding }
+    if ($notResp) { Out-Section 'Programs NOT RESPONDING right now' ($notResp | Select-Object Name, Id, SessionId) ; foreach ($p in $notResp) { Add-Hit 'HIGH' "$($p.Name) (PID $($p.Id)) is Not Responding now - it will block sign-out." } }
+
+    # 3. Shutdown / logoff performance (Diagnostics-Performance 200-203)
+    $dp = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Diagnostics-Performance/Operational'; Id = 200; StartTime = $since } -ErrorAction SilentlyContinue
+    Out-Section 'Shutdown durations (Diagnostics-Performance 200)' ($dp | Select-Object -First 10 | ForEach-Object { $d = Get-EvData $_; [pscustomobject]@{ Time = $_.TimeCreated; ShutdownSec = [math]::Round([int]$d.ShutdownTime/1000,1); UserSessionSec = [math]::Round([int]$d.ShutdownUserSessionTime/1000,1); ServicesSec = [math]::Round([int]$d.ShutdownServiceTime/1000,1) } })
+    $slowItems = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Diagnostics-Performance/Operational'; Id = 201,202,203; StartTime = $since } -ErrorAction SilentlyContinue |
+        ForEach-Object { $d = Get-EvData $_; [pscustomobject]@{ Type = @{201='App';202='Device';203='Service'}[$_.Id]; Item = $(if ($d.FriendlyName) { $d.FriendlyName } elseif ($d.Name) { $d.Name } else { $d.FileName }); DelayMs = [int]$d.TotalTime } } |
+        Group-Object Type, Item | ForEach-Object { [pscustomobject]@{ Item = $_.Name; Times = $_.Count; AvgDelaySec = [math]::Round((($_.Group.DelayMs | Measure-Object -Average).Average)/1000,1) } } | Sort-Object AvgDelaySec -Descending
+    Out-Section 'Apps / services / devices that slowed shutdown (201-203)' ($slowItems | Select-Object -First 15)
+    foreach ($s in ($slowItems | Where-Object { $_.AvgDelaySec -ge 10 } | Select-Object -First 5)) { Add-Hit 'HIGH' "Delays shutdown/sign-out by ~$($s.AvgDelaySec)s ($($s.Times)x): $($s.Item)" }
+
+    # 4. Winlogon subscribers slow on logoff (Application 6005/6006)
+    $wl = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-Winlogon'; Id = 6005,6006; StartTime = $since } -ErrorAction SilentlyContinue
+    $wlRows = $wl | ForEach-Object { [pscustomobject]@{ Time = $_.TimeCreated; Id = $_.Id; Message = ($_.Message -split "`n")[0].Trim() } }
+    Out-Section 'Winlogon notification subscribers taking long (6005/6006)' ($wlRows | Select-Object -First 20)
+    $wl | Where-Object { $_.Id -eq 6006 } | ForEach-Object { if ($_.Message -match "subscriber <(.+?)> took (\d+) second.+\((\w+)\)") { if ([int]$Matches[2] -ge 10) { Add-Hit 'HIGH' "Winlogon subscriber '$($Matches[1])' took $($Matches[2])s handling $($Matches[3])." } } }
+
+    # 5. User Profile Service - logoff timing + errors
+    $ups = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-User Profile Service/Operational'; Id = 3,4; StartTime = $since } -ErrorAction SilentlyContinue | Sort-Object TimeCreated
+    $pairs = @(); $open = @{}
+    foreach ($e in $ups) {
+        $sess = if ($e.Message -match 'session (\d+)') { $Matches[1] } else { '?' }
+        if ($e.Id -eq 3) { $open[$sess] = $e.TimeCreated }
+        elseif ($open.ContainsKey($sess)) { $pairs += [pscustomobject]@{ LogoffStarted = $open[$sess]; Session = $sess; ProfileUnloadSec = [math]::Round(($e.TimeCreated - $open[$sess]).TotalSeconds,1) }; $open.Remove($sess) }
+    }
+    Out-Section 'User Profile Service - logoff processing time per sign-out' ($pairs | Sort-Object LogoffStarted -Descending | Select-Object -First 15)
+    $slowPairs = @($pairs | Where-Object { $_.ProfileUnloadSec -ge 15 })
+    if ($slowPairs) { Add-Hit 'HIGH' "Profile unload took 15s+ on $($slowPairs.Count) sign-out(s) (max $(($pairs | Measure-Object ProfileUnloadSec -Maximum).Maximum)s) - profile/registry hive or sync issue." }
+    $upErr = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-User Profiles Service','Microsoft-Windows-User Profiles General'; StartTime = $since } -ErrorAction SilentlyContinue | Where-Object { $_.Level -le 3 }
+    Out-Section 'User Profile errors/warnings (1530 = registry handles held open at logoff)' ($upErr | Group-Object Id | ForEach-Object { [pscustomobject]@{ Id = $_.Name; Count = $_.Count; Last = $_.Group[0].TimeCreated; Sample = ($_.Group[0].Message -split "`n")[0].Trim() } })
+    $h1530 = @($upErr | Where-Object { $_.Id -eq 1530 })
+    if ($h1530) {
+        $holders = $h1530 | ForEach-Object { if ($_.Message -match 'Process \d+ \(([^)]+)\)') { Split-Path $Matches[1] -Leaf } } | Group-Object | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) ($($_.Count)x)" }
+        Add-Hit 'MEDIUM' "Event 1530 x$($h1530.Count): a program keeps the user's registry open at sign-out$(if ($holders) { ' - ' + ($holders -join ', ') })."
+    }
+    if (@($upErr | Where-Object { $_.Id -in 1500,1511,1515,1508,1509 })) { Add-Hit 'HIGH' 'Temporary-profile / profile load-copy errors found - check the profile (C:\Users) and ProfileList registry.' }
+
+    # 6. Profiles (size, roaming, hive size)
+    $profs = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { -not $_.Special -and $_.LocalPath -like '*\Users\*' }
+    $profRows = foreach ($p in $profs) {
+        $nt = Join-Path $p.LocalPath 'NTUSER.DAT'; $uc = Join-Path $p.LocalPath 'AppData\Local\Microsoft\Windows\UsrClass.dat'
+        $ntMB = if (Test-Path -LiteralPath $nt) { [math]::Round((Get-Item -LiteralPath $nt -Force).Length/1MB,1) } else { $null }
+        $ucMB = if (Test-Path -LiteralPath $uc) { [math]::Round((Get-Item -LiteralPath $uc -Force).Length/1MB,1) } else { $null }
+        $user = try { (New-Object Security.Principal.SecurityIdentifier($p.SID)).Translate([Security.Principal.NTAccount]).Value } catch { $p.SID }
+        [pscustomobject]@{ User = $user; Loaded = $p.Loaded; Roaming = $p.RoamingConfigured; LastUse = $p.LastUseTime; NTUSER_MB = $ntMB; UsrClass_MB = $ucMB; Path = $p.LocalPath }
+    }
+    Out-Section 'User profiles (registry hive sizes; big hives unload slowly)' ($profRows | Sort-Object LastUse -Descending)
+    foreach ($r in $profRows) {
+        if ($r.NTUSER_MB -ge 50)   { Add-Hit 'MEDIUM' "$($r.User): NTUSER.DAT is $($r.NTUSER_MB) MB (bloated hive slows sign-in/out)." }
+        if ($r.UsrClass_MB -ge 100) { Add-Hit 'MEDIUM' "$($r.User): UsrClass.dat is $($r.UsrClass_MB) MB (bloated - common Start menu/Explorer lag cause)." }
+        if ($r.Roaming) { Add-Hit 'MEDIUM' "$($r.User) uses a ROAMING profile - sign-out copies the profile to the server; large or slow link = slow sign-out." }
+    }
+
+    # 7. Per-user items for every loaded user (works when run as admin or SYSTEM via RMM)
+    $loaded = Get-ChildItem Registry::HKEY_USERS -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' }
+    $drives = @(); $userScripts = @(); $redir = @()
+    foreach ($k in $loaded) {
+        $sid = $k.PSChildName
+        $user = try { (New-Object Security.Principal.SecurityIdentifier($sid)).Translate([Security.Principal.NTAccount]).Value } catch { $sid }
+        Get-ChildItem "Registry::HKEY_USERS\$sid\Network" -ErrorAction SilentlyContinue | ForEach-Object { $drives += [pscustomobject]@{ User = $user; Drive = "$($_.PSChildName):"; Path = (Get-ItemProperty $_.PSPath).RemotePath } }
+        Get-ChildItem "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Group Policy\Scripts\Logoff" -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $sp = Get-ItemProperty $_.PSPath; if ($sp.Script) { $userScripts += [pscustomobject]@{ User = $user; Script = $sp.Script; Params = $sp.Parameters } } }
+        $sf = Get-ItemProperty "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" -ErrorAction SilentlyContinue
+        if ($sf) { foreach ($n in 'Desktop','Personal','{F42EE2D3-909F-4907-8871-4C22FC0BF756}','My Pictures','AppData') { $v = $sf.$n; if ($v -like '\\*') { $redir += [pscustomobject]@{ User = $user; Folder = $n; Target = $v } } } }
+    }
+    foreach ($d in $drives) {
+        $srv = if ($d.Path -match '^\\\\([^\\]+)') { $Matches[1] } else { $null }
+        $d | Add-Member NoteProperty ServerReachable $(if ($srv) { [bool](Test-Connection -ComputerName $srv -Count 1 -Quiet -ErrorAction SilentlyContinue) } else { $null })
+        if ($srv -and -not $d.ServerReachable) { Add-Hit 'HIGH' "$($d.User): mapped drive $($d.Drive) -> $($d.Path) is UNREACHABLE - Explorer hangs/lag at sign-out." }
+    }
+    Out-Section 'Mapped network drives (loaded users)' $drives
+    Out-Section 'Folder redirection to network (loaded users)' $redir
+    if ($redir) { Add-Hit 'LOW' 'Folders are redirected to a network share - a slow/offline server makes Explorer and sign-out lag (check Offline Files sync too).' }
+
+    # 8. Logoff scripts (GPO + local) and logoff-related policy
+    $machScripts = @()
+    Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State' -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.PSPath -match '\\Scripts\\Logoff\\\d+\\\d+$' } | ForEach-Object { $sp = Get-ItemProperty $_.PSPath; if ($sp.Script) { $machScripts += [pscustomobject]@{ Source = 'GPO (cached state)'; Script = $sp.Script; Params = $sp.Parameters } } }
+    $machScripts += $userScripts | ForEach-Object { [pscustomobject]@{ Source = "User: $($_.User)"; Script = $_.Script; Params = $_.Params } }
+    Out-Section 'Logoff scripts configured (run at every sign-out)' ($machScripts | Sort-Object Script -Unique)
+    if ($machScripts) { Add-Hit 'MEDIUM' "$(@($machScripts | Sort-Object Script -Unique).Count) logoff script(s) run at sign-out - test them / check their network paths." }
+    $pol = @()
+    $sysPol = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue
+    $ctl = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control' -ErrorAction SilentlyContinue
+    $pol += [pscustomobject]@{ Setting = 'RunLogoffScriptSync';     Value = $sysPol.RunLogoffScriptSync;   Note = '1 = sign-out waits for logoff scripts' }
+    $pol += [pscustomobject]@{ Setting = 'VerboseStatus';           Value = $sysPol.VerboseStatus;         Note = '1 = shows what sign-out is waiting on (handy for testing)' }
+    $pol += [pscustomobject]@{ Setting = 'WaitToKillServiceTimeout'; Value = $ctl.WaitToKillServiceTimeout; Note = 'default 5000 ms; large values = slow shutdown' }
+    $pol += [pscustomobject]@{ Setting = 'MaxGPOScriptWait (HKLM policy)'; Value = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -ErrorAction SilentlyContinue).MaxGPOScriptWait; Note = 'seconds a GPO script may run' }
+    Out-Section 'Logoff / shutdown related settings' $pol
+    if ($ctl.WaitToKillServiceTimeout -and [int]$ctl.WaitToKillServiceTimeout -gt 20000) { Add-Hit 'LOW' "WaitToKillServiceTimeout is $($ctl.WaitToKillServiceTimeout) ms - shutdown waits that long for hung services." }
+
+    # 9. App hangs / crashes
+    $hangs = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Hang','Application Error'; StartTime = $since } -ErrorAction SilentlyContinue |
+        ForEach-Object { $d = $_.Properties; [pscustomobject]@{ Type = $(if ($_.ProviderName -eq 'Application Hang') { 'Hang' } else { 'Crash' }); App = "$($d[0].Value)"; Time = $_.TimeCreated } } |
+        Group-Object Type, App | ForEach-Object { [pscustomobject]@{ Event = $_.Name; Count = $_.Count; Last = ($_.Group | Sort-Object Time -Descending)[0].Time } } | Sort-Object Count -Descending
+    Out-Section "Application hangs / crashes (last $days days)" ($hangs | Select-Object -First 15)
+    foreach ($h in ($hangs | Where-Object { $_.Count -ge 3 } | Select-Object -First 5)) { Add-Hit 'MEDIUM' "$($h.Event) $($h.Count)x in $days days." }
+
+    # 10. Disk health / free space / storage errors
+    $disks = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Select-Object DeviceID, @{n='SizeGB';e={[math]::Round($_.Size/1GB)}}, @{n='FreeGB';e={[math]::Round($_.FreeSpace/1GB,1)}}, @{n='FreePct';e={[math]::Round($_.FreeSpace/$_.Size*100)}}
+    Out-Section 'Disk free space' $disks
+    foreach ($d in $disks) { if ($d.FreePct -lt 10) { Add-Hit 'HIGH' "$($d.DeviceID) only $($d.FreePct)% free ($($d.FreeGB) GB) - low space causes lag and slow profile writes." } }
+    $phys = Get-PhysicalDisk -ErrorAction SilentlyContinue | Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus
+    Out-Section 'Physical disks' $phys
+    foreach ($p in ($phys | Where-Object { $_.HealthStatus -and $_.HealthStatus -ne 'Healthy' })) { Add-Hit 'HIGH' "Disk '$($p.FriendlyName)' health is $($p.HealthStatus)." }
+    foreach ($p in ($phys | Where-Object { $_.MediaType -eq 'HDD' })) { Add-Hit 'LOW' "Disk '$($p.FriendlyName)' is a spinning HDD - an SSD upgrade is the biggest fix for general lag." }
+    $stor = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7,11,51,129,153,157; StartTime = $since } -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -match 'disk|stor|nvme|iaStor|Ntfs|volmgr' }
+    Out-Section 'Storage errors (disk 7/51/153, controller 129, etc.)' ($stor | Group-Object ProviderName, Id | ForEach-Object { [pscustomobject]@{ Event = $_.Name; Count = $_.Count; Last = $_.Group[0].TimeCreated } })
+    if ($stor) { Add-Hit 'HIGH' "$(@($stor).Count) storage/disk error event(s) in $days days - disk or controller trouble causes freezes and slow sign-out." }
+    try {
+        $lat = (Get-Counter '\PhysicalDisk(_Total)\Avg. Disk sec/Transfer','\PhysicalDisk(_Total)\% Idle Time' -SampleInterval 1 -MaxSamples 5 -ErrorAction Stop).CounterSamples | Group-Object Path | ForEach-Object { [pscustomobject]@{ Counter = ($_.Name -split '\\')[-1]; Avg = [math]::Round(($_.Group.CookedValue | Measure-Object -Average).Average, 4) } }
+        Out-Section 'Disk latency (5 sec sample; >0.025 sec/transfer is slow)' $lat
+        $sec = ($lat | Where-Object { $_.Counter -like 'avg. disk sec*' }).Avg
+        if ($sec -gt 0.025) { Add-Hit 'HIGH' "Average disk latency is $([math]::Round($sec*1000)) ms per transfer right now (should be under 25 ms)." }
+    } catch {}
+
+    # 11. Pending reboot + Windows Update
+    $pend = @()
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pend += 'CBS' }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pend += 'Windows Update' }
+    if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction SilentlyContinue).PendingFileRenameOperations) { $pend += 'File rename' }
+    Out-Section 'Pending reboot' ([pscustomobject]@{ Pending = [bool]$pend; Reasons = ($pend -join ', ') })
+    if ($pend) { Add-Hit 'MEDIUM' "Reboot pending ($($pend -join ', ')) - updates waiting to install can make sign-out/shutdown slow; reboot the machine." }
+
+    # 12. Known sign-out blockers running now
+    $known = 'OneDrive','Teams','ms-teams','Outlook','Dropbox','GoogleDriveFS','Box','iCloudDrive','CcmExec','SearchIndexer','SearchProtocolHost','MsMpEng','TiWorker','TrustedInstaller','wuauclt','MoUsoCoreWorker','ShellExperienceHost','StartMenuExperienceHost','explorer','dwm','csrss'
+    Out-Section 'Common sign-out blockers currently running' ($procs | Where-Object { $known -contains $_.Name } | Sort-Object WorkingSet64 -Descending | Select-Object Name, Id, SessionId, @{n='MemMB';e={[math]::Round($_.WorkingSet64/1MB)}}, @{n='CPUsec';e={[math]::Round($_.CPU)}}, Responding)
+    if ($procs | Where-Object { $_.Name -in 'TiWorker','TrustedInstaller','MoUsoCoreWorker' -and $_.CPU -gt 60 }) { Add-Hit 'MEDIUM' 'Windows Update servicing (TiWorker/TrustedInstaller) is busy right now - lag and slow sign-out until it finishes.' }
+
+    # 13. Black screen / forced power-offs (WER black-screen diagnostics, live kernel watchdog dumps)
+    $wer = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Windows Error Reporting'; Id = 1001; StartTime = $since } -ErrorAction SilentlyContinue
+    $bs = $wer | Where-Object { $_.Message -match 'WindowsBlackScreenDiagnostics|HamLkd|AppHangB1|MoAppHang' } | ForEach-Object {
+        $m = $_.Message
+        $ev = if ($m -match 'Event Name: (\S+)') { $Matches[1] } else { '?' }
+        $p1 = if ($m -match 'P1: (\S*)') { $Matches[1] } else { '' }
+        $p4 = if ($m -match 'P4: (\S*)') { $Matches[1] } else { '' }
+        [pscustomobject]@{ Time = $_.TimeCreated; Event = $ev; P1 = $p1; P4 = $p4 } } |
+        Group-Object { '{0:yyyyMMddHHmm}|{1}|{2}|{3}' -f $_.Time, $_.Event, $_.P1, $_.P4 } | ForEach-Object { $_.Group[0] } | Sort-Object Time
+    Out-Section 'Black screen / app-hang reports (WER)' ($bs | Select-Object -Last 25)
+    $pwrHold = @($bs | Where-Object { $_.P4 -match 'LongPowerButtonHold' })
+    if ($pwrHold) { Add-Hit 'HIGH' "Black screen + power button held $($pwrHold.Count)x (last $($pwrHold[-1].Time)) - user is hard-powering off a hung display/shell. Suspect graphics driver/DWM; check LiveKernelReports dumps." }
+    if (@($bs | Where-Object { $_.Event -eq 'HamLkd' })) { Add-Hit 'HIGH' "HamLkd live dump: an app ($(@($bs | Where-Object { $_.Event -eq 'HamLkd' })[0].P1 -replace '_.*','')) could not be terminated - stuck in a kernel/driver call (classic sign-out hang)." }
+    $lkr = Join-Path $env:SystemRoot 'LiveKernelReports'
+    $dumps = Get-ChildItem $lkr -Recurse -Filter *.dmp -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since } | Sort-Object LastWriteTime -Descending
+    Out-Section "Live kernel dumps in $lkr (last $days days)" ($dumps | Select-Object -First 20 LastWriteTime, @{n='Folder';e={$_.Directory.Name}}, Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}})
+    if ($dumps) { Add-Hit 'HIGH' "$(@($dumps).Count) live kernel dump(s) (WATCHDOG = display/GPU watchdog) - open in WinDbg (!analyze -v) to name the driver; update the graphics driver from the OEM." }
+    $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object Name, DriverVersion, @{n='DriverDate';e={$_.DriverDate}}, Status
+    Out-Section 'Graphics adapter / driver' $gpu
+
+    # 14. Multi-homed / wrong DNS (domain machine on a second network, e.g. guest Wi-Fi)
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $ipc = Get-NetIPConfiguration -ErrorAction SilentlyContinue | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' }
+    $nets = $ipc | Select-Object InterfaceAlias, @{n='IPv4';e={$_.IPv4Address.IPAddress -join ','}}, @{n='Gateway';e={$_.IPv4DefaultGateway.NextHop -join ','}}, @{n='DNS';e={$_.DNSServer.ServerAddresses -join ','}}, @{n='Profile';e={$_.NetProfile.NetworkCategory}}
+    Out-Section 'Active network connections with a gateway' $nets
+    if (@($ipc).Count -gt 1) { Add-Hit 'MEDIUM' "$(@($ipc).Count) networks connected at once ($((@($ipc).InterfaceAlias) -join ', ')) - DNS/DC lookups can go out the wrong one; disconnect the extra (e.g. guest Wi-Fi)." }
+    if ($cs.PartOfDomain) {
+        $nl = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'NETLOGON'; Id = 5719; StartTime = $since } -ErrorAction SilentlyContinue
+        $gp = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-GroupPolicy'; Id = 1058,1129,1054,1055; StartTime = $since } -ErrorAction SilentlyContinue
+        if ($nl -or $gp) { Add-Hit 'MEDIUM' "Domain controller trouble: NETLOGON 5719 x$(@($nl).Count), Group Policy failures x$(@($gp).Count) - slow sign-in/out waiting on the DC. Check DNS points only at the DCs." }
+        $dcIps = @(); try { $dcIps = @(Resolve-DnsName -Name $cs.Domain -Type A -ErrorAction Stop | Where-Object IPAddress | Select-Object -ExpandProperty IPAddress) } catch {}
+        foreach ($c in $ipc) { foreach ($dns in $c.DNSServer.ServerAddresses) { if ($dns -notmatch ':' -and $dcIps -and $dcIps -notcontains $dns) { Add-Hit 'MEDIUM' "$($c.InterfaceAlias) uses DNS $dns which is not a domain controller ($($dcIps -join ', ')) - domain lookups may fail." } } }
+    }
+
+    # Summary
+    $order = @{ HIGH = 0; MEDIUM = 1; LOW = 2 }
+    $sorted = $findings | Sort-Object { $order[$_.Severity] }
+    Write-Sub 'LIKELY CAUSES (most serious first)'
+    if (-not $sorted) { Write-Host '  Nothing obvious found. Next: set VerboseStatus=1 to see what sign-out waits on, run Performance snapshot during the lag, or Sysinternals ProcMon boot/logoff trace.' -ForegroundColor Green }
+    foreach ($f in $sorted) { $c = @{ HIGH = 'Red'; MEDIUM = 'Yellow'; LOW = 'Gray' }[$f.Severity]; Write-Host ("  [{0,-6}] {1}" -f $f.Severity, $f.Finding) -ForegroundColor $c }
+    Write-Host "`n  Quick wins: reboot (clears pending updates/handle leaks), disconnect dead mapped drives, quit sync apps (OneDrive/Teams) before sign-out to test," -ForegroundColor DarkCyan
+    Write-Host '  and if sign-out sits on a blank/"Signing out" screen, enable VerboseStatus to see what it is waiting on.' -ForegroundColor DarkCyan
+    $head = "Slow sign-out / lag diagnostics - $env:COMPUTERNAME - $(Get-Date) - last $days days`r`nPrepared by Sigma Data Systems Inc. - Sigma Data Systems INC ToolKit`r`n`r`nLIKELY CAUSES:`r`n" + (($sorted | ForEach-Object { "  [$($_.Severity)] $($_.Finding)" }) -join "`r`n")
+    ($head + "`r`n" + ($log -join "`r`n")) | Out-File -FilePath $report -Encoding UTF8
+    $sorted | Export-Csv (Join-Path $dir "SlowLogoff_Findings_$($env:COMPUTERNAME)_$stamp.csv") -NoTypeInformation -Encoding UTF8
+    Write-Host "`n  Report saved: $report" -ForegroundColor Green
+}
+
 function Invoke-ADHealth {
     Write-Title 'Active Directory / DC health (dcdiag, repadmin, SYSVOL, FSMO)'
     if (-not (Get-Command dcdiag.exe -ErrorAction SilentlyContinue)) { Write-Host '  dcdiag not found - run on a domain controller or a machine with RSAT AD DS tools.' -ForegroundColor Red; return }
@@ -2855,6 +3103,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Reliability history (Reliability Monitor data, stability index)';               Action = { Invoke-ReliabilityHistory } }
     @{ Test='safe'; Text = 'Performance snapshot (CPU / RAM / disk latency / network, 30 sec)';             Action = { Invoke-PerfSnapshot } }
     @{ Test='safe'; Text = 'Boot / logon performance (what slows startup)';                                 Action = { Invoke-BootPerformance } }
+    @{ Test='safe'; Text = 'Slow sign-out / logoff / shutdown / black screen / lag diagnostics';           Action = { Invoke-SlowLogoffDiag } }
     @{ Test='safe'; Text = 'Hardware health (SMART, disk errors, driver problems, battery, temps)';         Action = { Invoke-HardwareHealth } }
     @{ Test='safe'; Text = 'Pending reboot - detailed (CBS, WU, file renames, rename/join, ConfigMgr)';     Action = { Invoke-PendingReboot } }
     @{ Test='safe'; Text = 'Device join / Entra ID / Workplace join / PIN status (dsregcmd)';               Action = { Invoke-DeviceJoinStatus } }
@@ -2936,6 +3185,7 @@ $Script:Menu = @(
     @{               Text = '[!] Repair .zip association / reset default browser (per user)';               Action = { Invoke-ZipBrowserRepair } }
     @{               Text = '[!] Remove bloatware (OEM + consumer Store apps)';                              Action = { Invoke-RemoveBloatware } }
     @{               Text = '[!] Power settings - never sleep / hibernate';                                  Action = { Invoke-PowerSettings } }
+    @{               Text = '[!] Windows Update driver updates - block / allow (use OEM driver tool instead)'; Action = { Invoke-WUDriverBlock } }
     @{ Section = 'SOFTWARE DEPLOYMENT (downloads to C:\temp\Tools)' }
     @{               Text = '[!] Install common apps with Ninite (Chrome, Firefox, 7-Zip, Zoom...)';         Action = { Invoke-NiniteInstall } }
     @{               Text = '[!] Install apps silently from the vendor (Chrome/Firefox/Edge MSI, Zoom, Teams, OneDrive)'; Action = { Invoke-DirectInstall } }
@@ -6723,10 +6973,12 @@ function Invoke-StandardCleanup {
 function Invoke-ExtendedCleanup {
     Write-Log "Starting extended cleanup pass."
 
-    foreach ($dumpPath in @("C:\Windows\Minidump\*", "C:\Windows\MEMORY.DMP")) {
-        try { Remove-Item -Path $dumpPath -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    # Keep crash/black-screen evidence: only dumps older than 30 days are removed (LiveKernelReports is never touched here)
+    $dumpCutoff = (Get-Date).AddDays(-30)
+    foreach ($dumpPath in @("C:\Windows\Minidump", "C:\Windows\MEMORY.DMP")) {
+        try { Get-ChildItem -Path $dumpPath -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $dumpCutoff } | Remove-Item -Force -ErrorAction SilentlyContinue } catch { }
     }
-    Write-Log "Cleared crash dump files (Minidump/MEMORY.DMP)."
+    Write-Log "Cleared crash dump files older than 30 days (Minidump/MEMORY.DMP) - recent dumps kept for troubleshooting."
 
     try {
         if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
@@ -17345,13 +17597,14 @@ function Invoke-IISLogCleanup {
 }
 
 function Invoke-DumpCleanup {
-    param([string]$Server)
+    param([string]$Server, [int]$RetainDays = 30)
     if (Should-Skip "Dumps") { Write-Log "[$Server] Skipping dump cleanup." "WARN"; return 0 }
 
-    Write-Log "[$Server] Removing old crash dumps..." "ACTION"
+    Write-Log "[$Server] Removing crash dumps older than $RetainDays days (recent dumps are kept as evidence)..." "ACTION"
 
     $result = Invoke-Target $Server {
-        param($dryRun)
+        param($dryRun, $retainDays)
+        $cutoff = (Get-Date).AddDays(-$retainDays)
         $dumpPaths = @(
             "C:\Windows\Minidump",
             "C:\Windows\MEMORY.DMP",
@@ -17360,27 +17613,17 @@ function Invoke-DumpCleanup {
         $totalSize = 0
         foreach ($p in $dumpPaths) {
             if (Test-Path $p) {
-                $size = if ((Get-Item $p).PSIsContainer) {
-                    $m = Get-ChildItem $p -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum -ErrorAction SilentlyContinue
-                    if ($m -and $m.Sum) { [long]$m.Sum } else { 0 }
-                } else {
-                    (Get-Item $p).Length
-                }
-                $totalSize += if ($size) { $size } else { 0 }
-                if (-not $dryRun) {
-                    if ((Get-Item $p).PSIsContainer) {
-                        Remove-Item "$p\*" -Force -Recurse -ErrorAction SilentlyContinue
-                    } else {
-                        Remove-Item $p -Force -ErrorAction SilentlyContinue
-                    }
-                }
+                $old = @(Get-ChildItem $p -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff })
+                $m = $old | Measure-Object Length -Sum -ErrorAction SilentlyContinue
+                $totalSize += if ($m -and $m.Sum) { [long]$m.Sum } else { 0 }
+                if (-not $dryRun) { $old | Remove-Item -Force -ErrorAction SilentlyContinue }
             }
         }
         return $totalSize
-    } -ArgumentList $DryRun
+    } -ArgumentList $DryRun, $RetainDays
 
     if ($DryRun) {
-        Write-Log "[$Server] [DRYRUN] Would remove crash dumps (~$(Format-Bytes $result))." "DRYRUN"
+        Write-Log "[$Server] [DRYRUN] Would remove crash dumps older than $RetainDays days (~$(Format-Bytes $result))." "DRYRUN"
     } else {
         Write-Log "[$Server] Crash dumps removed. Freed ~$(Format-Bytes $result)." "SUCCESS"
     }
