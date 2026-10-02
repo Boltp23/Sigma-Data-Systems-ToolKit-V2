@@ -2,7 +2,7 @@
 
 *Prepared by [Sigma Data Systems Inc.](https://sigmadatainc.com/)*
 
-<!-- AUTO-VERSION -->**Current version: v2.0** · 123 options · updated 2026-10-01<!-- /AUTO-VERSION -->
+<!-- AUTO-VERSION -->**Current version: v2.0** | 123 options | updated 2026-10-01<!-- /AUTO-VERSION -->
 
 ```
   _____ _____ _____ __  __            _____       _______
@@ -50,7 +50,7 @@ Each option either checks something and writes a report, or makes a fix after as
 
 | | |
 |---|---|
-| **OS** | Windows 10 / 11, Windows Server 2012 R2 â€“ 2025 |
+| **OS** | Windows 10 / 11, Windows Server 2012 R2 - 2025 |
 | **PowerShell** | Windows PowerShell 5.1 (built in). Built-in tools always run in 5.1, even if you start the menu from PowerShell 7. |
 | **Rights** | Run as **Administrator**. If you don't, the toolkit offers to restart itself elevated. |
 | **Optional modules** | Hyper-V, ActiveDirectory, GroupPolicy, DhcpServer, DnsServer, WebAdministration. Options that need a missing module say so and go back to the menu. |
@@ -92,7 +92,7 @@ The home screen shows the banner, a line about the machine (host, domain, OS, ad
 | Type | Does |
 |---|---|
 | A section letter (`A`, `C`, `D`...) | Open that section |
-| Any option number (`1`â€“`122`) | Run that option directly, from any screen |
+| Any option number (`1`-`123`) | Run that option directly, from any screen |
 | `ALL` | List every option |
 | `B` | Back to the section list |
 | `O` | Change the output folder |
@@ -277,7 +277,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 </details>
 <!-- AUTO-OPTIONS:END -->
 
-Legend: **[!]** = changes the machine (asks first) Â· **slow** = can take several minutes Â· **dl** = downloads a tool from the vendor's site.
+Legend: **[!]** = changes the machine (asks first) | **slow** = can take several minutes | **dl** = downloads a tool from the vendor's site.
 
 ### A. System health
 | # | Option | Notes |
@@ -291,7 +291,7 @@ Legend: **[!]** = changes the machine (asks first) Â· **slow** = can take seve
 | 7 | Performance snapshot (CPU / RAM / disk latency / network, 30 sec) | |
 | 8 | Boot / logon performance (what slows startup) | |
 | 9 | Hardware health (SMART, disk errors, driver problems, battery, temps) | |
-| 10 | Pending reboot â€“ detailed (CBS, Windows Update, file renames, rename/domain join, ConfigMgr) | |
+| 10 | Pending reboot - detailed (CBS, Windows Update, file renames, rename/domain join, ConfigMgr) | |
 | 11 | Device join / Entra ID / Workplace join / PIN status (dsregcmd) | Flags stray workplace joins that break Windows Hello PINs |
 | 12 | Patch & reboot history report | HTML |
 | 13 | **[!]** Enable crash dumps (Automatic memory dump) | |
@@ -299,22 +299,22 @@ Legend: **[!]** = changes the machine (asks first) Â· **slow** = can take seve
 ### C. Windows Update / upgrade / repair
 | # | Option | Notes |
 |---|---|---|
-| 14 | Windows Update â€“ list available updates + history (optional install) | slow |
+| 14 | Windows Update - list available updates + history (optional install) | slow |
 | 15 | **[!]** Reset Windows Update components (Windows 10/11) | Afterwards it offers to delete the leftover `.bak` folders |
 | 16 | **[!]** Repair Windows Update (Windows Server 2016+) | |
 | 17 | **[!]** System file repair (DISM RestoreHealth + SFC) | |
 | 18 | Windows 11 upgrade troubleshooter | Status, SetupDiag results, logs |
-| 19 | Microsoft SetupDiag â€“ why did an upgrade fail? | dl |
-| 20 | System Reserved / EFI partition â€“ check & free space | Fixes 0x800f0922. Briefly mounts the partition; deleting asks first |
+| 19 | Microsoft SetupDiag - why did an upgrade fail? | dl |
+| 20 | System Reserved / EFI partition - check & free space | Fixes 0x800f0922. Briefly mounts the partition; deleting asks first |
 
 ### D. Disk space
 | # | Option | Notes |
 |---|---|---|
-| 21 | Disk space check â€“ what can be reclaimed | Read-only |
+| 21 | Disk space check - what can be reclaimed | Read-only |
 | 22 | **[!]** Disk space cleanup (workstation / general) | Logs free space after each stage. Never raises the System Restore cap. Skips an update cache that's mid-download |
-| 23 | Disk space analyze & resolve â€“ servers | Dry run by default |
+| 23 | Disk space analyze & resolve - servers | Dry run by default |
 | 24 | Find largest folders | slow |
-| 25 | Event log folder bloat (Archive-*.evtx) â€“ check / clean up | |
+| 25 | Event log folder bloat (Archive-*.evtx) - check / clean up | |
 | 26 | **[!]** Clear Dell SupportAssist remediation cache | Often 100+ GB |
 
 ### E. Network / DHCP / DNS / shares
@@ -329,14 +329,14 @@ Legend: **[!]** = changes the machine (asks first) Â· **slow** = can take seve
 | 33 | **[!]** Network quick fixes | Flush DNS / DHCP renew / Winsock + TCP/IP reset |
 | 34 | DHCP Event 1059 / DC authorization diagnostics | |
 | 35 | DHCP mobile device lease audit / cleanup | Audit only by default |
-| 36 | DNS server forwarders â€“ check / set | |
+| 36 | DNS server forwarders - check / set | |
 | 37 | File shares, sessions and open files | Can force-close locked files |
 
 ### F. Remote Desktop (RDP / RDS)
 | # | Option | Notes |
 |---|---|---|
 | 38 | RDP / RDS server health | Services, sessions, licensing, September 2026 update hang |
-| 39 | **[!]** RDS fix â€“ September 2026 update hang | Restart services / install the fix update / registry workaround (backed up first) |
+| 39 | **[!]** RDS fix - September 2026 update hang | Restart services / install the fix update / registry workaround (backed up first) |
 | 40 | **[!]** RDP clipboard / drive "redirection" popup | Apply or remove the `RedirectionWarningDialogVersion` stopgap |
 
 ### G. Hyper-V / virtual machines
@@ -357,9 +357,9 @@ Legend: **[!]** = changes the machine (asks first) Â· **slow** = can take seve
 | 49 | Active Directory / DC health | dcdiag, repadmin, FSMO, SYSVOL / DFSR |
 | 50 | Group Policy audit | HTML + CSV |
 | 51 | Group Policy results for this machine | gpresult HTML + Group Policy errors |
-| 52 | AD users â€“ true last logon | Queries every DC. slow |
-| 53 | Export BitLocker recovery keys from AD | **Secret output â€“ handle securely** |
-| 54 | Export LAPS passwords from AD (legacy + Windows LAPS) | **Secret output â€“ handle securely** |
+| 52 | AD users - true last logon | Queries every DC. slow |
+| 53 | Export BitLocker recovery keys from AD | **Secret output - handle securely** |
+| 54 | Export LAPS passwords from AD (legacy + Windows LAPS) | **Secret output - handle securely** |
 | 55 | Azure AD / Entra Connect Sync (ADSync) status | Offers to restart the service if it's stopped |
 | 56 | Backup / VSS health | VSS writers, shadow storage, Windows Server Backup, backup agents |
 | 57 | Folder permissions (ACL) export | |
@@ -369,8 +369,8 @@ Legend: **[!]** = changes the machine (asks first) Â· **slow** = can take seve
 | # | Option | Notes |
 |---|---|---|
 | 59 | Security posture | AV, firewall, BitLocker, TPM, Secure Boot, SMBv1, RDP NLA, local admins, expiring certificates, activation |
-| 60 | Sysinternals Autoruns â€“ startup / persistence report | Unsigned items flagged. dl |
-| 61 | Sysinternals Sigcheck â€“ unsigned executables in user / ProgramData folders | dl |
+| 60 | Sysinternals Autoruns - startup / persistence report | Unsigned items flagged. dl |
+| 61 | Sysinternals Sigcheck - unsigned executables in user / ProgramData folders | dl |
 | 62 | N-central compromise IOC hunt | |
 | 63 | Unknown / adware program hunt | Prefetch, browser notification permissions, startup, scheduled tasks |
 | 64 | Incident response log collection for a time window | 4688, PowerShell, Defender, WMI, logons. Zipped. slow |
@@ -380,11 +380,11 @@ Legend: **[!]** = changes the machine (asks first) Â· **slow** = can take seve
 | # | Option | Notes |
 |---|---|---|
 | 66 | Installed software inventory | CSV |
-| 67 | User profiles â€“ size, last use | slow |
+| 67 | User profiles - size, last use | slow |
 | 68 | Migration inventory (full machine discovery) | slow |
 | 69 | Install provenance for a program (when / how / by whom) | |
 | 70 | .NET / Node.js / Java / Python / VC++ runtime versions | |
-| 71 | Citrix Workspace app â€“ install state | |
+| 71 | Citrix Workspace app - install state | |
 | 72 | Time sync (w32time) check / resync | |
 
 ### K. Quick fixes
@@ -396,7 +396,7 @@ Legend: **[!]** = changes the machine (asks first) Â· **slow** = can take seve
 | 76 | **[!]** OneDrive reset |
 | 77 | **[!]** Repair `.zip` association / reset default browser (per user) |
 | 78 | **[!]** Remove bloatware (OEM + consumer Store apps) |
-| 79 | **[!]** Power settings â€“ never sleep / hibernate |
+| 79 | **[!]** Power settings - never sleep / hibernate |
 
 ### L. Software deployment (downloads to `C:\temp\Tools`)
 | # | Option | Notes |
@@ -410,10 +410,10 @@ Legend: **[!]** = changes the machine (asks first) Â· **slow** = can take seve
 | # | Option | Notes |
 |---|---|---|
 | 84 | NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimesView, LastActivityView, USBDeview, DriverView | HTML. dl |
-| 85 | Sysinternals Handle â€“ what is locking this file? | dl |
-| 86 | Sysinternals ProcDump â€“ dump a hung or crashing program | dl |
+| 85 | Sysinternals Handle - what is locking this file? | dl |
+| 86 | Sysinternals ProcDump - dump a hung or crashing program | dl |
 | 87 | Download & launch a GUI tool | Process Explorer, Process Monitor, Autoruns, TCPView, RAMMap, ShellExView, CurrPorts... dl |
-| 88 | Microsoft TSS â€“ official support log collection (SDP) | dl |
+| 88 | Microsoft TSS - official support log collection (SDP) | dl |
 
 
 ### N. Microsoft 365 (Exchange Online / Entra ID / Intune)
@@ -425,10 +425,10 @@ Each option runs in its own PowerShell window and signs in only to the services 
 | 90 | Install / repair PowerShell modules | EXO, Graph, SPO, Teams. Also installs EXO 3.7.1 side by side to fix the EXO + Graph "method not found" conflict |
 | 91 | Compromised account **audit** | Rules, forwarding, sign-ins and risk, MFA methods, delegates, OAuth apps, recent sends, admin roles. HTML report |
 | 92 | **[!]** **Contain** a compromised account | Step 1 (Entra): block sign-in, revoke sessions, reset password (cloud or on-prem AD), review MFA methods and app consents. Step 2 (Exchange): remove forwarding, disable malicious rules, lift the outbound-spam send restriction, check delegates |
-| 93 | Inbox rules â€“ one or all mailboxes | Flags forward / delete / hide rules, and uses the **audit log to show when each rule was created** (useful for proving a "new rules" alert is wrong) |
+| 93 | Inbox rules - one or all mailboxes | Flags forward / delete / hide rules, and uses the **audit log to show when each rule was created** (useful for proving a "new rules" alert is wrong) |
 | 94 | Forwarding audit | Mailbox forwarding, external-forwarding rules, tenant auto-forward policy |
 | 95 | Message trace | Sender / recipient / subject, up to 90 days (10-day chunks), delivery detail |
-| 96 | Quarantine â€“ find & release | Shows *why*: Spam / **Bulk (BCL)** / Phish / Malware. Never releases malware or high-confidence phish |
+| 96 | Quarantine - find & release | Shows *why*: Spam / **Bulk (BCL)** / Phish / Malware. Never releases malware or high-confidence phish |
 | 97 | Why is this sender filtered? | Mail flow rules, BCL vs SCL, Tenant Allow/Block List, impersonation exclusions. One-step fixes: allow sender, exclude domain from impersonation, add `BulkStamping=0` to a rule |
 | 98 | SPF / DKIM / DMARC / MX check | Every accepted domain. Flags SPF lookup count, multiple SPF records, `+all`, DMARC `p=none`, missing or disabled M365 DKIM |
 | 99 | Direct Send / connectors | Lists connectors. **[!]** Creates an IP-restricted connector for scanners and apps, and turns RejectDirectSend on or off |
@@ -463,10 +463,10 @@ Each option runs in its own PowerShell window and signs in only to the services 
 The self-test checks the toolkit itself on a real machine. It runs every **read-only** option with its default answers and **declines every change**.
 
 ```powershell
-# Standard (about 5â€“10 minutes)
+# Standard (about 5-10 minutes)
 powershell -ExecutionPolicy Bypass -File .\SigmaDataSystems-ToolKit-v2.ps1 -SelfTest
 
-# Full coverage (about 20â€“40 minutes, needs internet)
+# Full coverage (about 20-40 minutes, needs internet)
 powershell -ExecutionPolicy Bypass -File .\SigmaDataSystems-ToolKit-v2.ps1 -SelfTest -IncludeSlow -IncludeDownloads
 ```
 
@@ -498,21 +498,21 @@ Everything is written under `C:\temp`. Change it with `-OutputRoot` or menu `O`.
 
 ```
 C:\temp\
-â”œâ”€â”€ Crash\            BSOD / crash HTML reports
-â”œâ”€â”€ EventLogs\        .evtx exports + error CSVs + .zip
-â”œâ”€â”€ DiskSpace\        cleanup logs, largest-folder CSVs
-â”œâ”€â”€ WindowsUpdate\    WU reset / repair logs
-â”œâ”€â”€ Network\          connection lists, reachability logs, Wi-Fi reports
-â”œâ”€â”€ HyperV\           host / guest / hang captures
-â”œâ”€â”€ RDS\              registry backups before RDS changes
-â”œâ”€â”€ AD\  ADHealth\    AD exports and DC health output
-â”œâ”€â”€ Security\         posture, Autoruns, unsigned files, adware hunt
-â”œâ”€â”€ IR\               incident response collections (.zip)
-â”œâ”€â”€ NirSoft\          NirSoft HTML reports
-â”œâ”€â”€ Software\         inventories, profiles, install provenance
-â”œâ”€â”€ M365\             Microsoft 365 reports (rules, traces, quarantine, licenses, audits...)
-â”œâ”€â”€ SelfTest\         self-test reports
-â””â”€â”€ Tools\            downloaded tools (Sysinternals, NirSoft, Ninite, Office ODT, TSS, SetupDiag)
++-- Crash\            BSOD / crash HTML reports
++-- EventLogs\        .evtx exports + error CSVs + .zip
++-- DiskSpace\        cleanup logs, largest-folder CSVs
++-- WindowsUpdate\    WU reset / repair logs
++-- Network\          connection lists, reachability logs, Wi-Fi reports
++-- HyperV\           host / guest / hang captures
++-- RDS\              registry backups before RDS changes
++-- AD\  ADHealth\    AD exports and DC health output
++-- Security\         posture, Autoruns, unsigned files, adware hunt
++-- IR\               incident response collections (.zip)
++-- NirSoft\          NirSoft HTML reports
++-- Software\         inventories, profiles, install provenance
++-- M365\             Microsoft 365 reports (rules, traces, quarantine, licenses, audits...)
++-- SelfTest\         self-test reports
++-- Tools\            downloaded tools (Sysinternals, NirSoft, Ninite, Office ODT, TSS, SetupDiag)
 ```
 
 > **Secret output:** options 53 (BitLocker keys) and 54 (LAPS passwords) write secrets to disk.
@@ -564,15 +564,15 @@ Some options still do things EDRs watch closely: reading LAPS / BitLocker data, 
 
 ```
 SigmaDataSystems-ToolKit-v2.ps1
-â”œâ”€â”€ Help header + parameters
-â”œâ”€â”€ Helpers          prompts, confirmations, output folders, self-test answers
-â”œâ”€â”€ Tool runner      writes a built-in script to %TEMP%\SDSI-ToolKit_xxxx\ and runs it in its own
-â”‚                    Windows PowerShell process (a script that exits or errors can't kill the menu)
-â”œâ”€â”€ Menu actions     one Invoke-* function per option
-â”œâ”€â”€ Self-test
-â”œâ”€â”€ Menu definition  sections + options (numbers are assigned automatically)
-â”œâ”€â”€ Built-in tools   $Script:Payloads['Name'] = @' ...plain .ps1 text... '@
-â””â”€â”€ Main loop
++-- Help header + parameters
++-- Helpers          prompts, confirmations, output folders, self-test answers
++-- Tool runner      writes a built-in script to %TEMP%\SDSI-ToolKit_xxxx\ and runs it in its own
+|                    Windows PowerShell process (a script that exits or errors can't kill the menu)
++-- Menu actions     one Invoke-* function per option
++-- Self-test
++-- Menu definition  sections + options (numbers are assigned automatically)
++-- Built-in tools   $Script:Payloads['Name'] = @' ...plain .ps1 text... '@
++-- Main loop
 ```
 
 - Built-in scripts are stored as single-quoted here-strings. A line inside a script that starts with `'@` is saved with a `#SDSI-ESC#` prefix so it can't end the block early, and the prefix is removed when the script is unpacked.
@@ -644,7 +644,7 @@ SigmaDataSystems-ToolKit-v2.ps1
 ## Changelog
 
 ### v2.0 (2026-10)
-- **Microsoft 365 section (options 89â€“122)**: compromised-account audit and containment, inbox rules with audit-log timestamps, forwarding, message trace, quarantine release, sender filtering diagnosis (BCL vs SCL), SPF / DKIM / DMARC, Direct Send connectors, mobile device wipe, audit log, sign-ins, MFA, stale accounts, admin roles, licenses, new users, app consent, expiring app secrets, Intune / BitLocker escrow, OneDrive sharing, retention exclusions, tenant hardening, posture audit and remediation plan, app registration, hybrid join and BitLocker-to-Entra on the PC. Works for client tenants via GDAP.
+- **Microsoft 365 section (options 89-122)**: compromised-account audit and containment, inbox rules with audit-log timestamps, forwarding, message trace, quarantine release, sender filtering diagnosis (BCL vs SCL), SPF / DKIM / DMARC, Direct Send connectors, mobile device wipe, audit log, sign-ins, MFA, stale accounts, admin roles, licenses, new users, app consent, expiring app secrets, Intune / BitLocker escrow, OneDrive sharing, retention exclusions, tenant hardening, posture audit and remediation plan, app registration, hybrid join and BitLocker-to-Entra on the PC. Works for client tenants via GDAP.
 - Section menu: section letters, direct option numbers, `ALL`, `B` back.
 - **Public IP** lookup (also shown in the quick snapshot) and an **internet speed test** (built-in Cloudflare test or Ookla CLI, with history).
 - Built-in **self-test** (`-SelfTest`, `-IncludeSlow`, `-IncludeDownloads`, menu `T`).
@@ -671,14 +671,14 @@ SigmaDataSystems-ToolKit-v2.ps1
 
 - **[Sigma Data Systems Inc.](https://sigmadatainc.com/)**: toolkit, menu, and most built-in scripts.
 - **Built-in third-party scripts** (attribution kept in each script's header):
-  - `Get-LAPSPasswords.ps1` â€“ Karl Fosaaen / NetSPI, https://github.com/kfosaaen/Get-LAPSPasswords
-  - `Export-Bitlockerkeys.ps1` â€“ Ali Tajran, https://www.alitajran.com/
+  - `Get-LAPSPasswords.ps1` - Karl Fosaaen / NetSPI, https://github.com/kfosaaen/Get-LAPSPasswords
+  - `Export-Bitlockerkeys.ps1` - Ali Tajran, https://www.alitajran.com/
 - **Ideas drawn from** (MIT-licensed, rewritten here): [bcwilhite/PendingReboot](https://github.com/bcwilhite/PendingReboot), [MahmoudNoureddine/SysAdmin-PS-Toolkit](https://github.com/MahmoudNoureddine/SysAdmin-PS-Toolkit), [steviecoaster/PSSysadminToolkit](https://github.com/steviecoaster/PSSysadminToolkit), [ruudmens/LazyAdmin](https://github.com/ruudmens/LazyAdmin).
 - **Microsoft 365**: the security posture audit's check library (`data/all-checks.json`) is modeled on SaaS posture-management checks and maintained by Sigma Data Systems. Microsoft's licensing friendly-name list is downloaded at run time from download.microsoft.com.
 - **Downloaded tools** keep their own licenses and are not redistributed here:
-  - Sysinternals â€“ Microsoft license terms: https://learn.microsoft.com/sysinternals/license-terms. Command-line tools run with `-accepteula` after you confirm.
-  - NirSoft â€“ freeware by Nir Sofer: https://www.nirsoft.net
-  - Ninite, Ookla Speedtest CLI (its license and privacy terms are accepted when you run it), Microsoft TSS / SetupDiag / Office Deployment Tool â€“ their vendors' terms apply.
+  - Sysinternals - Microsoft license terms: https://learn.microsoft.com/sysinternals/license-terms. Command-line tools run with `-accepteula` after you confirm.
+  - NirSoft - freeware by Nir Sofer: https://www.nirsoft.net
+  - Ninite, Ookla Speedtest CLI (its license and privacy terms are accepted when you run it), Microsoft TSS / SetupDiag / Office Deployment Tool - their vendors' terms apply.
 
 ---
 
@@ -688,4 +688,4 @@ This toolkit is provided **as is**, without warranty. Options marked `[!]` chang
 
 ---
 
-**Sigma Data Systems Inc.** Â· https://sigmadatainc.com/
+**Sigma Data Systems Inc.** | https://sigmadatainc.com/

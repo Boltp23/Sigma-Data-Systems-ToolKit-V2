@@ -226,18 +226,17 @@ try {
                 if ($kv.Text) { $num++; $lines.Add(("{0}. {1}" -f $num, ($kv.Text -replace '\|', '\|'))) }
             }
             $index = "<!-- AUTO-OPTIONS:START -->`r`n<details><summary><b>Quick index of all $num options</b> (auto-generated from the script, $tkDate)</summary>`r`n" + ($lines -join "`r`n") + "`r`n`r`n</details>`r`n<!-- AUTO-OPTIONS:END -->"
-            $rm = Get-Content $readme -Raw
+            # Read/write explicitly as UTF-8: Windows PowerShell 5.1 would otherwise read a BOM-less README as ANSI and garble it
+            $rm = [System.IO.File]::ReadAllText($readme, [System.Text.Encoding]::UTF8)
             if ($rm -match '(?s)<!-- AUTO-OPTIONS:START -->.*?<!-- AUTO-OPTIONS:END -->') {
                 $rm = [regex]::Replace($rm, '(?s)<!-- AUTO-OPTIONS:START -->.*?<!-- AUTO-OPTIONS:END -->', { param($m) $index })
             } else {
                 $rm = $rm -replace '(## All options\s*\r?\n)', "`$1`r`n$index`r`n"
             }
             $rm = [regex]::Replace($rm, '\*\*\d+ diagnostics', "**$num diagnostics")
-            $dash = [string][char]0x2013   # en dash - kept out of the source so the file stays pure ASCII
-            $rm = [regex]::Replace($rm, ('`1`' + $dash + '`\d+`'), ('`1`' + $dash + '`' + $num + '`'))
+            $rm = [regex]::Replace($rm, '`1`(-|\u2013)`\d+`', ('`1`-`' + $num + '`'))
             $ver = (Select-String -Path $tkFile -Pattern "ToolkitVersion\s*=\s*'([^']+)'" | Select-Object -First 1).Matches.Groups[1].Value
-            $dot = [string][char]0x00B7
-            $stamp = "<!-- AUTO-VERSION -->**Current version: v$ver** $dot $num options $dot updated $tkDate<!-- /AUTO-VERSION -->"
+            $stamp = "<!-- AUTO-VERSION -->**Current version: v$ver** | $num options | updated $tkDate<!-- /AUTO-VERSION -->"
             if ($rm -match '<!-- AUTO-VERSION -->.*?<!-- /AUTO-VERSION -->') { $rm = [regex]::Replace($rm, '<!-- AUTO-VERSION -->.*?<!-- /AUTO-VERSION -->', { param($m) $stamp }) }
             [System.IO.File]::WriteAllText($readme, $rm, (New-Object System.Text.UTF8Encoding($false)))
             Log "README refreshed: $num options, v$ver"
