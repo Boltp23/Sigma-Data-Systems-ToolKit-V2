@@ -1774,12 +1774,12 @@ function Invoke-ProfileRebuild {
         if (-not (Test-Path $dst)) { Write-Host "  $dst does not exist yet - the user must sign in once first." -ForegroundColor Red; return }
 
         # Read the old registry hive: folder redirection (OneDrive), mapped drives, printers
-        $hive = 'HKU\SDSI_OldProfile'; $redirected = @(); $info = @()
+        $hive = 'HKU\SDSI_OldProfile'; $redirected = @(); $redirTargets = @(); $info = @()
         if (Test-Path "$src\NTUSER.DAT") {
             & reg.exe load $hive "$src\NTUSER.DAT" 2>$null | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 $sf = Get-ItemProperty 'Registry::HKEY_USERS\SDSI_OldProfile\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction SilentlyContinue
-                foreach ($k in @{ Desktop = 'Desktop'; Personal = 'Documents'; 'My Pictures' = 'Pictures' }.GetEnumerator()) { if ("$($sf.($k.Key))" -match 'OneDrive|^\\\\') { $redirected += $k.Value } }
+                foreach ($k in @{ Desktop = 'Desktop'; Personal = 'Documents'; 'My Pictures' = 'Pictures' }.GetEnumerator()) { if ("$($sf.($k.Key))" -match 'OneDrive|^\\\\') { $redirected += $k.Value; $redirTargets += [pscustomobject]@{ Folder = $k.Value; Target = "$($sf.($k.Key))" } } }
                 Get-ChildItem 'Registry::HKEY_USERS\SDSI_OldProfile\Network' -ErrorAction SilentlyContinue | ForEach-Object { $info += [pscustomobject]@{ Type = 'Mapped drive'; Item = "$($_.PSChildName): -> $((Get-ItemProperty $_.PSPath).RemotePath)" } }
                 Get-ChildItem 'Registry::HKEY_USERS\SDSI_OldProfile\Printers\Connections' -ErrorAction SilentlyContinue | ForEach-Object { $info += [pscustomobject]@{ Type = 'Printer'; Item = ($_.PSChildName -replace ',', '\') } }
                 $defPrn = (Get-ItemProperty 'Registry::HKEY_USERS\SDSI_OldProfile\Software\Microsoft\Windows NT\CurrentVersion\Windows' -ErrorAction SilentlyContinue).Device
@@ -1788,7 +1788,16 @@ function Invoke-ProfileRebuild {
                 & reg.exe unload $hive 2>$null | Out-Null
             } else { Write-Host '  Could not load the old NTUSER.DAT (corrupt or in use) - skipping drive/printer list.' -ForegroundColor DarkYellow }
         }
-        if ($redirected) { Write-Host "  Old profile had $($redirected -join ', ') redirected to OneDrive/network - NOT copied (sign in to OneDrive and it re-syncs)." -ForegroundColor Yellow }
+        if ($redirected) {
+            Write-Host '  These folders were REDIRECTED in the old profile - their files are NOT in the old folder and are NOT copied:' -ForegroundColor Yellow
+            $redirTargets | Format-Table -AutoSize -Wrap
+            if ($redirTargets | Where-Object { $_.Target -match '^\\\\' }) {
+                Write-Host '  Network (server) redirection: the files are on the server. The new profile gets them back when the folder-redirection' -ForegroundColor Cyan
+                Write-Host '  Group Policy applies - user on the office network, gpupdate /force, then sign out/in (can take 2 sign-ins).' -ForegroundColor Cyan
+                Write-Host '  Do NOT clear the Offline Files (CSC) cache - it may hold changes not yet synced to the server (check Sync Center).' -ForegroundColor DarkYellow
+            }
+            if ($redirTargets | Where-Object { $_.Target -match 'OneDrive' }) { Write-Host '  OneDrive redirection: sign the user in to OneDrive and turn on folder backup - files re-sync from the cloud.' -ForegroundColor Cyan }
+        }
         $oneDrive = Get-ChildItem $src -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue
         if ($oneDrive) { Write-Host "  Skipping $($oneDrive.Name -join ', ') - OneDrive will re-sync it. (Copy manually only if there were un-synced files.)" -ForegroundColor Yellow }
 
@@ -1854,6 +1863,68 @@ function Invoke-ProfileRebuild {
         Write-Host "`n  Restore log: $logf" -ForegroundColor Green
         Write-Host '  Then: sign in to OneDrive + Outlook (new Outlook profile builds automatically for M365), check browser bookmarks,' -ForegroundColor Cyan
         Write-Host "  re-attach any PSTs. Keep $src for a couple of weeks, then delete it." -ForegroundColor Cyan
+    }
+}
+
+function Invoke-FolderRedirectionReset {
+    Write-Title 'Folder redirection - show source GPO / point folders back to the local profile'
+    Write-Host '  Use when a user''s Desktop/Documents are redirected to a server share and should not be.' -ForegroundColor Gray
+    Write-Host '  FIRST stop the GPO (unlink / security-filter / set "redirect back on policy removal"), or it re-redirects at next sign-in.' -ForegroundColor DarkYellow
+    $profs = @(Get-CimInstance Win32_UserProfile | Where-Object { -not $_.Special -and $_.LocalPath -like '*\Users\*' -and $_.LocalPath -notmatch '\.old_' } | Sort-Object LastUseTime -Descending)
+    for ($i = 0; $i -lt $profs.Count; $i++) {
+        $u = try { (New-Object Security.Principal.SecurityIdentifier($profs[$i].SID)).Translate([Security.Principal.NTAccount]).Value } catch { $profs[$i].SID }
+        $profs[$i] | Add-Member NoteProperty Account $u -Force
+        Write-Host ("   {0,2}. {1,-35} {2,-28} Signed in: {3}" -f ($i + 1), $u, $profs[$i].LocalPath, $profs[$i].Loaded)
+    }
+    $n = Read-Int '  User number (0 = cancel)' 0
+    if ($n -lt 1 -or $n -gt $profs.Count) { return }
+    $p = $profs[$n - 1]; $loadedHere = $false
+    $root = "Registry::HKEY_USERS\$($p.SID)"
+    if (-not (Test-Path $root)) {
+        & reg.exe load "HKU\SDSI_FR" "$($p.LocalPath)\NTUSER.DAT" 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Host '  Could not load the user''s registry hive.' -ForegroundColor Red; return }
+        $root = 'Registry::HKEY_USERS\SDSI_FR'; $loadedHere = $true
+    }
+    try {
+        $usf = "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        $shf = "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+        $map = [ordered]@{ Desktop = 'Desktop'; Personal = 'Documents'; 'My Pictures' = 'Pictures'; 'My Music' = 'Music'; 'My Video' = 'Videos'; Favorites = 'Favorites'
+                           '{374DE290-123F-4565-9164-39C4925E467B}' = 'Downloads'; AppData = 'AppData\Roaming'; 'Start Menu' = 'AppData\Roaming\Microsoft\Windows\Start Menu' }
+        $cur = Get-ItemProperty $usf -ErrorAction SilentlyContinue
+        $rows = foreach ($k in $map.Keys) { $v = "$($cur.$k)"; if ($v) { [pscustomobject]@{ Folder = $map[$k]; Key = $k; Target = $v; Redirected = ($v -match '^\\\\') } } }
+        Write-Sub "Folder locations for $($p.Account)"
+        $rows | Format-Table Folder, Target, Redirected -AutoSize -Wrap
+        $red = @($rows | Where-Object Redirected)
+        if (-not $red) { Write-Host '  Nothing is redirected to a network share.' -ForegroundColor Green; return }
+
+        Write-Sub 'Which GPO is doing it'
+        if ($p.Loaded) { Write-Host '  As the USER run:  gpresult /h C:\temp\gp.html  -> "Folder Redirection" shows the winning GPO.' -ForegroundColor Cyan }
+        Write-Host '  On a DC (finds every GPO with folder redirection):' -ForegroundColor Cyan
+        Write-Host '    Get-GPO -All | ? { (Get-GPOReport -Guid $_.Id -ReportType Xml) -match ''FolderRedirection'' } | ft DisplayName, ModificationTime, GpoStatus' -ForegroundColor Gray
+        Write-Host '  Check the policy''s "Policy Removal" setting: "Leave the folder in the new location" (default) means removing the GPO' -ForegroundColor DarkYellow
+        Write-Host '  does NOT bring folders back for existing users - that is what this option fixes.' -ForegroundColor DarkYellow
+
+        if (-not (Confirm-Change "Point $(($red.Folder) -join ', ') for $($p.Account) back to $($p.LocalPath) (copy files from the server first if you choose).")) { return }
+        $copy = Read-YesNo '  Copy the files from the server locations into the local folders first?' $true
+        $logf = Join-Path (Get-OutDir 'ProfileRebuild') "FolderRedirReset_$((Split-Path $p.LocalPath -Leaf))_$(Get-Stamp).log"
+        foreach ($r in $red) {
+            $local = Join-Path $p.LocalPath $map[$r.Key]
+            Ensure-Dir $local | Out-Null
+            $srcPath = [Environment]::ExpandEnvironmentVariables(($r.Target -replace '%USERNAME%', (Split-Path $p.LocalPath -Leaf)))
+            if ($copy) {
+                if (Test-Path -LiteralPath $srcPath) {
+                    & robocopy.exe $srcPath $local /E /XJ /R:1 /W:1 /COPY:DAT /DCOPY:T /XF desktop.ini /NP /NFL /NDL /LOG+:"$logf" | Out-Null
+                    Write-Host "  Copied $srcPath -> $local (robocopy exit $LASTEXITCODE)" -ForegroundColor $(if ($LASTEXITCODE -lt 8) { 'Green' } else { 'Red' })
+                } else { Write-Host "  Cannot reach $srcPath - folder repointed but nothing copied (copy it later)." -ForegroundColor Yellow }
+            }
+            Set-ItemProperty $usf -Name $r.Key -Value ('%USERPROFILE%\' + $map[$r.Key]) -Type ExpandString
+            Set-ItemProperty $shf -Name $r.Key -Value $local -ErrorAction SilentlyContinue
+        }
+        Write-Host "`n  Done. Sign the user out and back in. Copy log: $logf" -ForegroundColor Green
+        Write-Host '  If folders go back to the server after sign-in, the GPO is still applying to this user - fix the GPO first.' -ForegroundColor DarkYellow
+        Write-Host '  Offline Files: if CSC is enabled only for redirection, you can disable it later (Sync Center > Manage offline files) once data is verified.' -ForegroundColor Gray
+    } finally {
+        if ($loadedHere) { $cur = $null; [gc]::Collect(); Start-Sleep 1; & reg.exe unload 'HKU\SDSI_FR' 2>$null | Out-Null }
     }
 }
 
@@ -3433,6 +3504,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Installed software inventory (CSV)';                                            Action = { Invoke-SoftwareInventory } }
     @{ Test='slow'; Text = 'User profiles - size, last use (stale / temp profiles)';                        Action = { Invoke-UserProfiles } }
     @{               Text = '[!] Rebuild a corrupted user profile (back up, reset, restore data)';            Action = { Invoke-ProfileRebuild } }
+    @{               Text = '[!] Folder redirection - find GPO / point Desktop+Documents back to local (copy data)'; Action = { Invoke-FolderRedirectionReset } }
     @{ Test='slow'; Text = 'Migration inventory (full machine discovery)';                                  Action = { Invoke-MigrationInventory } }
     @{ Test='safe'; Text = 'Install provenance for a program (when/how/by whom)';                           Action = { Invoke-InstallProvenance } }
     @{ Test='safe'; Text = '.NET / Node.js / Java / Python / VC++ runtime versions';                         Action = { Invoke-DotNetVersion } }
