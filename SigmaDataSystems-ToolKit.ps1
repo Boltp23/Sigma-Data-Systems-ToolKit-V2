@@ -36,7 +36,7 @@
     v2.0 - adds: section menu, self-test, security posture, hardware/SMART, reliability, perf,
     boot performance, pending-reboot detail, Windows Update list/install, SFC/DISM, AD/DC health,
     backup/VSS health, shares/open files, advanced network (MTU/tracert/proxy/Wi-Fi), server roles,
-    quick fixes (spooler, network, Teams, Office, OneDrive, OneDrive file-open errors), software deployment (Ninite, vendor
+    quick fixes (spooler, network, Teams, Office, OneDrive), software deployment (Ninite, vendor
     MSIs, Microsoft 365 Apps via ODT, remove OEM Office), Sysinternals (Autoruns, Sigcheck, Handle,
     ProcDump, GUI tools), NirSoft reports, Microsoft SetupDiag and TSS. Third-party tools are
     downloaded at run time from their official sites into C:\temp\Tools and signature-checked;
@@ -635,7 +635,7 @@ function Invoke-ReachabilityTest {
         }
         $until = (Get-Date).AddSeconds($interval)
         while ((Get-Date) -lt $until) {
-            if ([Console]::KeyAvailable -and [Console]::ReadKey($true).Key -eq 'Q') { Write-Host '  Stopped.'; return }
+            $q = $false; try { $q = [Console]::KeyAvailable -and [Console]::ReadKey($true).Key -eq 'Q' } catch { }; if ($q) { Write-Host '  Stopped.'; return }
             Start-Sleep -Milliseconds 250
         }
     }
@@ -1041,43 +1041,6 @@ function Invoke-RemoveBloatware {
     if (Confirm-Change 'Remove bloatware AppX packages for all users and from the provisioning image.') {
         Invoke-Tool 'Remove-Bloatware' ([ordered]@{ OutputPath = (Get-OutDir 'Bloatware') }) | Out-Null
     }
-}
-
-function Invoke-WUDriverBlock {
-    Write-Title 'Windows Update driver updates - block / allow'
-    $wuKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-    $dsKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching'
-    $mdKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching'
-    $cur = [pscustomobject]@{
-        ExcludeWUDriversInQualityUpdate = (Get-ItemProperty $wuKey -ErrorAction SilentlyContinue).ExcludeWUDriversInQualityUpdate
-        SearchOrderConfig               = (Get-ItemProperty $dsKey -ErrorAction SilentlyContinue).SearchOrderConfig
-        DontSearchWindowsUpdate_Policy  = (Get-ItemProperty $mdKey -ErrorAction SilentlyContinue).DontSearchWindowsUpdate
-    }
-    Write-Sub 'Current settings (1 / 0 / 1 = drivers blocked)'
-    $cur | Format-List
-    Write-Sub 'Drivers installed by Windows Update (last 60 days)'
-    try {
-        $s = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
-        $n = $s.GetTotalHistoryCount()
-        if ($n -gt 0) { $s.QueryHistory(0, [math]::Min($n, 300)) | Where-Object { $_.Date -ge (Get-Date).AddDays(-60) -and $_.Title -match 'Driver|Firmware' } |
-            Select-Object @{n='Date';e={$_.Date.ToLocalTime()}}, Title | Format-Table -AutoSize -Wrap }
-    } catch { Write-Host '  Could not read Windows Update history.' -ForegroundColor DarkGray }
-    $mode = (Read-Default '  B = block driver updates, A = allow again, blank = no change' '').ToString().ToUpper()
-    if ($mode -eq 'B') {
-        if (-not (Confirm-Change 'Stop Windows Update and automatic device installs from downloading drivers (OEM tools like Dell Command Update still work).')) { return }
-        foreach ($k in $wuKey, $dsKey, $mdKey) { if (-not (Test-Path $k)) { New-Item $k -Force | Out-Null } }
-        Set-ItemProperty $wuKey -Name ExcludeWUDriversInQualityUpdate -Value 1 -Type DWord
-        Set-ItemProperty $dsKey -Name SearchOrderConfig -Value 0 -Type DWord
-        Set-ItemProperty $mdKey -Name DontSearchWindowsUpdate -Value 1 -Type DWord
-        Write-Host '  Driver updates from Windows Update are now BLOCKED. Install drivers with the OEM tool (Dell Command Update, Lenovo Vantage, HP Image Assistant).' -ForegroundColor Green
-        Write-Host '  Note: an RMM/Intune/GPO policy can override these values - set it there too for a permanent fleet setting.' -ForegroundColor DarkYellow
-    } elseif ($mode -eq 'A') {
-        if (-not (Confirm-Change 'Allow Windows Update to install drivers again.')) { return }
-        Remove-ItemProperty $wuKey -Name ExcludeWUDriversInQualityUpdate -ErrorAction SilentlyContinue
-        Set-ItemProperty $dsKey -Name SearchOrderConfig -Value 1 -Type DWord -ErrorAction SilentlyContinue
-        Remove-ItemProperty $mdKey -Name DontSearchWindowsUpdate -ErrorAction SilentlyContinue
-        Write-Host '  Windows Update driver updates ALLOWED again.' -ForegroundColor Green
-    } else { Write-Host '  No change made.' -ForegroundColor DarkGray }
 }
 
 function Invoke-PowerSettings {
@@ -1712,297 +1675,6 @@ function Invoke-SoftwareInventory {
     Write-Host "  $(@($rows).Count) programs saved to $out" -ForegroundColor Green
 }
 
-function Invoke-ProfileRebuild {
-    Write-Title 'Rebuild a corrupted Windows user profile (back up -> reset -> copy data back)'
-    Write-Host '  Step 1 RESET : user signed out -> old profile renamed to <name>.old_<date>, its registry entry removed (exported first).' -ForegroundColor Gray
-    Write-Host '                 The user then signs in and gets a brand-new profile.' -ForegroundColor Gray
-    Write-Host '  Step 2 RESTORE: copies files, bookmarks, signatures, Sticky Notes from the .old folder into the new profile' -ForegroundColor Gray
-    Write-Host '                 and lists the old mapped drives / printers.' -ForegroundColor Gray
-    $mode = (Read-Default '  1 = RESET a profile, 2 = RESTORE data into the new profile, blank = cancel' '').ToString()
-    if (-not $mode) { return }
-    $plKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
-    $dir = Get-OutDir 'ProfileRebuild'; $stamp = Get-Stamp
-
-    if ($mode -eq '1') {
-        $profs = @(Get-CimInstance Win32_UserProfile | Where-Object { -not $_.Special -and $_.LocalPath -like '*\Users\*' } | Sort-Object LastUseTime -Descending)
-        for ($i = 0; $i -lt $profs.Count; $i++) {
-            $u = try { (New-Object Security.Principal.SecurityIdentifier($profs[$i].SID)).Translate([Security.Principal.NTAccount]).Value } catch { $profs[$i].SID }
-            $profs[$i] | Add-Member NoteProperty Account $u -Force
-            Write-Host ("   {0,2}. {1,-35} {2,-30} Loaded: {3,-5} LastUse: {4}" -f ($i + 1), $u, $profs[$i].LocalPath, $profs[$i].Loaded, $profs[$i].LastUseTime)
-        }
-        $n = Read-Int '  Profile number to RESET (0 = cancel)' 0
-        if ($n -lt 1 -or $n -gt $profs.Count) { return }
-        $p = $profs[$n - 1]
-        if ($p.LocalPath -ieq $env:USERPROFILE) { Write-Host '  You are signed in as this user - run this from a different admin account.' -ForegroundColor Red; return }
-        if ($p.Loaded) {
-            Write-Host "  $($p.Account) is still loaded (signed in, or a process is holding the registry)." -ForegroundColor Red
-            Write-Host '  Sign the user out (or restart the PC and sign in ONLY as an admin), then run this again.' -ForegroundColor Yellow
-            return
-        }
-        $sizeGB = [math]::Round(((Get-ChildItem $p.LocalPath -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum)/1GB, 2)
-        $free = [math]::Round((Get-PSDrive ($p.LocalPath.Substring(0,1))).Free/1GB, 1)
-        Write-Host "  Profile size: $sizeGB GB   Free on drive: $free GB (renaming needs no extra space; restoring copies the data)" -ForegroundColor Gray
-        $newName = "$($p.LocalPath).old_$stamp"
-        if (-not (Confirm-Change "Reset profile of $($p.Account): rename $($p.LocalPath) -> $newName and remove its ProfileList registry key (backup in $dir).")) { return }
-        & reg.exe export ("HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\" + $p.SID) "$dir\ProfileList_$($p.SID)_$stamp.reg" /y | Out-Null
-        try { Rename-Item -LiteralPath $p.LocalPath -NewName (Split-Path $newName -Leaf) -ErrorAction Stop }
-        catch {
-            Write-Host "  Rename FAILED: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host '  Something still has files open in the profile. Restart the PC, sign in ONLY as an admin, and run this again. Nothing was changed.' -ForegroundColor Yellow
-            return
-        }
-        $guid = (Get-ItemProperty "$plKey\$($p.SID)" -ErrorAction SilentlyContinue).Guid
-        Remove-Item "$plKey\$($p.SID)" -Recurse -Force -ErrorAction SilentlyContinue
-        Get-ChildItem $plKey -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like "$($p.SID).bak" } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-        if ($guid) { Remove-Item "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileGuid\$guid" -Recurse -Force -ErrorAction SilentlyContinue }
-        "$($p.Account)|$($p.SID)|$newName|$(Get-Date)" | Add-Content "$dir\ProfileRebuild_log.txt"
-        Write-Host "`n  Done. Old profile is now: $newName" -ForegroundColor Green
-        Write-Host '  NEXT: have the user sign in (domain users need line-of-sight to a DC / VPN). Windows builds a new profile.' -ForegroundColor Cyan
-        Write-Host '  Once they reach the desktop, run this option again and pick 2 = RESTORE.' -ForegroundColor Cyan
-        return
-    }
-
-    if ($mode -eq '2') {
-        $olds = @(Get-ChildItem (Split-Path $env:PUBLIC -Parent) -Directory -Filter '*.old_*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
-        if (-not $olds) { Write-Host '  No <name>.old_<date> profile folders found under C:\Users.' -ForegroundColor Red; return }
-        for ($i = 0; $i -lt $olds.Count; $i++) { Write-Host ("   {0,2}. {1}" -f ($i + 1), $olds[$i].FullName) }
-        $n = Read-Int '  Old profile to restore FROM (0 = cancel)' 1
-        if ($n -lt 1 -or $n -gt $olds.Count) { return }
-        $src = $olds[$n - 1].FullName
-        $guess = Join-Path (Split-Path $src -Parent) (($olds[$n - 1].Name) -replace '\.old_\d{8}_\d{6}$', '')
-        $dst = Read-Default '  New profile to restore INTO' $guess
-        if (-not (Test-Path $dst)) { Write-Host "  $dst does not exist yet - the user must sign in once first." -ForegroundColor Red; return }
-
-        # Read the old registry hive: folder redirection (OneDrive), mapped drives, printers
-        $hive = 'HKU\SDSI_OldProfile'; $redirected = @(); $redirTargets = @(); $info = @()
-        if (Test-Path "$src\NTUSER.DAT") {
-            & reg.exe load $hive "$src\NTUSER.DAT" 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                $sf = Get-ItemProperty 'Registry::HKEY_USERS\SDSI_OldProfile\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' -ErrorAction SilentlyContinue
-                foreach ($k in @{ Desktop = 'Desktop'; Personal = 'Documents'; 'My Pictures' = 'Pictures' }.GetEnumerator()) { if ("$($sf.($k.Key))" -match 'OneDrive|^\\\\') { $redirected += $k.Value; $redirTargets += [pscustomobject]@{ Folder = $k.Value; Target = "$($sf.($k.Key))" } } }
-                Get-ChildItem 'Registry::HKEY_USERS\SDSI_OldProfile\Network' -ErrorAction SilentlyContinue | ForEach-Object { $info += [pscustomobject]@{ Type = 'Mapped drive'; Item = "$($_.PSChildName): -> $((Get-ItemProperty $_.PSPath).RemotePath)" } }
-                Get-ChildItem 'Registry::HKEY_USERS\SDSI_OldProfile\Printers\Connections' -ErrorAction SilentlyContinue | ForEach-Object { $info += [pscustomobject]@{ Type = 'Printer'; Item = ($_.PSChildName -replace ',', '\') } }
-                $defPrn = (Get-ItemProperty 'Registry::HKEY_USERS\SDSI_OldProfile\Software\Microsoft\Windows NT\CurrentVersion\Windows' -ErrorAction SilentlyContinue).Device
-                if ($defPrn) { $info += [pscustomobject]@{ Type = 'Default printer'; Item = ($defPrn -split ',')[0] } }
-                $sf = $null; [gc]::Collect(); Start-Sleep 1
-                & reg.exe unload $hive 2>$null | Out-Null
-            } else { Write-Host '  Could not load the old NTUSER.DAT (corrupt or in use) - skipping drive/printer list.' -ForegroundColor DarkYellow }
-        }
-        if ($redirected) {
-            Write-Host '  These folders were REDIRECTED in the old profile - their files are NOT in the old folder and are NOT copied:' -ForegroundColor Yellow
-            $redirTargets | Format-Table -AutoSize -Wrap
-            if ($redirTargets | Where-Object { $_.Target -match '^\\\\' }) {
-                Write-Host '  Network (server) redirection: the files are on the server. The new profile gets them back when the folder-redirection' -ForegroundColor Cyan
-                Write-Host '  Group Policy applies - user on the office network, gpupdate /force, then sign out/in (can take 2 sign-ins).' -ForegroundColor Cyan
-                Write-Host '  Do NOT clear the Offline Files (CSC) cache - it may hold changes not yet synced to the server (check Sync Center).' -ForegroundColor DarkYellow
-                $newSid = (Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { $_.LocalPath -ieq $dst }).SID
-                if ($newSid) { $null = Show-FolderRedirectionSource -Sid $newSid -Account (Split-Path $dst -Leaf) }
-                Write-Host '  If the redirection is NOT wanted: stop the GPO for this user first, then use "Folder redirection - point back to local".' -ForegroundColor Cyan
-            }
-            if ($redirTargets | Where-Object { $_.Target -match 'OneDrive' }) { Write-Host '  OneDrive redirection: sign the user in to OneDrive and turn on folder backup - files re-sync from the cloud.' -ForegroundColor Cyan }
-        }
-        $oneDrive = Get-ChildItem $src -Directory -Filter 'OneDrive*' -ErrorAction SilentlyContinue
-        if ($oneDrive) { Write-Host "  Skipping $($oneDrive.Name -join ', ') - OneDrive will re-sync it. (Copy manually only if there were un-synced files.)" -ForegroundColor Yellow }
-
-        $items = @(
-            'Desktop','Documents','Downloads','Pictures','Music','Videos','Favorites','Links','Contacts'
-            'AppData\Roaming\Microsoft\Signatures'
-            'AppData\Roaming\Microsoft\Templates'
-            'AppData\Roaming\Microsoft\UProof'
-            'AppData\Roaming\Microsoft\Proof'
-            'AppData\Local\Microsoft\Edge\User Data\Default\Bookmarks'
-            'AppData\Local\Google\Chrome\User Data\Default\Bookmarks'
-            'AppData\Local\Packages\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe\LocalState'
-            'AppData\Roaming\Microsoft\Sticky Notes'
-        ) | Where-Object { $redirected -notcontains $_ }
-        $pst = Get-ChildItem $src -Recurse -Filter *.pst -File -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '\\OneDrive' }
-        # Full browser data (all profiles, extensions, history, settings) - optional
-        $browsers = @(
-            [pscustomobject]@{ Name = 'Chrome';  Proc = 'chrome';  Rel = 'AppData\Local\Google\Chrome\User Data' }
-            [pscustomobject]@{ Name = 'Edge';    Proc = 'msedge';  Rel = 'AppData\Local\Microsoft\Edge\User Data' }
-            [pscustomobject]@{ Name = 'Firefox'; Proc = 'firefox'; Rel = 'AppData\Roaming\Mozilla\Firefox' }
-        ) | Where-Object { Test-Path -LiteralPath (Join-Path $src $_.Rel) }
-        $fullBrowser = $false
-        if ($browsers) {
-            Write-Host "`n  Browser data found in the old profile: $($browsers.Name -join ', ')" -ForegroundColor Gray
-            Write-Host '  FULL copy = every browser profile, extensions, history, settings, open tabs (caches skipped).' -ForegroundColor Gray
-            Write-Host '  Chrome/Edge saved passwords usually do NOT survive (Windows ties them to the old profile) - use browser sync for those.' -ForegroundColor DarkYellow
-            Write-Host '  Firefox saved passwords DO carry over.  No = bookmarks only (Chrome/Edge default profile).' -ForegroundColor Gray
-            $fullBrowser = Read-YesNo '  Copy FULL browser data?' $true
-            if ($fullBrowser) { $items = $items | Where-Object { $_ -notmatch '\\Bookmarks$' } }
-        }
-        Write-Host "`n  Will copy (only what exists): $($items -join '; ')$(if ($fullBrowser) { '; FULL ' + ($browsers.Name -join '/') + ' browser data' })" -ForegroundColor Gray
-        if ($pst) { Write-Host "  PST files found (copied to the same relative place; re-attach in Outlook): $($pst.Name -join ', ')" -ForegroundColor Gray }
-        if (-not (Confirm-Change "Copy user data from $src into $dst (nothing in $src is deleted; ask the user to close Edge/Chrome/Sticky Notes first).")) { return }
-        $logf = "$dir\Restore_$((Split-Path $dst -Leaf))_$stamp.log"
-        foreach ($it in $items) {
-            $s = Join-Path $src $it; $d = Join-Path $dst $it
-            if (Test-Path -LiteralPath $s -PathType Container) {
-                & robocopy.exe $s $d /E /XJ /R:1 /W:1 /COPY:DAT /DCOPY:T /XF desktop.ini /NP /NFL /NDL /LOG+:"$logf" | Out-Null
-                Write-Host "  Copied $it" -ForegroundColor Green
-            } elseif (Test-Path -LiteralPath $s -PathType Leaf) {
-                Ensure-Dir (Split-Path $d -Parent) | Out-Null
-                if (Test-Path -LiteralPath $d) { Copy-Item -LiteralPath $d "$d.new_$stamp" -Force }
-                Copy-Item -LiteralPath $s $d -Force; Write-Host "  Copied $it" -ForegroundColor Green
-            }
-        }
-        if ($fullBrowser) {
-            $dstUser = Split-Path $dst -Leaf
-            $running = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $browsers.Proc -contains ($_.Name -replace '\.exe$','') } |
-                Where-Object { $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue; $o.User -ieq $dstUser })
-            if ($running -and (Confirm-Change "Close $(@($running.Name | Sort-Object -Unique) -join ', ') for $dstUser (browser must be closed to copy its data).")) {
-                $running | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; Start-Sleep 2
-            }
-            foreach ($b in $browsers) {
-                $s = Join-Path $src $b.Rel; $d = Join-Path $dst $b.Rel
-                & robocopy.exe $s $d /E /XJ /R:1 /W:1 /COPY:DAT /DCOPY:T /NP /NFL /NDL /LOG+:"$logf" /XD 'Cache' 'Code Cache' 'GPUCache' 'ShaderCache' 'GrShaderCache' 'GraphiteDawnCache' 'DawnCache' 'DawnWebGPUCache' 'CacheStorage' 'ScriptCache' 'Crashpad' 'cache2' 'startupCache' /XF 'lock' 'parent.lock' 'LOCK' 'SingletonLock' 'SingletonCookie' 'SingletonSocket' | Out-Null
-                if ($LASTEXITCODE -lt 8) { Write-Host "  Copied FULL $($b.Name) data" -ForegroundColor Green } else { Write-Host "  $($b.Name) copy had errors (exit $LASTEXITCODE) - see $logf" -ForegroundColor Red }
-            }
-            Write-Host '  Have the user open each browser and check bookmarks/extensions; if Chrome/Edge passwords are blank, sign in to browser sync.' -ForegroundColor Cyan
-        }
-        foreach ($f in $pst) { $rel = $f.FullName.Substring($src.Length).TrimStart('\'); $d = Join-Path $dst $rel; Ensure-Dir (Split-Path $d -Parent) | Out-Null; Copy-Item -LiteralPath $f.FullName $d -Force; Write-Host "  Copied $rel" -ForegroundColor Green }
-        Write-Sub 'Re-create these for the user (from the OLD profile)'
-        if ($info) { $info | Format-Table -AutoSize -Wrap; $info | Export-Csv "$dir\OldDrivesPrinters_$((Split-Path $dst -Leaf))_$stamp.csv" -NoTypeInformation } else { Write-Host '  None recorded (or GPO maps them automatically).' }
-        Write-Host "`n  Restore log: $logf" -ForegroundColor Green
-        Write-Host '  Then: sign in to OneDrive + Outlook (new Outlook profile builds automatically for M365), check browser bookmarks,' -ForegroundColor Cyan
-        Write-Host "  re-attach any PSTs. Keep $src for a couple of weeks, then delete it." -ForegroundColor Cyan
-    }
-}
-
-function Get-FolderRedirectionSource {
-    # Finds which GPO(s) redirect folders for a user and WHICH GROUP grants them "Apply group policy".
-    # Uses only ADSI + SYSVOL (no RSAT / GroupPolicy module needed). Works for domain users only.
-    param([Parameter(Mandatory)][string]$Sid)
-    $fdCse = '{25537BA6-77A8-11D2-9B6C-0000F8080861}'
-    $applyRight = 'edacfd8f-ffb3-11d1-b41d-00a0c968f939'
-    $out = @()
-    try { $cs = Get-CimInstance Win32_ComputerSystem; if (-not $cs.PartOfDomain) { return $out }; $dom = $cs.Domain } catch { return $out }
-    # 1. GPOs this PC last applied to the user (Group Policy state)
-    $applied = @{}
-    Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State\$Sid\GPO-List" -ErrorAction SilentlyContinue | ForEach-Object {
-        $g = Get-ItemProperty $_.PSPath
-        if ("$($g.Extensions)" -match [regex]::Escape($fdCse)) { $applied[("$($g.GPOName)").ToUpper()] = "$($g.DisplayName)" }
-    }
-    # 2. Every GPO in SYSVOL that has folder redirection configured
-    $cands = @{}
-    Get-ChildItem "\\$dom\SYSVOL\$dom\Policies" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-        if (Get-ChildItem (Join-Path $_.FullName 'User\Documents & Settings') -Filter 'fdeploy*.ini' -ErrorAction SilentlyContinue) { $cands[$_.Name.ToUpper()] = $_.FullName }
-    }
-    foreach ($k in $applied.Keys) { if (-not $cands.ContainsKey($k)) { $cands[$k] = $null } }
-    # 3. The user's groups (nested, via tokenGroups)
-    $userGroups = @{}; $userName = $Sid
-    try {
-        $u = [adsi]"LDAP://<SID=$Sid>"; $userName = "$($u.sAMAccountName)"
-        $u.RefreshCache(@('tokenGroups'))
-        foreach ($b in $u.Properties['tokenGroups']) { $gs = (New-Object Security.Principal.SecurityIdentifier($b, 0)).Value; $userGroups[$gs] = $true }
-        $userGroups[$Sid] = $true
-        $userGroups['S-1-5-11'] = $true   # Authenticated Users
-    } catch {}
-    $root = try { ([adsi]"LDAP://RootDSE").defaultNamingContext } catch { $null }
-    foreach ($guid in $cands.Keys) {
-        $name = $applied[$guid]; $via = @(); $status = ''
-        if ($root) {
-            try {
-                $g = [adsi]"LDAP://CN=$guid,CN=Policies,CN=System,$root"
-                if (-not $name) { $name = "$($g.displayName)" }
-                $flags = [int]"$($g.flags)"; $status = @{0='Enabled';1='User settings disabled';2='Computer settings disabled';3='All settings disabled'}[$flags]
-                foreach ($ace in $g.psbase.ObjectSecurity.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
-                    if ($ace.AccessControlType -ne 'Allow' -or "$($ace.ObjectType)" -ne $applyRight) { continue }
-                    $s = $ace.IdentityReference.Value
-                    if ($userGroups.ContainsKey($s)) { $via += try { (New-Object Security.Principal.SecurityIdentifier($s)).Translate([Security.Principal.NTAccount]).Value } catch { $s } }
-                }
-            } catch {}
-        }
-        $paths = ''
-        if ($cands[$guid]) {
-            $ini = Get-ChildItem (Join-Path $cands[$guid] 'User\Documents & Settings') -Filter 'fdeploy*.ini' -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($ini) { $paths = ((Get-Content $ini.FullName -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*s-1-|=\\\\|\\\\' } | ForEach-Object { ($_ -split '=', 2)[-1] } | Where-Object { $_ -match '^\\\\' } | Select-Object -Unique) -join '; ') }
-        }
-        $out += [pscustomobject]@{
-            GPO = $(if ($name) { $name } else { $guid }); Guid = $guid; GpoStatus = $status
-            AppliedToUserLastTime = $applied.ContainsKey($guid)
-            AppliesVia = $(if ($via) { ($via | Select-Object -Unique) -join ', ' } elseif ($userGroups.Count) { '(user not in filter)' } else { '(could not read AD)' })
-            Targets = $paths
-        }
-    }
-    $out | Sort-Object @{e={$_.AppliedToUserLastTime}; Descending=$true}, @{e={$_.AppliesVia -notmatch '^\('}; Descending=$true}
-}
-
-function Show-FolderRedirectionSource([string]$Sid, [string]$Account) {
-    Write-Sub "Which GPO / group redirects folders for $Account"
-    $src = @(Get-FolderRedirectionSource -Sid $Sid)
-    if (-not $src) { Write-Host '  No folder-redirection GPO found (not domain-joined, SYSVOL unreachable, or none configured).' -ForegroundColor DarkGray; return $src }
-    $src | Format-Table GPO, GpoStatus, AppliedToUserLastTime, AppliesVia, Targets -AutoSize -Wrap | Out-Host
-    $hit = @($src | Where-Object { $_.AppliedToUserLastTime -or $_.AppliesVia -notmatch '^\(' })
-    foreach ($h in $hit) {
-        Write-Host "  -> '$($h.GPO)' applies to $Account via: $($h.AppliesVia)" -ForegroundColor Yellow
-        if ($h.GPO -match 'SBS|Small Business') { Write-Host '     Legacy SBS policy - if folders should not be redirected, remove the user from that group (or retire the GPO).' -ForegroundColor Yellow }
-    }
-    if ($hit) {
-        Write-Host '  To stop it for this user: remove them from the group above in AD Users & Computers (or add a Deny "Apply group policy"' -ForegroundColor Cyan
-        Write-Host '  for them on the GPO''s Delegation tab). Then point folders back (this option) and sign out/in.' -ForegroundColor Cyan
-        Write-Host '  GPO Policy Removal default = "Leave folder in new location" - unlinking alone does NOT bring folders back.' -ForegroundColor DarkYellow
-    }
-    return $src
-}
-
-function Invoke-FolderRedirectionReset {
-    Write-Title 'Folder redirection - show source GPO / point folders back to the local profile'
-    Write-Host '  Use when a user''s Desktop/Documents are redirected to a server share and should not be.' -ForegroundColor Gray
-    Write-Host '  FIRST stop the GPO (unlink / security-filter / set "redirect back on policy removal"), or it re-redirects at next sign-in.' -ForegroundColor DarkYellow
-    $profs = @(Get-CimInstance Win32_UserProfile | Where-Object { -not $_.Special -and $_.LocalPath -like '*\Users\*' -and $_.LocalPath -notmatch '\.old_' } | Sort-Object LastUseTime -Descending)
-    for ($i = 0; $i -lt $profs.Count; $i++) {
-        $u = try { (New-Object Security.Principal.SecurityIdentifier($profs[$i].SID)).Translate([Security.Principal.NTAccount]).Value } catch { $profs[$i].SID }
-        $profs[$i] | Add-Member NoteProperty Account $u -Force
-        Write-Host ("   {0,2}. {1,-35} {2,-28} Signed in: {3}" -f ($i + 1), $u, $profs[$i].LocalPath, $profs[$i].Loaded)
-    }
-    $n = Read-Int '  User number (0 = cancel)' 0
-    if ($n -lt 1 -or $n -gt $profs.Count) { return }
-    $p = $profs[$n - 1]; $loadedHere = $false
-    $root = "Registry::HKEY_USERS\$($p.SID)"
-    if (-not (Test-Path $root)) {
-        & reg.exe load "HKU\SDSI_FR" "$($p.LocalPath)\NTUSER.DAT" 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Host '  Could not load the user''s registry hive.' -ForegroundColor Red; return }
-        $root = 'Registry::HKEY_USERS\SDSI_FR'; $loadedHere = $true
-    }
-    try {
-        $usf = "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
-        $shf = "$root\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
-        $map = [ordered]@{ Desktop = 'Desktop'; Personal = 'Documents'; 'My Pictures' = 'Pictures'; 'My Music' = 'Music'; 'My Video' = 'Videos'; Favorites = 'Favorites'
-                           '{374DE290-123F-4565-9164-39C4925E467B}' = 'Downloads'; AppData = 'AppData\Roaming'; 'Start Menu' = 'AppData\Roaming\Microsoft\Windows\Start Menu' }
-        $cur = Get-ItemProperty $usf -ErrorAction SilentlyContinue
-        $rows = foreach ($k in $map.Keys) { $v = "$($cur.$k)"; if ($v) { [pscustomobject]@{ Folder = $map[$k]; Key = $k; Target = $v; Redirected = ($v -match '^\\\\') } } }
-        Write-Sub "Folder locations for $($p.Account)"
-        $rows | Format-Table Folder, Target, Redirected -AutoSize -Wrap
-        $red = @($rows | Where-Object Redirected)
-        $null = Show-FolderRedirectionSource -Sid $p.SID -Account $p.Account
-        if (-not $red) { Write-Host '  Nothing is redirected to a network share right now (a GPO listed above as applying will redirect at next sign-in).' -ForegroundColor Green; return }
-        Write-Host '  Manual cross-check: as the user  gpresult /h C:\temp\gp.html  ("Folder Redirection" section).' -ForegroundColor DarkGray
-
-        if (-not (Confirm-Change "Point $(($red.Folder) -join ', ') for $($p.Account) back to $($p.LocalPath) (copy files from the server first if you choose).")) { return }
-        $copy = Read-YesNo '  Copy the files from the server locations into the local folders first?' $true
-        $logf = Join-Path (Get-OutDir 'ProfileRebuild') "FolderRedirReset_$((Split-Path $p.LocalPath -Leaf))_$(Get-Stamp).log"
-        foreach ($r in $red) {
-            $local = Join-Path $p.LocalPath $map[$r.Key]
-            Ensure-Dir $local | Out-Null
-            $srcPath = [Environment]::ExpandEnvironmentVariables(($r.Target -replace '%USERNAME%', (Split-Path $p.LocalPath -Leaf)))
-            if ($copy) {
-                if (Test-Path -LiteralPath $srcPath) {
-                    & robocopy.exe $srcPath $local /E /XJ /R:1 /W:1 /COPY:DAT /DCOPY:T /XF desktop.ini /NP /NFL /NDL /LOG+:"$logf" | Out-Null
-                    Write-Host "  Copied $srcPath -> $local (robocopy exit $LASTEXITCODE)" -ForegroundColor $(if ($LASTEXITCODE -lt 8) { 'Green' } else { 'Red' })
-                } else { Write-Host "  Cannot reach $srcPath - folder repointed but nothing copied (copy it later)." -ForegroundColor Yellow }
-            }
-            Set-ItemProperty $usf -Name $r.Key -Value ('%USERPROFILE%\' + $map[$r.Key]) -Type ExpandString
-            Set-ItemProperty $shf -Name $r.Key -Value $local -ErrorAction SilentlyContinue
-        }
-        Write-Host "`n  Done. Sign the user out and back in. Copy log: $logf" -ForegroundColor Green
-        Write-Host '  If folders go back to the server after sign-in, the GPO is still applying to this user - fix the GPO first.' -ForegroundColor DarkYellow
-        Write-Host '  Offline Files: if CSC is enabled only for redirection, you can disable it later (Sync Center > Manage offline files) once data is verified.' -ForegroundColor Gray
-    } finally {
-        if ($loadedHere) { $cur = $null; [gc]::Collect(); Start-Sleep 1; & reg.exe unload 'HKU\SDSI_FR' 2>$null | Out-Null }
-    }
-}
-
 function Invoke-UserProfiles {
     Write-Title 'User profiles - size and last use'
     $sizes = Read-YesNo 'Calculate profile sizes (can be slow)?' $true
@@ -2070,84 +1742,6 @@ function Invoke-SfcDism {
     Write-Host "  Log: $log  (SFC details: C:\Windows\Logs\CBS\CBS.log)" -ForegroundColor Green
 }
 
-function Invoke-PostUpdateBlackScreen {
-    Write-Title 'Black screen / stuck sign-in after a Windows Update (AppReadiness, Explorer, pending servicing)'
-    $since = (Get-Date).AddDays(-2)
-    $hits = New-Object System.Collections.ArrayList
-    Write-Sub 'Recent reboots and how long the PC had been up before them'
-    $up = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'EventLog'; Id = 6013; StartTime = (Get-Date).AddDays(-14) } -ErrorAction SilentlyContinue |
-        ForEach-Object { [pscustomobject]@{ Time = $_.TimeCreated; UptimeDays = [math]::Round([int]($_.Properties[4].Value)/86400, 1) } } | Sort-Object Time
-    $maxUp = ($up | Measure-Object UptimeDays -Maximum).Maximum
-    if ($maxUp) { Write-Host "  Longest uptime seen in the last 14 days: $maxUp days" }
-    if ($maxUp -ge 30) { [void]$hits.Add("PC ran $maxUp days without a reboot - months of staged updates applied at once (slow, multiple reboots, heavy first sign-in).") }
-    Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'User32'; Id = 1074; StartTime = $since } -ErrorAction SilentlyContinue |
-        Select-Object -First 8 TimeCreated, @{n='By';e={($_.Properties[0].Value -split '\\')[-1]}}, @{n='User';e={$_.Properties[6].Value}}, @{n='Type';e={$_.Properties[4].Value}} | Format-Table -AutoSize | Out-Host
-
-    Write-Sub 'Updates installed by servicing in the last 2 days'
-    Get-WinEvent -FilterHashtable @{ LogName = 'Setup'; StartTime = $since } -ErrorAction SilentlyContinue |
-        ForEach-Object { if ($_.ToXml() -match '(KB\d{6,8})') { [pscustomobject]@{ Time = $_.TimeCreated; KB = $Matches[1]; Id = $_.Id } } } |
-        Sort-Object KB -Unique | Format-Table -AutoSize | Out-Host
-    $pend = @()
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pend += 'CBS' }
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pend += 'Windows Update' }
-    if ($pend) { [void]$hits.Add("Another reboot is still pending ($($pend -join ', ')) - do a full RESTART (not Shut down) so servicing can finish.") }
-    $hb = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -ErrorAction SilentlyContinue).HiberbootEnabled
-    if ($hb -eq 1) { Write-Host '  Fast Startup is ON - "Shut down" does not fully restart Windows; use Restart.' -ForegroundColor DarkYellow }
-
-    Write-Sub 'AppReadiness (prepares apps at first sign-in after an update - the usual cause of a black screen)'
-    $ar = Get-Service AppReadiness -ErrorAction SilentlyContinue
-    if ($ar) { Write-Host "  AppReadiness service: $($ar.Status)" }
-    $arEv = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7011, 10029; StartTime = $since } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'AppReadiness' })
-    if ($arEv) {
-        Write-Host "  AppReadiness timeout/hang events: $($arEv.Count) (first $($arEv[-1].TimeCreated), last $($arEv[0].TimeCreated))" -ForegroundColor Yellow
-        [void]$hits.Add("AppReadiness is hung ($($arEv.Count) timeout events) - Explorer/Start can't load, so users get a black screen after sign-in.")
-    }
-    $arLog = Get-WinEvent -LogName 'Microsoft-Windows-AppReadiness/Admin' -MaxEvents 200 -ErrorAction SilentlyContinue | Where-Object { $_.TimeCreated -ge $since -and $_.Level -le 2 }
-    if ($arLog) { $arLog | Select-Object -First 8 TimeCreated, Id, @{n='Message';e={($_.Message -split "`n")[0]}} | Format-Table -AutoSize -Wrap | Out-Host }
-
-    Write-Sub 'Signed-in sessions and whether Explorer is running in them'
-    $sess = Get-CimInstance Win32_Process -Filter "Name='winlogon.exe'" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty SessionId -Unique
-    $exp = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue
-    foreach ($s in $sess) {
-        $e = $exp | Where-Object SessionId -eq $s | Select-Object -First 1
-        $own = if ($e) { $o = Invoke-CimMethod -InputObject $e -MethodName GetOwner -ErrorAction SilentlyContinue; "$($o.Domain)\$($o.User)" } else { '' }
-        $logon = Get-CimInstance Win32_Process -Filter "Name='LogonUI.exe' AND SessionId=$s" -ErrorAction SilentlyContinue
-        Write-Host ("  Session {0}: Explorer {1} {2} {3}" -f $s, $(if ($e) { 'RUNNING' } else { 'NOT running' }), $own, $(if ($logon) { '(at sign-in screen)' } else { '' }))
-        if (-not $e -and -not $logon -and $s -ne 0) { [void]$hits.Add("Session $s is signed in but Explorer is not running - that is the black screen.") }
-    }
-    $os = Get-CimInstance Win32_OperatingSystem
-    $memPct = [math]::Round((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize) * 100)
-    if ($memPct -ge 90) { [void]$hits.Add("RAM is $memPct% used of $([math]::Round($os.TotalVisibleMemorySize/1MB,1)) GB - first sign-in after updates will be very slow.") }
-    $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($gpu) { Write-Host "  Graphics: $($gpu.Name) driver $($gpu.DriverVersion)" -ForegroundColor Gray }
-
-    Write-Sub 'LIKELY CAUSES'
-    if ($hits.Count) { $hits | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow } } else { Write-Host '  Nothing obvious from here.' -ForegroundColor Green }
-    Write-Host "`n  At the PC: Ctrl+Shift+Esc > Run new task > explorer.exe brings the desktop back for that session." -ForegroundColor Cyan
-
-    Write-Host "`n  Fixes (each asks first):" -ForegroundColor Cyan
-    Write-Host '   1. Restart the AppReadiness service (kills it if hung)'
-    Write-Host '   2. Re-register the Start menu / shell apps for all users (StartMenuExperienceHost, ShellExperienceHost, Search)'
-    Write-Host '   3. Full restart now (not Shut down) so pending servicing finishes'
-    $pick = Read-List '  Fix numbers (comma separated, blank = none)' ''
-    foreach ($p in $pick) {
-        switch ($p) {
-            '1' { if (Confirm-Change 'Stop (force) and start the AppReadiness service.') {
-                    $svc = Get-CimInstance Win32_Service -Filter "Name='AppReadiness'"
-                    if ($svc.ProcessId) { Stop-Process -Id $svc.ProcessId -Force -ErrorAction SilentlyContinue }
-                    Stop-Service AppReadiness -Force -ErrorAction SilentlyContinue; Start-Sleep 2; Start-Service AppReadiness -ErrorAction SilentlyContinue
-                    Write-Host "  AppReadiness: $((Get-Service AppReadiness).Status). Have the user sign out/in (or start explorer.exe from Task Manager)." -ForegroundColor Green } }
-            '2' { if (Confirm-Change 'Re-register Start menu / shell / search system apps for all users.') {
-                    foreach ($n in 'Microsoft.Windows.StartMenuExperienceHost', 'Microsoft.Windows.ShellExperienceHost', 'MicrosoftWindows.Client.CBS', 'Microsoft.Windows.Search', 'Microsoft.UI.Xaml.CBS') {
-                        Get-AppxPackage -AllUsers -Name $n -ErrorAction SilentlyContinue | ForEach-Object {
-                            try { Add-AppxPackage -Register (Join-Path $_.InstallLocation 'AppxManifest.xml') -DisableDevelopmentMode -ForceApplicationShutdown -ErrorAction Stop; Write-Host "  Re-registered $($_.Name)" -ForegroundColor Green }
-                            catch { Write-Host "  $($_.Exception.Message)" -ForegroundColor DarkYellow } } }
-                    Write-Host '  Note: registration from an admin/SYSTEM session applies to that account; for the user, sign them out/in afterwards.' -ForegroundColor Gray } }
-            '3' { if (Confirm-Change 'Restart this PC NOW (users lose unsaved work).') { & shutdown.exe /r /t 5 /c 'SDSI ToolKit: restart to finish Windows Update' } }
-        }
-    }
-}
-
 function Invoke-SpoolerReset {
     Write-Title '[!] Print spooler reset (clear stuck print jobs)'
     $jobs = @(Get-ChildItem "$env:SystemRoot\System32\spool\PRINTERS" -File -ErrorAction SilentlyContinue)
@@ -2197,122 +1791,6 @@ function Invoke-TeamsCacheClear {
     }
 }
 
-function Invoke-OutlookLoadingProfile {
-    Write-Title 'Outlook stuck on "Loading Profile" - diagnose + fix'
-    # Work on the signed-in user (the ToolKit usually runs elevated as a different admin account)
-    $exp = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue | Select-Object -First 1
-    $owner = if ($exp) { Invoke-CimMethod -InputObject $exp -MethodName GetOwner -ErrorAction SilentlyContinue } else { $null }
-    $acct = if ($owner -and $owner.User) { "$($owner.Domain)\$($owner.User)" } else { "$env:USERDOMAIN\$env:USERNAME" }
-    $sid = try { (New-Object Security.Principal.NTAccount($acct)).Translate([Security.Principal.SecurityIdentifier]).Value } catch { $null }
-    $hku = if ($sid -and (Test-Path "Registry::HKEY_USERS\$sid")) { "Registry::HKEY_USERS\$sid" } else { 'HKCU:' }
-    $prof = if ($sid) { (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue).LocalPath } else { $env:USERPROFILE }
-    Write-Host "  Signed-in user: $acct   Profile: $prof" -ForegroundColor Gray
-    $off = "$hku\Software\Microsoft\Office\16.0"
-    $hits = New-Object System.Collections.ArrayList
-
-    Write-Sub 'Outlook processes'
-    $ol = Get-CimInstance Win32_Process -Filter "Name='OUTLOOK.EXE'" -ErrorAction SilentlyContinue
-    if ($ol) {
-        $ol | ForEach-Object { $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
-            [pscustomobject]@{ PID = $_.ProcessId; User = "$($o.Domain)\$($o.User)"; Started = $_.CreationDate; CommandLine = $_.CommandLine } } | Format-Table -AutoSize -Wrap
-        if (@($ol).Count -gt 1) { [void]$hits.Add('More than one OUTLOOK.EXE running - a hung background copy blocks the profile. Kill them all and retry.') }
-    } else { Write-Host '  Outlook is not running.' }
-
-    Write-Sub 'Compatibility mode / run-as-admin flags on OUTLOOK.EXE'
-    $layers = foreach ($root in "$hku\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers", 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers') {
-        $p = Get-ItemProperty $root -ErrorAction SilentlyContinue
-        if ($p) { $p.PSObject.Properties | Where-Object { $_.Name -match 'OUTLOOK\.EXE$' } | ForEach-Object { [pscustomobject]@{ Key = $root -replace '^Registry::',''; Exe = $_.Name; Flags = $_.Value } } }
-    }
-    if ($layers) { $layers | Format-Table -AutoSize -Wrap; [void]$hits.Add('OUTLOOK.EXE has compatibility / run-as-admin flags - a classic "Loading Profile" hang. Remove them (fix option 1).') } else { Write-Host '  None (good).' }
-
-    Write-Sub 'Microsoft 365 sign-in broker (WAM / AAD.BrokerPlugin)'
-    $bp = Get-AppxPackage -AllUsers -Name Microsoft.AAD.BrokerPlugin -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($bp) { Write-Host "  BrokerPlugin $($bp.Version)  Status: $($bp.Status)" } else { Write-Host '  Microsoft.AAD.BrokerPlugin NOT found - Microsoft 365 sign-in cannot work.' -ForegroundColor Red; [void]$hits.Add('AAD BrokerPlugin missing - re-register it (fix option 2).') }
-    $bpErr = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-AppModel-State'; StartTime = (Get-Date).AddDays(-7) } -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'AAD\.BrokerPlugin' }
-    $aadErr = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-AAD/Operational'; Level = 2; StartTime = (Get-Date).AddDays(-2) } -MaxEvents 200 -ErrorAction SilentlyContinue
-    if ($bpErr) { [void]$hits.Add("BrokerPlugin settings write failures x$(@($bpErr).Count) in 7 days - the sign-in broker's local data is likely corrupt (fix option 2).") }
-    if ($aadErr) { Write-Host "  AAD/Operational errors (48h): $(@($aadErr).Count)"; $aadErr | Select-Object -First 5 TimeCreated, Id, @{n='Message';e={($_.Message -split "`n")[0..1] -join ' '}} | Format-Table -AutoSize -Wrap; if (@($aadErr).Count -ge 5) { [void]$hits.Add("Many Entra sign-in errors (AAD/Operational x$(@($aadErr).Count)) - token/broker problem (fix option 2).") } }
-    $ds = (& dsregcmd /status) 2>$null
-    $prt = ($ds | Select-String 'AzureAdPrt\s*:\s*(\w+)').Matches.Groups[1].Value
-    if ($prt) { Write-Host "  AzureAdPrt: $prt  (from the context this ran in)" }
-
-    Write-Sub 'Outlook profiles / OST / PST'
-    $profKey = "$off\Outlook\Profiles"
-    $profiles = @(Get-ChildItem $profKey -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
-    $def = (Get-ItemProperty "$off\Outlook" -ErrorAction SilentlyContinue).DefaultProfile
-    Write-Host "  Profiles: $(if ($profiles) { $profiles -join ', ' } else { '(none)' })   Default: $def"
-    if ($prof) {
-        Get-ChildItem "$prof\AppData\Local\Microsoft\Outlook" -Include *.ost, *.pst -Recurse -ErrorAction SilentlyContinue |
-            Select-Object Name, @{n='GB';e={[math]::Round($_.Length/1GB,2)}}, LastWriteTime | Format-Table -AutoSize
-        $big = Get-ChildItem "$prof\AppData\Local\Microsoft\Outlook" -Include *.ost, *.pst -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 45GB }
-        if ($big) { [void]$hits.Add('An OST/PST is over 45 GB - near the 50 GB limit; Outlook can hang opening it.') }
-    }
-
-    Write-Sub 'Add-ins set to load at startup'
-    $addins = foreach ($r in "$hku\Software\Microsoft\Office\Outlook\Addins", 'HKLM:\SOFTWARE\Microsoft\Office\Outlook\Addins', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Office\Outlook\Addins') {
-        Get-ChildItem $r -ErrorAction SilentlyContinue | ForEach-Object { $p = Get-ItemProperty $_.PSPath; if ($p.LoadBehavior -eq 3) { [pscustomobject]@{ AddIn = $_.PSChildName; Name = $p.FriendlyName } } }
-    }
-    if ($addins) { $addins | Format-Table -AutoSize } else { Write-Host '  None found in registry.' }
-
-    Write-Sub 'Hardware graphics acceleration (hangs after graphics driver changes)'
-    $hw = (Get-ItemProperty "$off\Common\Graphics" -ErrorAction SilentlyContinue).DisableHardwareAcceleration
-    Write-Host "  DisableHardwareAcceleration = $(if ($null -eq $hw) { '(not set = acceleration ON)' } else { $hw })"
-
-    Write-Sub 'Connectivity to Microsoft 365'
-    foreach ($h in 'outlook.office365.com', 'login.microsoftonline.com', 'autodiscover-s.outlook.com') {
-        $t = Test-NetConnection $h -Port 443 -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
-        Write-Host ("  {0,-32} {1}" -f $h, $(if ($t.TcpTestSucceeded) { 'OK' } else { 'FAILED' })) -ForegroundColor $(if ($t.TcpTestSucceeded) { 'Green' } else { 'Red' })
-        if (-not $t.TcpTestSucceeded) { [void]$hits.Add("Cannot reach $h on 443 - check DNS / proxy / firewall.") }
-    }
-
-    Write-Sub 'LIKELY CAUSES'
-    if ($hits.Count) { $hits | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow } } else { Write-Host '  Nothing obvious - try options 3-5 in order.' -ForegroundColor Green }
-
-    Write-Host "`n  Fixes (Outlook is closed first; each asks before changing anything):" -ForegroundColor Cyan
-    Write-Host '   1. Remove compatibility / run-as-admin flags from OUTLOOK.EXE'
-    Write-Host '   2. Repair Microsoft 365 sign-in (re-register AAD BrokerPlugin + clear Office identity cache) - user signs in again'
-    Write-Host '   3. Turn off Outlook hardware graphics acceleration'
-    Write-Host '   4. Start Outlook in Safe Mode (no add-ins) / reset navigation pane (/resetnavpane)'
-    Write-Host '   5. Rename the OST so it rebuilds (re-downloads mail)'
-    Write-Host '   6. Create a new Outlook profile (opens Mail control panel)'
-    $pick = Read-List '  Pick fix numbers (comma separated, blank = none)' ''
-    if (-not $pick) { return }
-    $stopOutlook = { Get-Process OUTLOOK -ErrorAction SilentlyContinue | Stop-Process -Force; Start-Sleep 2 }
-    foreach ($p in $pick) {
-        switch ($p) {
-            '1' { if (Confirm-Change 'Delete AppCompat Layers values for OUTLOOK.EXE.') {
-                    foreach ($l in $layers) { Remove-ItemProperty -Path ("Registry::" + ($l.Key -replace '^HKLM:\\','HKEY_LOCAL_MACHINE\')) -Name $l.Exe -ErrorAction SilentlyContinue }
-                    Write-Host '  Compatibility flags removed.' -ForegroundColor Green } }
-            '2' { if (Confirm-Change "Close Outlook/Office, re-register AAD BrokerPlugin, clear Office identity cache for $acct (user must sign in to Office again).") {
-                    & $stopOutlook
-                    if ($prof) {
-                        foreach ($d in "$prof\AppData\Local\Microsoft\IdentityCache", "$prof\AppData\Local\Microsoft\OneAuth", "$prof\AppData\Local\Packages\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\AC\TokenBroker\Accounts") {
-                            if (Test-Path $d) { Rename-Item $d "$(Split-Path $d -Leaf).old_$(Get-Stamp)" -ErrorAction SilentlyContinue; Write-Host "  Renamed $d" } }
-                    }
-                    Remove-Item "$off\Common\Identity\Identities\*" -Recurse -Force -ErrorAction SilentlyContinue
-                    $pkg = Get-AppxPackage -AllUsers -Name Microsoft.AAD.BrokerPlugin -ErrorAction SilentlyContinue | Select-Object -First 1
-                    $man = if ($pkg) { Join-Path $pkg.InstallLocation 'AppxManifest.xml' } else { "$env:SystemRoot\SystemApps\Microsoft.AAD.BrokerPlugin_cw5n1h2txyewy\AppxManifest.xml" }
-                    if ($acct -ieq "$env:USERDOMAIN\$env:USERNAME") { Add-AppxPackage -Register $man -DisableDevelopmentMode -ForceApplicationShutdown -ErrorAction SilentlyContinue; Write-Host '  BrokerPlugin re-registered.' -ForegroundColor Green }
-                    else { Write-Host "  Re-register must run AS THE USER: Add-AppxPackage -Register `"$man`" -DisableDevelopmentMode -ForceApplicationShutdown" -ForegroundColor DarkYellow }
-                    Write-Host '  Have the user open Outlook and sign in when prompted.' -ForegroundColor Green } }
-            '3' { if (Confirm-Change 'Set Office DisableHardwareAcceleration = 1 for the signed-in user.') {
-                    New-Item "$off\Common\Graphics" -Force | Out-Null; Set-ItemProperty "$off\Common\Graphics" -Name DisableHardwareAcceleration -Value 1 -Type DWord
-                    Write-Host '  Hardware acceleration OFF.' -ForegroundColor Green } }
-            '4' { & $stopOutlook; $exe = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\OUTLOOK.EXE' -ErrorAction SilentlyContinue).'(default)'
-                  if (-not $exe) { Write-Host '  OUTLOOK.EXE not found.' -ForegroundColor Red; break }
-                  $sw = if (Read-YesNo '  Also reset the navigation pane (/resetnavpane)?' $false) { '/safe /resetnavpane' } else { '/safe' }
-                  Write-Host "  Run AS THE USER (not elevated): `"$exe`" $sw" -ForegroundColor Cyan
-                  if ($acct -ieq "$env:USERDOMAIN\$env:USERNAME" -and -not (Test-IsAdmin)) { Start-Process $exe $sw } }
-            '5' { if (Confirm-Change 'Close Outlook and rename every .ost so Outlook rebuilds it (mail re-downloads from Microsoft 365).') {
-                    & $stopOutlook
-                    Get-ChildItem "$prof\AppData\Local\Microsoft\Outlook" -Filter *.ost -ErrorAction SilentlyContinue | ForEach-Object { Rename-Item $_.FullName "$($_.Name).old_$(Get-Stamp)"; Write-Host "  Renamed $($_.Name)" } } }
-            '6' { Write-Host '  Opening Mail control panel - Show Profiles > Add, then set "Always use this profile".' -ForegroundColor Cyan
-                  $mlcfg = Get-ChildItem "${env:ProgramFiles}\Microsoft Office\root\Office16\MLCFG32.CPL", "${env:ProgramFiles(x86)}\Microsoft Office\root\Office16\MLCFG32.CPL" -ErrorAction SilentlyContinue | Select-Object -First 1
-                  if ($mlcfg) { Start-Process control.exe "`"$($mlcfg.FullName)`"" } else { Start-Process control.exe 'mlcfg32.cpl' } }
-        }
-    }
-}
-
 function Invoke-OfficeRepair {
     Write-Title '[!] Microsoft 365 Apps / Office - quick or online repair'
     $c2r = "$env:ProgramFiles\Common Files\Microsoft Shared\ClickToRun\OfficeClickToRun.exe"
@@ -2338,22 +1816,9 @@ function Invoke-OneDriveReset {
     if (Confirm-Change 'Reset OneDrive for this user (re-syncs everything; files are NOT deleted).') {
         Start-Process $exe -ArgumentList '/reset' -Wait
         Start-Sleep -Seconds 5
-        # Start through explorer.exe so OneDrive is NOT elevated (an elevated OneDrive breaks file opens)
-        if (-not (Get-Process OneDrive -ErrorAction SilentlyContinue)) { Start-Process -FilePath "$env:SystemRoot\explorer.exe" -ArgumentList "`"$exe`"" }
+        if (-not (Get-Process OneDrive -ErrorAction SilentlyContinue)) { Start-Process $exe }
         Write-Host '  Reset done - OneDrive will re-sync. Large libraries can take a while.' -ForegroundColor Green
     }
-}
-
-function Invoke-OneDriveFileAccess {
-    Write-Title 'OneDrive "can''t open file" errors - diagnose + repair'
-    Write-Host '  For Explorer errors on OneDrive/SharePoint files such as:' -ForegroundColor DarkGray
-    Write-Host '    "The data area passed to a system call is too small" (0x8007007A)' -ForegroundColor DarkGray
-    Write-Host '    "The cloud file provider is not running" (0x8007016A) / "The cloud operation was unsuccessful"' -ForegroundColor DarkGray
-    $test = Read-Default 'Full path of a file that gave the error (blank = skip the test open)' ''
-    $scan = if ($Script:Auto) { $false } else { Read-YesNo 'Scan the sync folders (online-only / stuck / long paths / bad names)?' $true }
-    Invoke-Tool 'Repair-OneDriveFileAccess' ([ordered]@{
-        OutputPath = (Get-OutDir 'OneDrive'); TestPath = $test; ScanFiles = $scan; ReportOnly = [bool]$Script:Auto
-    }) | Out-Null
 }
 
 # ---------- MICROSOFT / SYSINTERNALS / NIRSOFT TOOLS ------------------------------------
@@ -2847,225 +2312,6 @@ function Invoke-BootPerformance {
     Write-Sub 'Last 5 Group Policy / logon durations'
     Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-GroupPolicy/Operational'; Id = 8001, 8000 } -MaxEvents 10 -ErrorAction SilentlyContinue |
         Select-Object TimeCreated, Id, @{n='Message';e={($_.Message -split "`n")[0]}} | Format-Table -AutoSize -Wrap
-}
-
-function Invoke-SlowLogoffDiag {
-    Write-Title 'Slow sign-out / logoff / shutdown + general lag diagnostics'
-    $days  = Read-Int '  How many days back to look' 7
-    $since = (Get-Date).AddDays(-$days)
-    $dir = Get-OutDir 'SlowLogoff'; $stamp = Get-Stamp
-    $report = Join-Path $dir "SlowLogoff_$($env:COMPUTERNAME)_$stamp.txt"
-    $findings = New-Object System.Collections.ArrayList
-    function Add-Hit([string]$Sev, [string]$Text) { [void]$findings.Add([pscustomobject]@{ Severity = $Sev; Finding = $Text }) }
-    function Get-EvData($e) { $d = @{}; try { ([xml]$e.ToXml()).Event.EventData.Data | ForEach-Object { if ($_.Name) { $d[$_.Name] = $_.'#text' } } } catch {}; $d }
-    $log = New-Object System.Collections.ArrayList
-    function Out-Section([string]$Title, $Data) {
-        Write-Sub $Title
-        $txt = if ($null -eq $Data -or @($Data).Count -eq 0) { '  (nothing found)' } else { ($Data | Format-Table -AutoSize -Wrap | Out-String -Width 220).TrimEnd() }
-        Write-Host $txt
-        [void]$log.Add("`r`n--- $Title ---`r`n$txt")
-    }
-
-    # 1. Uptime, memory, CPU
-    $os = Get-CimInstance Win32_OperatingSystem
-    $upDays = [math]::Round(((Get-Date) - $os.LastBootUpTime).TotalDays, 1)
-    $memPct = [math]::Round((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize) * 100)
-    $cpu = (Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
-    $sys = [pscustomobject]@{ UptimeDays = $upDays; RAMUsedPct = $memPct; RAMTotalGB = [math]::Round($os.TotalVisibleMemorySize/1MB,1); CPUPct = $cpu; LastBoot = $os.LastBootUpTime }
-    Out-Section 'Uptime / memory / CPU' $sys
-    if ($upDays -ge 14) { Add-Hit 'MEDIUM' "Up $upDays days without a reboot - a full restart often clears logoff hangs and lag." }
-    if ($memPct -ge 90) { Add-Hit 'HIGH' "RAM is $memPct% used - machine is paging; see top memory processes." }
-    if ($cpu -ge 85)    { Add-Hit 'HIGH' "CPU is at $cpu% right now - see top CPU processes." }
-
-    # 2. Top processes
-    $procs = Get-Process -IncludeUserName -ErrorAction SilentlyContinue
-    if (-not $procs) { $procs = Get-Process }
-    Out-Section 'Top 15 processes by memory' ($procs | Sort-Object WorkingSet64 -Descending | Select-Object -First 15 Name, Id, SessionId, UserName, @{n='MemMB';e={[math]::Round($_.WorkingSet64/1MB)}}, @{n='CPUsec';e={[math]::Round($_.CPU)}}, Handles)
-    Out-Section 'Top 10 processes by total CPU time' ($procs | Sort-Object CPU -Descending | Select-Object -First 10 Name, Id, SessionId, @{n='CPUsec';e={[math]::Round($_.CPU)}}, @{n='MemMB';e={[math]::Round($_.WorkingSet64/1MB)}})
-    $leaky = $procs | Where-Object { $_.Handles -gt 20000 }
-    foreach ($p in $leaky) { Add-Hit 'MEDIUM' "$($p.Name) (PID $($p.Id)) has $($p.Handles) handles - possible handle leak; restart that app." }
-    $notResp = $procs | Where-Object { $_.MainWindowHandle -ne 0 -and -not $_.Responding }
-    if ($notResp) { Out-Section 'Programs NOT RESPONDING right now' ($notResp | Select-Object Name, Id, SessionId) ; foreach ($p in $notResp) { Add-Hit 'HIGH' "$($p.Name) (PID $($p.Id)) is Not Responding now - it will block sign-out." } }
-
-    # 3. Shutdown / logoff performance (Diagnostics-Performance 200-203)
-    $dp = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Diagnostics-Performance/Operational'; Id = 200; StartTime = $since } -ErrorAction SilentlyContinue
-    Out-Section 'Shutdown durations (Diagnostics-Performance 200)' ($dp | Select-Object -First 10 | ForEach-Object { $d = Get-EvData $_; [pscustomobject]@{ Time = $_.TimeCreated; ShutdownSec = [math]::Round([int]$d.ShutdownTime/1000,1); UserSessionSec = [math]::Round([int]$d.ShutdownUserSessionTime/1000,1); ServicesSec = [math]::Round([int]$d.ShutdownServiceTime/1000,1) } })
-    $slowItems = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Diagnostics-Performance/Operational'; Id = 201,202,203; StartTime = $since } -ErrorAction SilentlyContinue |
-        ForEach-Object { $d = Get-EvData $_; [pscustomobject]@{ Type = @{201='App';202='Device';203='Service'}[$_.Id]; Item = $(if ($d.FriendlyName) { $d.FriendlyName } elseif ($d.Name) { $d.Name } else { $d.FileName }); DelayMs = [int]$d.TotalTime } } |
-        Group-Object Type, Item | ForEach-Object { [pscustomobject]@{ Item = $_.Name; Times = $_.Count; AvgDelaySec = [math]::Round((($_.Group.DelayMs | Measure-Object -Average).Average)/1000,1) } } | Sort-Object AvgDelaySec -Descending
-    Out-Section 'Apps / services / devices that slowed shutdown (201-203)' ($slowItems | Select-Object -First 15)
-    foreach ($s in ($slowItems | Where-Object { $_.AvgDelaySec -ge 10 } | Select-Object -First 5)) { Add-Hit 'HIGH' "Delays shutdown/sign-out by ~$($s.AvgDelaySec)s ($($s.Times)x): $($s.Item)" }
-
-    # 4. Winlogon subscribers slow on logoff (Application 6005/6006)
-    $wl = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-Winlogon'; Id = 6005,6006; StartTime = $since } -ErrorAction SilentlyContinue
-    $wlRows = $wl | ForEach-Object { [pscustomobject]@{ Time = $_.TimeCreated; Id = $_.Id; Message = ($_.Message -split "`n")[0].Trim() } }
-    Out-Section 'Winlogon notification subscribers taking long (6005/6006)' ($wlRows | Select-Object -First 20)
-    $wl | Where-Object { $_.Id -eq 6006 } | ForEach-Object { if ($_.Message -match "subscriber <(.+?)> took (\d+) second.+\((\w+)\)") { if ([int]$Matches[2] -ge 10) { Add-Hit 'HIGH' "Winlogon subscriber '$($Matches[1])' took $($Matches[2])s handling $($Matches[3])." } } }
-
-    # 5. User Profile Service - logoff timing + errors
-    $ups = Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-User Profile Service/Operational'; Id = 3,4; StartTime = $since } -ErrorAction SilentlyContinue | Sort-Object TimeCreated
-    $pairs = @(); $open = @{}
-    foreach ($e in $ups) {
-        $sess = if ($e.Message -match 'session (\d+)') { $Matches[1] } else { '?' }
-        if ($e.Id -eq 3) { $open[$sess] = $e.TimeCreated }
-        elseif ($open.ContainsKey($sess)) { $pairs += [pscustomobject]@{ LogoffStarted = $open[$sess]; Session = $sess; ProfileUnloadSec = [math]::Round(($e.TimeCreated - $open[$sess]).TotalSeconds,1) }; $open.Remove($sess) }
-    }
-    Out-Section 'User Profile Service - logoff processing time per sign-out' ($pairs | Sort-Object LogoffStarted -Descending | Select-Object -First 15)
-    $slowPairs = @($pairs | Where-Object { $_.ProfileUnloadSec -ge 15 })
-    if ($slowPairs) { Add-Hit 'HIGH' "Profile unload took 15s+ on $($slowPairs.Count) sign-out(s) (max $(($pairs | Measure-Object ProfileUnloadSec -Maximum).Maximum)s) - profile/registry hive or sync issue." }
-    $upErr = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Microsoft-Windows-User Profiles Service','Microsoft-Windows-User Profiles General'; StartTime = $since } -ErrorAction SilentlyContinue | Where-Object { $_.Level -le 3 }
-    Out-Section 'User Profile errors/warnings (1530 = registry handles held open at logoff)' ($upErr | Group-Object Id | ForEach-Object { [pscustomobject]@{ Id = $_.Name; Count = $_.Count; Last = $_.Group[0].TimeCreated; Sample = ($_.Group[0].Message -split "`n")[0].Trim() } })
-    $h1530 = @($upErr | Where-Object { $_.Id -eq 1530 })
-    if ($h1530) {
-        $holders = $h1530 | ForEach-Object { if ($_.Message -match 'Process \d+ \(([^)]+)\)') { Split-Path $Matches[1] -Leaf } } | Group-Object | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) ($($_.Count)x)" }
-        Add-Hit 'MEDIUM' "Event 1530 x$($h1530.Count): a program keeps the user's registry open at sign-out$(if ($holders) { ' - ' + ($holders -join ', ') })."
-    }
-    if (@($upErr | Where-Object { $_.Id -in 1500,1511,1515,1508,1509 })) { Add-Hit 'HIGH' 'Temporary-profile / profile load-copy errors found - check the profile (C:\Users) and ProfileList registry.' }
-
-    # 6. Profiles (size, roaming, hive size)
-    $profs = Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { -not $_.Special -and $_.LocalPath -like '*\Users\*' }
-    $profRows = foreach ($p in $profs) {
-        $nt = Join-Path $p.LocalPath 'NTUSER.DAT'; $uc = Join-Path $p.LocalPath 'AppData\Local\Microsoft\Windows\UsrClass.dat'
-        $ntMB = if (Test-Path -LiteralPath $nt) { [math]::Round((Get-Item -LiteralPath $nt -Force).Length/1MB,1) } else { $null }
-        $ucMB = if (Test-Path -LiteralPath $uc) { [math]::Round((Get-Item -LiteralPath $uc -Force).Length/1MB,1) } else { $null }
-        $user = try { (New-Object Security.Principal.SecurityIdentifier($p.SID)).Translate([Security.Principal.NTAccount]).Value } catch { $p.SID }
-        [pscustomobject]@{ User = $user; Loaded = $p.Loaded; Roaming = $p.RoamingConfigured; LastUse = $p.LastUseTime; NTUSER_MB = $ntMB; UsrClass_MB = $ucMB; Path = $p.LocalPath }
-    }
-    Out-Section 'User profiles (registry hive sizes; big hives unload slowly)' ($profRows | Sort-Object LastUse -Descending)
-    foreach ($r in $profRows) {
-        if ($r.NTUSER_MB -ge 50)   { Add-Hit 'MEDIUM' "$($r.User): NTUSER.DAT is $($r.NTUSER_MB) MB (bloated hive slows sign-in/out)." }
-        if ($r.UsrClass_MB -ge 100) { Add-Hit 'MEDIUM' "$($r.User): UsrClass.dat is $($r.UsrClass_MB) MB (bloated - common Start menu/Explorer lag cause)." }
-        if ($r.Roaming) { Add-Hit 'MEDIUM' "$($r.User) uses a ROAMING profile - sign-out copies the profile to the server; large or slow link = slow sign-out." }
-    }
-
-    # 7. Per-user items for every loaded user (works when run as admin or SYSTEM via RMM)
-    $loaded = Get-ChildItem Registry::HKEY_USERS -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-5-21-[\d-]+$' }
-    $drives = @(); $userScripts = @(); $redir = @()
-    foreach ($k in $loaded) {
-        $sid = $k.PSChildName
-        $user = try { (New-Object Security.Principal.SecurityIdentifier($sid)).Translate([Security.Principal.NTAccount]).Value } catch { $sid }
-        Get-ChildItem "Registry::HKEY_USERS\$sid\Network" -ErrorAction SilentlyContinue | ForEach-Object { $drives += [pscustomobject]@{ User = $user; Drive = "$($_.PSChildName):"; Path = (Get-ItemProperty $_.PSPath).RemotePath } }
-        Get-ChildItem "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Group Policy\Scripts\Logoff" -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $sp = Get-ItemProperty $_.PSPath; if ($sp.Script) { $userScripts += [pscustomobject]@{ User = $user; Script = $sp.Script; Params = $sp.Parameters } } }
-        $sf = Get-ItemProperty "Registry::HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" -ErrorAction SilentlyContinue
-        if ($sf) { foreach ($n in 'Desktop','Personal','{F42EE2D3-909F-4907-8871-4C22FC0BF756}','My Pictures','AppData') { $v = $sf.$n; if ($v -like '\\*') { $redir += [pscustomobject]@{ User = $user; Folder = $n; Target = $v } } } }
-    }
-    foreach ($d in $drives) {
-        $srv = if ($d.Path -match '^\\\\([^\\]+)') { $Matches[1] } else { $null }
-        $d | Add-Member NoteProperty ServerReachable $(if ($srv) { [bool](Test-Connection -ComputerName $srv -Count 1 -Quiet -ErrorAction SilentlyContinue) } else { $null })
-        if ($srv -and -not $d.ServerReachable) { Add-Hit 'HIGH' "$($d.User): mapped drive $($d.Drive) -> $($d.Path) is UNREACHABLE - Explorer hangs/lag at sign-out." }
-    }
-    Out-Section 'Mapped network drives (loaded users)' $drives
-    Out-Section 'Folder redirection to network (loaded users)' $redir
-    if ($redir) {
-        Add-Hit 'LOW' 'Folders are redirected to a network share - a slow/offline server makes Explorer and sign-out lag (check Offline Files sync too).'
-        foreach ($k in $loaded) {
-            $acct = try { (New-Object Security.Principal.SecurityIdentifier($k.PSChildName)).Translate([Security.Principal.NTAccount]).Value } catch { $k.PSChildName }
-            if (-not ($redir | Where-Object { $_.User -eq $acct })) { continue }
-            $src = @(Show-FolderRedirectionSource -Sid $k.PSChildName -Account $acct)
-            foreach ($h in ($src | Where-Object { $_.AppliedToUserLastTime -or $_.AppliesVia -notmatch '^\(' })) { Add-Hit 'MEDIUM' "$acct folders redirected by GPO '$($h.GPO)' via $($h.AppliesVia) - confirm this is still wanted (legacy SBS policies often linger)." }
-        }
-    }
-
-    # 8. Logoff scripts (GPO + local) and logoff-related policy
-    $machScripts = @()
-    Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State' -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.PSPath -match '\\Scripts\\Logoff\\\d+\\\d+$' } | ForEach-Object { $sp = Get-ItemProperty $_.PSPath; if ($sp.Script) { $machScripts += [pscustomobject]@{ Source = 'GPO (cached state)'; Script = $sp.Script; Params = $sp.Parameters } } }
-    $machScripts += $userScripts | ForEach-Object { [pscustomobject]@{ Source = "User: $($_.User)"; Script = $_.Script; Params = $_.Params } }
-    Out-Section 'Logoff scripts configured (run at every sign-out)' ($machScripts | Sort-Object Script -Unique)
-    if ($machScripts) { Add-Hit 'MEDIUM' "$(@($machScripts | Sort-Object Script -Unique).Count) logoff script(s) run at sign-out - test them / check their network paths." }
-    $pol = @()
-    $sysPol = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -ErrorAction SilentlyContinue
-    $ctl = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control' -ErrorAction SilentlyContinue
-    $pol += [pscustomobject]@{ Setting = 'RunLogoffScriptSync';     Value = $sysPol.RunLogoffScriptSync;   Note = '1 = sign-out waits for logoff scripts' }
-    $pol += [pscustomobject]@{ Setting = 'VerboseStatus';           Value = $sysPol.VerboseStatus;         Note = '1 = shows what sign-out is waiting on (handy for testing)' }
-    $pol += [pscustomobject]@{ Setting = 'WaitToKillServiceTimeout'; Value = $ctl.WaitToKillServiceTimeout; Note = 'default 5000 ms; large values = slow shutdown' }
-    $pol += [pscustomobject]@{ Setting = 'MaxGPOScriptWait (HKLM policy)'; Value = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -ErrorAction SilentlyContinue).MaxGPOScriptWait; Note = 'seconds a GPO script may run' }
-    Out-Section 'Logoff / shutdown related settings' $pol
-    if ($ctl.WaitToKillServiceTimeout -and [int]$ctl.WaitToKillServiceTimeout -gt 20000) { Add-Hit 'LOW' "WaitToKillServiceTimeout is $($ctl.WaitToKillServiceTimeout) ms - shutdown waits that long for hung services." }
-
-    # 9. App hangs / crashes
-    $hangs = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Hang','Application Error'; StartTime = $since } -ErrorAction SilentlyContinue |
-        ForEach-Object { $d = $_.Properties; [pscustomobject]@{ Type = $(if ($_.ProviderName -eq 'Application Hang') { 'Hang' } else { 'Crash' }); App = "$($d[0].Value)"; Time = $_.TimeCreated } } |
-        Group-Object Type, App | ForEach-Object { [pscustomobject]@{ Event = $_.Name; Count = $_.Count; Last = ($_.Group | Sort-Object Time -Descending)[0].Time } } | Sort-Object Count -Descending
-    Out-Section "Application hangs / crashes (last $days days)" ($hangs | Select-Object -First 15)
-    foreach ($h in ($hangs | Where-Object { $_.Count -ge 3 } | Select-Object -First 5)) { Add-Hit 'MEDIUM' "$($h.Event) $($h.Count)x in $days days." }
-
-    # 10. Disk health / free space / storage errors
-    $disks = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Select-Object DeviceID, @{n='SizeGB';e={[math]::Round($_.Size/1GB)}}, @{n='FreeGB';e={[math]::Round($_.FreeSpace/1GB,1)}}, @{n='FreePct';e={[math]::Round($_.FreeSpace/$_.Size*100)}}
-    Out-Section 'Disk free space' $disks
-    foreach ($d in $disks) { if ($d.FreePct -lt 10) { Add-Hit 'HIGH' "$($d.DeviceID) only $($d.FreePct)% free ($($d.FreeGB) GB) - low space causes lag and slow profile writes." } }
-    $phys = Get-PhysicalDisk -ErrorAction SilentlyContinue | Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus
-    Out-Section 'Physical disks' $phys
-    foreach ($p in ($phys | Where-Object { $_.HealthStatus -and $_.HealthStatus -ne 'Healthy' })) { Add-Hit 'HIGH' "Disk '$($p.FriendlyName)' health is $($p.HealthStatus)." }
-    foreach ($p in ($phys | Where-Object { $_.MediaType -eq 'HDD' })) { Add-Hit 'LOW' "Disk '$($p.FriendlyName)' is a spinning HDD - an SSD upgrade is the biggest fix for general lag." }
-    $stor = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 7,11,51,129,153,157; StartTime = $since } -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -match 'disk|stor|nvme|iaStor|Ntfs|volmgr' }
-    Out-Section 'Storage errors (disk 7/51/153, controller 129, etc.)' ($stor | Group-Object ProviderName, Id | ForEach-Object { [pscustomobject]@{ Event = $_.Name; Count = $_.Count; Last = $_.Group[0].TimeCreated } })
-    if ($stor) { Add-Hit 'HIGH' "$(@($stor).Count) storage/disk error event(s) in $days days - disk or controller trouble causes freezes and slow sign-out." }
-    try {
-        $lat = (Get-Counter '\PhysicalDisk(_Total)\Avg. Disk sec/Transfer','\PhysicalDisk(_Total)\% Idle Time' -SampleInterval 1 -MaxSamples 5 -ErrorAction Stop).CounterSamples | Group-Object Path | ForEach-Object { [pscustomobject]@{ Counter = ($_.Name -split '\\')[-1]; Avg = [math]::Round(($_.Group.CookedValue | Measure-Object -Average).Average, 4) } }
-        Out-Section 'Disk latency (5 sec sample; >0.025 sec/transfer is slow)' $lat
-        $sec = ($lat | Where-Object { $_.Counter -like 'avg. disk sec*' }).Avg
-        if ($sec -gt 0.025) { Add-Hit 'HIGH' "Average disk latency is $([math]::Round($sec*1000)) ms per transfer right now (should be under 25 ms)." }
-    } catch {}
-
-    # 11. Pending reboot + Windows Update
-    $pend = @()
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $pend += 'CBS' }
-    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $pend += 'Windows Update' }
-    if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction SilentlyContinue).PendingFileRenameOperations) { $pend += 'File rename' }
-    Out-Section 'Pending reboot' ([pscustomobject]@{ Pending = [bool]$pend; Reasons = ($pend -join ', ') })
-    if ($pend) { Add-Hit 'MEDIUM' "Reboot pending ($($pend -join ', ')) - updates waiting to install can make sign-out/shutdown slow; reboot the machine." }
-
-    # 12. Known sign-out blockers running now
-    $known = 'OneDrive','Teams','ms-teams','Outlook','Dropbox','GoogleDriveFS','Box','iCloudDrive','CcmExec','SearchIndexer','SearchProtocolHost','MsMpEng','TiWorker','TrustedInstaller','wuauclt','MoUsoCoreWorker','ShellExperienceHost','StartMenuExperienceHost','explorer','dwm','csrss'
-    Out-Section 'Common sign-out blockers currently running' ($procs | Where-Object { $known -contains $_.Name } | Sort-Object WorkingSet64 -Descending | Select-Object Name, Id, SessionId, @{n='MemMB';e={[math]::Round($_.WorkingSet64/1MB)}}, @{n='CPUsec';e={[math]::Round($_.CPU)}}, Responding)
-    if ($procs | Where-Object { $_.Name -in 'TiWorker','TrustedInstaller','MoUsoCoreWorker' -and $_.CPU -gt 60 }) { Add-Hit 'MEDIUM' 'Windows Update servicing (TiWorker/TrustedInstaller) is busy right now - lag and slow sign-out until it finishes.' }
-
-    # 13. Black screen / forced power-offs (WER black-screen diagnostics, live kernel watchdog dumps)
-    $wer = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Windows Error Reporting'; Id = 1001; StartTime = $since } -ErrorAction SilentlyContinue
-    $bs = $wer | Where-Object { $_.Message -match 'WindowsBlackScreenDiagnostics|HamLkd|AppHangB1|MoAppHang' } | ForEach-Object {
-        $m = $_.Message
-        $ev = if ($m -match 'Event Name: (\S+)') { $Matches[1] } else { '?' }
-        $p1 = if ($m -match 'P1: (\S*)') { $Matches[1] } else { '' }
-        $p4 = if ($m -match 'P4: (\S*)') { $Matches[1] } else { '' }
-        [pscustomobject]@{ Time = $_.TimeCreated; Event = $ev; P1 = $p1; P4 = $p4 } } |
-        Group-Object { '{0:yyyyMMddHHmm}|{1}|{2}|{3}' -f $_.Time, $_.Event, $_.P1, $_.P4 } | ForEach-Object { $_.Group[0] } | Sort-Object Time
-    Out-Section 'Black screen / app-hang reports (WER)' ($bs | Select-Object -Last 25)
-    $pwrHold = @($bs | Where-Object { $_.P4 -match 'LongPowerButtonHold' })
-    if ($pwrHold) { Add-Hit 'HIGH' "Black screen + power button held $($pwrHold.Count)x (last $($pwrHold[-1].Time)) - user is hard-powering off a hung display/shell. Suspect graphics driver/DWM; check LiveKernelReports dumps." }
-    if (@($bs | Where-Object { $_.Event -eq 'HamLkd' })) { Add-Hit 'HIGH' "HamLkd live dump: an app ($(@($bs | Where-Object { $_.Event -eq 'HamLkd' })[0].P1 -replace '_.*','')) could not be terminated - stuck in a kernel/driver call (classic sign-out hang)." }
-    $lkr = Join-Path $env:SystemRoot 'LiveKernelReports'
-    $dumps = Get-ChildItem $lkr -Recurse -Filter *.dmp -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since } | Sort-Object LastWriteTime -Descending
-    Out-Section "Live kernel dumps in $lkr (last $days days)" ($dumps | Select-Object -First 20 LastWriteTime, @{n='Folder';e={$_.Directory.Name}}, Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}})
-    if ($dumps) { Add-Hit 'HIGH' "$(@($dumps).Count) live kernel dump(s) (WATCHDOG = display/GPU watchdog) - open in WinDbg (!analyze -v) to name the driver; update the graphics driver from the OEM." }
-    $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object Name, DriverVersion, @{n='DriverDate';e={$_.DriverDate}}, Status
-    Out-Section 'Graphics adapter / driver' $gpu
-
-    # 14. Multi-homed / wrong DNS (domain machine on a second network, e.g. guest Wi-Fi)
-    $cs = Get-CimInstance Win32_ComputerSystem
-    $ipc = Get-NetIPConfiguration -ErrorAction SilentlyContinue | Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' }
-    $nets = $ipc | Select-Object InterfaceAlias, @{n='IPv4';e={$_.IPv4Address.IPAddress -join ','}}, @{n='Gateway';e={$_.IPv4DefaultGateway.NextHop -join ','}}, @{n='DNS';e={$_.DNSServer.ServerAddresses -join ','}}, @{n='Profile';e={$_.NetProfile.NetworkCategory}}
-    Out-Section 'Active network connections with a gateway' $nets
-    if (@($ipc).Count -gt 1) { Add-Hit 'MEDIUM' "$(@($ipc).Count) networks connected at once ($((@($ipc).InterfaceAlias) -join ', ')) - DNS/DC lookups can go out the wrong one; disconnect the extra (e.g. guest Wi-Fi)." }
-    if ($cs.PartOfDomain) {
-        $nl = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'NETLOGON'; Id = 5719; StartTime = $since } -ErrorAction SilentlyContinue
-        $gp = Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-GroupPolicy'; Id = 1058,1129,1054,1055; StartTime = $since } -ErrorAction SilentlyContinue
-        if ($nl -or $gp) { Add-Hit 'MEDIUM' "Domain controller trouble: NETLOGON 5719 x$(@($nl).Count), Group Policy failures x$(@($gp).Count) - slow sign-in/out waiting on the DC. Check DNS points only at the DCs." }
-        $dcIps = @(); try { $dcIps = @(Resolve-DnsName -Name $cs.Domain -Type A -ErrorAction Stop | Where-Object IPAddress | Select-Object -ExpandProperty IPAddress) } catch {}
-        foreach ($c in $ipc) { foreach ($dns in $c.DNSServer.ServerAddresses) { if ($dns -notmatch ':' -and $dcIps -and $dcIps -notcontains $dns) { Add-Hit 'MEDIUM' "$($c.InterfaceAlias) uses DNS $dns which is not a domain controller ($($dcIps -join ', ')) - domain lookups may fail." } } }
-    }
-
-    # Summary
-    $order = @{ HIGH = 0; MEDIUM = 1; LOW = 2 }
-    $sorted = $findings | Sort-Object { $order[$_.Severity] }
-    Write-Sub 'LIKELY CAUSES (most serious first)'
-    if (-not $sorted) { Write-Host '  Nothing obvious found. Next: set VerboseStatus=1 to see what sign-out waits on, run Performance snapshot during the lag, or Sysinternals ProcMon boot/logoff trace.' -ForegroundColor Green }
-    foreach ($f in $sorted) { $c = @{ HIGH = 'Red'; MEDIUM = 'Yellow'; LOW = 'Gray' }[$f.Severity]; Write-Host ("  [{0,-6}] {1}" -f $f.Severity, $f.Finding) -ForegroundColor $c }
-    Write-Host "`n  Quick wins: reboot (clears pending updates/handle leaks), disconnect dead mapped drives, quit sync apps (OneDrive/Teams) before sign-out to test," -ForegroundColor DarkCyan
-    Write-Host '  and if sign-out sits on a blank/"Signing out" screen, enable VerboseStatus to see what it is waiting on.' -ForegroundColor DarkCyan
-    $head = "Slow sign-out / lag diagnostics - $env:COMPUTERNAME - $(Get-Date) - last $days days`r`nPrepared by Sigma Data Systems Inc. - Sigma Data Systems INC ToolKit`r`n`r`nLIKELY CAUSES:`r`n" + (($sorted | ForEach-Object { "  [$($_.Severity)] $($_.Finding)" }) -join "`r`n")
-    ($head + "`r`n" + ($log -join "`r`n")) | Out-File -FilePath $report -Encoding UTF8
-    $sorted | Export-Csv (Join-Path $dir "SlowLogoff_Findings_$($env:COMPUTERNAME)_$stamp.csv") -NoTypeInformation -Encoding UTF8
-    Write-Host "`n  Report saved: $report" -ForegroundColor Green
 }
 
 function Invoke-ADHealth {
@@ -3568,6 +2814,403 @@ function Invoke-BitLockerToEntra {
     }
 }
 
+
+# ---------- WI-FI DIAGNOSTICS -------------------------------------------------------------
+# Built only on Windows' own tools (netsh wlan, WLAN AutoConfig event log, NetAdapter cmdlets,
+# the Native WiFi API for a fresh scan). netsh output is parsed in English - on a non-English
+# Windows some fields may come back empty.
+
+function ConvertFrom-NetshBlocks([string[]]$Lines) {
+    # Generic "Key : Value" parser that keeps the indentation level, used for netsh wlan output
+    foreach ($l in $Lines) {
+        if ($l -match '^(\s*)([^:]+?)\s*:\s?(.*)$') { [pscustomobject]@{ Indent = $Matches[1].Length; Key = $Matches[2].Trim(); Value = $Matches[3].Trim() } }
+    }
+}
+
+function Get-WifiInterfaces {
+    $raw = netsh wlan show interfaces 2>&1
+    $out = @(); $cur = $null
+    foreach ($kv in (ConvertFrom-NetshBlocks $raw)) {
+        if ($kv.Key -eq 'Name') { if ($cur) { $out += [pscustomobject]$cur }; $cur = [ordered]@{ Name = $kv.Value } ; continue }
+        if ($cur -and -not $cur.Contains($kv.Key)) { $cur[$kv.Key] = $kv.Value }
+    }
+    if ($cur) { $out += [pscustomobject]$cur }
+    foreach ($i in $out) {
+        $sig = [int]("0$($i.Signal)" -replace '[^\d]', '')
+        $i | Add-Member -NotePropertyName SignalPct -NotePropertyValue $sig -Force
+        $rssi = if ($i.PSObject.Properties['Rssi'] -and "$($i.Rssi)" -match '-?\d+') { [int]$Matches[0] } else { [int]($sig / 2) - 100 }
+        $i | Add-Member -NotePropertyName dBm -NotePropertyValue $rssi -Force
+        $bssid = if ($i.PSObject.Properties['AP BSSID']) { $i.'AP BSSID' } else { $i.BSSID }
+        $i | Add-Member -NotePropertyName ApBssid -NotePropertyValue "$bssid".ToLower() -Force
+        $ch = [int]("0$($i.Channel)" -replace '[^\d]', '')
+        $i | Add-Member -NotePropertyName ChannelNum -NotePropertyValue $ch -Force
+        $band = if ($i.PSObject.Properties['Band'] -and $i.Band) { $i.Band } elseif ($ch -ge 1 -and $ch -le 14) { '2.4 GHz' } elseif ($ch) { '5 GHz' } else { '' }
+        $i | Add-Member -NotePropertyName BandName -NotePropertyValue $band -Force
+    }
+    return $out
+}
+
+function Invoke-WifiRescan {
+    # Ask Windows for a fresh scan (Native WiFi API WlanScan) so the neighbor list isn't a stale cache
+    try {
+        if (-not ('SdsiWlan' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class SdsiWlan {
+    [DllImport("wlanapi.dll")] static extern uint WlanOpenHandle(uint ver, IntPtr res, out uint neg, out IntPtr h);
+    [DllImport("wlanapi.dll")] static extern uint WlanCloseHandle(IntPtr h, IntPtr res);
+    [DllImport("wlanapi.dll")] static extern uint WlanEnumInterfaces(IntPtr h, IntPtr res, out IntPtr list);
+    [DllImport("wlanapi.dll")] static extern uint WlanScan(IntPtr h, ref Guid g, IntPtr ssid, IntPtr ie, IntPtr res);
+    [DllImport("wlanapi.dll")] static extern void WlanFreeMemory(IntPtr p);
+    public static int ScanAll() {
+        uint neg; IntPtr h; int n = 0;
+        if (WlanOpenHandle(2, IntPtr.Zero, out neg, out h) != 0) return -1;
+        IntPtr list;
+        if (WlanEnumInterfaces(h, IntPtr.Zero, out list) == 0) {
+            int count = Marshal.ReadInt32(list);
+            for (int i = 0; i < count; i++) {
+                IntPtr p = new IntPtr(list.ToInt64() + 8 + i * 532);   // WLAN_INTERFACE_INFO = GUID + 256 WCHAR + state
+                Guid g = (Guid)Marshal.PtrToStructure(p, typeof(Guid));
+                if (WlanScan(h, ref g, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero) == 0) n++;
+            }
+            WlanFreeMemory(list);
+        }
+        WlanCloseHandle(h, IntPtr.Zero);
+        return n;
+    }
+}
+'@ -ErrorAction Stop
+        }
+        $n = [SdsiWlan]::ScanAll()
+        if ($n -gt 0) { Write-Host '  Fresh Wi-Fi scan requested - waiting 5 seconds...' -ForegroundColor DarkGray; Start-Sleep -Seconds 5; return $true }
+    } catch { }
+    return $false
+}
+
+function Get-WifiNeighbors {
+    $raw = netsh wlan show networks mode=bssid 2>&1
+    if (($raw -join ' ') -match 'location permission|Location services') { return 'LOCATION' }
+    $aps = @(); $ssid = $null; $auth = $null; $enc = $null; $cur = $null
+    foreach ($kv in (ConvertFrom-NetshBlocks $raw)) {
+        if ($kv.Key -match '^SSID \d+$') { if ($cur) { $aps += [pscustomobject]$cur; $cur = $null }; $ssid = $kv.Value; continue }
+        if ($kv.Key -eq 'Authentication') { $auth = $kv.Value; continue }
+        if ($kv.Key -eq 'Encryption') { $enc = $kv.Value; continue }
+        if ($kv.Key -match '^BSSID \d+$') {
+            if ($cur) { $aps += [pscustomobject]$cur }
+            $cur = [ordered]@{ SSID = $(if ($ssid) { $ssid } else { '(hidden)' }); BSSID = $kv.Value.ToLower(); Auth = $auth; Encryption = $enc; SignalPct = 0; dBm = $null; Radio = ''; Band = ''; Channel = 0; Stations = $null; UtilizationPct = $null }
+            continue
+        }
+        if (-not $cur) { continue }
+        switch -Regex ($kv.Key) {
+            '^Signal$'              { $cur.SignalPct = [int]($kv.Value -replace '[^\d]', '') }
+            '^Rssi$'                { if ($kv.Value -match '-?\d+') { $cur.dBm = [int]$Matches[0] } }
+            '^Radio type$'          { $cur.Radio = $kv.Value }
+            '^Band$'                { $cur.Band = $kv.Value }
+            '^Channel$'             { $cur.Channel = [int]("0$($kv.Value)" -replace '[^\d]', '') }
+            '^Connected Stations$'  { $cur.Stations = [int]("0$($kv.Value)" -replace '[^\d]', '') }
+            '^Channel Utilization$' { if ($kv.Value -match '\((\d+)\s*%\)') { $cur.UtilizationPct = [int]$Matches[1] } elseif ($kv.Value -match '^\d+') { $cur.UtilizationPct = [math]::Round([int]$Matches[0] / 255 * 100) } }
+        }
+    }
+    if ($cur) { $aps += [pscustomobject]$cur }
+    foreach ($a in $aps) {
+        if ($null -eq $a.dBm) { $a.dBm = [int]($a.SignalPct / 2) - 100 }
+        if (-not $a.Band) { $a.Band = if ($a.Channel -le 14) { '2.4 GHz' } else { '5 GHz' } }
+    }
+    return $aps
+}
+
+function Get-WifiChannelAnalysis($Aps, [string]$OwnSsid) {
+    $others = @($Aps | Where-Object { $_.SSID -ne $OwnSsid })
+    # 2.4 GHz: anything within 4 channels overlaps (20 MHz channels are 5 channels wide)
+    $r24 = foreach ($c in 1, 6, 11) {
+        $score = 0; $same = 0; $adj = 0
+        foreach ($a in ($others | Where-Object Band -like '2.4*')) {
+            $d = [math]::Abs($a.Channel - $c)
+            if ($d -eq 0) { $same++; $score += $a.SignalPct } elseif ($d -lt 5) { $adj++; $score += $a.SignalPct * (1 - $d / 5) }
+        }
+        [pscustomobject]@{ Band = '2.4 GHz'; Channel = $c; SameChannelAPs = $same; OverlappingAPs = $adj; InterferenceScore = [math]::Round($score) }
+    }
+    # 5 GHz: score per channel and per 80 MHz block (most APs use 40/80 MHz)
+    $blocks = @(@{ N = '36-48'; C = 36..48 }, @{ N = '52-64 (DFS)'; C = 52..64 }, @{ N = '100-112 (DFS)'; C = 100..112 }, @{ N = '116-128 (DFS)'; C = 116..128 }, @{ N = '132-144 (DFS)'; C = 132..144 }, @{ N = '149-161'; C = 149..161 })
+    $r5 = foreach ($b in $blocks) {
+        $in = @($others | Where-Object { $_.Band -like '5*' -and $b.C -contains $_.Channel })
+        [pscustomobject]@{ Band = '5 GHz'; Channel = $b.N; SameChannelAPs = $in.Count; OverlappingAPs = 0; InterferenceScore = [math]::Round((($in | Measure-Object SignalPct -Sum).Sum)) }
+    }
+    return @($r24) + @($r5)
+}
+
+function Test-PingResponds {
+    param([string]$Target, [int]$Tries = 3)
+    $p = New-Object System.Net.NetworkInformation.Ping
+    try { for ($t = 0; $t -lt $Tries; $t++) { try { if (($p.Send($Target, 1000)).Status -eq 'Success') { return $true } } catch { } } ; return $false } finally { $p.Dispose() }
+}
+
+function Invoke-LivePing {
+    param([string]$Target, [int]$Count = 30, [int]$WarnMs = 30, [int]$BadMs = 100)
+    Write-Host "  (live: each number is one ping in ms, X = no reply within 1 second)" -ForegroundColor DarkGray
+    $pinger = New-Object System.Net.NetworkInformation.Ping
+    $times = New-Object System.Collections.Generic.List[int]; $lost = 0
+    Write-Host '  ' -NoNewline
+    for ($n = 1; $n -le $Count; $n++) {
+        $r = $null; try { $r = $pinger.Send($Target, 1000) } catch { }
+        if ($r -and $r.Status -eq 'Success') {
+            $ms = [int]$r.RoundtripTime; $times.Add($ms)
+            Write-Host ("{0} " -f $ms) -NoNewline -ForegroundColor $(if ($ms -gt $BadMs) { 'Red' } elseif ($ms -gt $WarnMs) { 'Yellow' } else { 'Green' })
+        } else { $lost++; Write-Host 'X ' -NoNewline -ForegroundColor Red }
+        if ($n % 15 -eq 0 -or $n -eq $Count) { Write-Host ''; if ($n -lt $Count) { Write-Host '  ' -NoNewline } }
+        Start-Sleep -Milliseconds 500
+    }
+    $pinger.Dispose()
+    $loss = [math]::Round(($lost / [math]::Max(1, $Count)) * 100)
+    $avg = if ($times.Count) { [math]::Round(($times | Measure-Object -Average).Average) } else { 'n/a' }
+    $max = if ($times.Count) { ($times | Measure-Object -Maximum).Maximum } else { 0 }
+    Write-Host ("  Loss {0}%   avg {1} ms   max {2} ms" -f $loss, $avg, $max) -ForegroundColor $(if ($loss -gt 0 -or $max -gt $BadMs) { 'Yellow' } else { 'Green' })
+    [pscustomobject]@{ Target = $Target; Loss = $loss; Avg = $avg; Max = $max }
+}
+
+function Invoke-WifiDiagnostics {
+    Write-Title 'Wi-Fi deep diagnostics'
+    $svc = Get-Service WlanSvc -ErrorAction SilentlyContinue
+    if (-not $svc) { Write-Host '  WLAN AutoConfig service not present - this machine has no Wi-Fi support installed.' -ForegroundColor Yellow; return }
+    if ($svc.Status -ne 'Running') { Write-Host "  WLAN AutoConfig service is $($svc.Status)." -ForegroundColor Red }
+    $dir = Get-OutDir ("Network\WiFi_{0}_{1}" -f $env:COMPUTERNAME, (Get-Stamp))
+    $findings = New-Object System.Collections.Generic.List[string]
+
+    # ---- 1. current connection -------------------------------------------------------
+    $ifs = @(Get-WifiInterfaces)
+    if (-not $ifs) { Write-Host '  No wireless interface found.' -ForegroundColor Yellow; return }
+    $conn = $ifs | Where-Object { $_.State -match 'connected' -and $_.State -notmatch 'disconnected' } | Select-Object -First 1
+    Write-Sub 'Current connection'
+    foreach ($i in $ifs) {
+        [pscustomobject]@{ Adapter = $i.Name; State = $i.State; SSID = $i.SSID; AP_BSSID = $i.ApBssid; Radio = $i.'Radio type'; Band = $i.BandName; Channel = $i.Channel
+            Signal = "$($i.SignalPct)% (~$($i.dBm) dBm)"; RxMbps = $i.'Receive rate (Mbps)'; TxMbps = $i.'Transmit rate (Mbps)'; Security = "$($i.Authentication) / $($i.Cipher)"; Profile = $i.Profile } | Format-List
+    }
+    if ($conn) {
+        if ($conn.dBm -le -75) { $findings.Add("WEAK SIGNAL: $($conn.dBm) dBm ($($conn.SignalPct)%). Below -70 dBm expect slow speeds and drops; below -80 dBm it is unusable. Move closer, add an AP, or check for walls/metal between PC and AP.") }
+        elseif ($conn.dBm -le -67) { $findings.Add("Marginal signal: $($conn.dBm) dBm. Fine for browsing, not for Teams/VoIP (aim for -67 dBm or better).") }
+        $rx = [double]("0$($conn.'Receive rate (Mbps)')" -replace '[^\d\.]', '')
+        if ($rx -gt 0 -and $rx -lt 50) { $findings.Add("Low link rate: $rx Mbps receive. Usually caused by weak signal, interference, or a 2.4 GHz / old 802.11n connection.") }
+        if ($conn.BandName -like '2.4*') { $findings.Add('Connected on 2.4 GHz - slower and far more crowded than 5 GHz. Check below whether 5 GHz from the same network is available.') }
+        if ($conn.Authentication -match 'Open|WEP' -or $conn.Cipher -match 'WEP|TKIP') { $findings.Add("Weak/legacy security on this network ($($conn.Authentication) / $($conn.Cipher)). TKIP also caps speed at 54 Mbps.") }
+    } else { Write-Host '  Not connected to Wi-Fi right now - showing the environment only.' -ForegroundColor Yellow }
+
+    # ---- 2. adapter, driver, power ----------------------------------------------------
+    Write-Sub 'Adapter, driver and power settings'
+    $drv = netsh wlan show drivers 2>&1
+    $dkv = @{}; foreach ($kv in (ConvertFrom-NetshBlocks $drv)) { if (-not $dkv.ContainsKey($kv.Key)) { $dkv[$kv.Key] = $kv.Value } }
+    [pscustomobject]@{ Driver = $dkv['Driver']; Vendor = $dkv['Vendor']; Version = $dkv['Version']; Date = $dkv['Date']; RadioTypes = $dkv['Radio types supported']; WPA3 = (($drv | Select-String 'WPA3') -join ' ').Trim() } | Format-List
+    $dDate = $null; try { $dDate = [datetime]::Parse($dkv['Date']) } catch { }
+    if ($dDate -and $dDate -lt (Get-Date).AddYears(-2)) { $findings.Add("Wi-Fi driver is from $($dDate.ToString('yyyy-MM-dd')) - over 2 years old. Install the latest driver from the PC maker / Intel / Realtek; old drivers are a top cause of random drops.") }
+    $wa = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.PhysicalMediaType -match '802\.11' -or $_.InterfaceDescription -match 'Wi-?Fi|Wireless|802\.11|WLAN' } | Select-Object -First 1
+    if ($wa) {
+        $pm = Get-NetAdapterPowerManagement -Name $wa.Name -ErrorAction SilentlyContinue
+        if ($pm) {
+            Write-Host "  'Allow the computer to turn off this device to save power': $($pm.AllowComputerToTurnOffDevice)"
+            if ("$($pm.AllowComputerToTurnOffDevice)" -eq 'Enabled') { $findings.Add('Windows is allowed to power off the Wi-Fi adapter to save power - a common cause of drops after idle. (Fix available below.)') }
+        }
+        $adv = Get-NetAdapterAdvancedProperty -Name $wa.Name -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'Roam|Band|Width|MIMO|Power|Wireless Mode|802\.11|Preferred|Throughput|U-APSD|Packet Coalescing|ARP|NS offload|Wake' }
+        if ($adv) { Write-Host '  Key driver settings:'; $adv | Select-Object DisplayName, DisplayValue | Format-Table -AutoSize }
+    }
+    $wps = powercfg /query SCHEME_CURRENT 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 2>$null
+    $ac = ($wps | Select-String 'Current AC Power Setting Index:\s*0x([0-9a-f]+)').Matches.Groups[1].Value
+    $dc = ($wps | Select-String 'Current DC Power Setting Index:\s*0x([0-9a-f]+)').Matches.Groups[1].Value
+    $pmNames = @{ 0 = 'Maximum Performance'; 1 = 'Low Power Saving'; 2 = 'Medium Power Saving'; 3 = 'Maximum Power Saving' }
+    if ($ac) { Write-Host ("  Power plan 'Wireless Adapter Settings': plugged in = {0}, on battery = {1}" -f $pmNames[[convert]::ToInt32($ac, 16)], $pmNames[[convert]::ToInt32($dc, 16)])
+        if ([convert]::ToInt32($ac, 16) -gt 0) { $findings.Add("Wi-Fi power saving is ON while plugged in ($($pmNames[[convert]::ToInt32($ac, 16)])) - can cause lag spikes and drops. (Fix available below.)") } }
+
+    # ---- 3. neighbors / channels --------------------------------------------------------
+    Write-Sub 'Nearby networks (fresh scan)'
+    $fresh = Invoke-WifiRescan
+    $aps = Get-WifiNeighbors
+    if ($aps -eq 'LOCATION') {
+        Write-Host '  Windows blocked the network scan: Location access is required to read nearby Wi-Fi (Windows 11 24H2+).' -ForegroundColor Yellow
+        Write-Host '  Turn on Settings > Privacy & security > Location (and "Let desktop apps access your location"), then re-run.' -ForegroundColor Yellow
+        if (Read-YesNo 'Open the Location settings page now?' $false) { Start-Process 'ms-settings:privacy-location' }
+        $aps = @()
+    }
+    $aps = @($aps)
+    if (-not $fresh) { Write-Host '  (Could not trigger a fresh scan - list may be up to a minute old.)' -ForegroundColor DarkGray }
+    if ($aps) {
+        $ownSsid = if ($conn) { $conn.SSID } else { '' }
+        $aps | Sort-Object Band, Channel, @{e='SignalPct';Descending=$true} |
+            Select-Object @{n='Own';e={ if ($conn -and $_.BSSID -eq $conn.ApBssid) { '>>' } elseif ($_.SSID -eq $ownSsid) { '*' } else { '' } }}, SSID, BSSID, Band, Channel, @{n='Signal';e={"$($_.SignalPct)% ($($_.dBm))"}}, Radio, Stations, @{n='Util%';e={$_.UtilizationPct}}, Auth |
+            Format-Table -AutoSize
+        Write-Host '  >> = the AP you are connected to   * = other APs broadcasting your network' -ForegroundColor DarkGray
+        $aps | Export-Csv (Join-Path $dir 'NearbyAPs.csv') -NoTypeInformation
+
+        $n24 = @($aps | Where-Object Band -like '2.4*').Count; $n5 = @($aps | Where-Object Band -like '5*').Count; $n6 = @($aps | Where-Object Band -like '6*').Count
+        Write-Host ("  Access points seen: {0} total - 2.4 GHz {1}, 5 GHz {2}, 6 GHz {3}" -f $aps.Count, $n24, $n5, $n6)
+
+        # Channel analysis
+        Write-Sub 'Channel congestion (other networks only)'
+        $ca = Get-WifiChannelAnalysis $aps $ownSsid
+        $ca | Format-Table -AutoSize
+        $ca | Export-Csv (Join-Path $dir 'ChannelAnalysis.csv') -NoTypeInformation
+        $best24 = $ca | Where-Object Band -eq '2.4 GHz' | Sort-Object InterferenceScore | Select-Object -First 1
+        $best5  = $ca | Where-Object { $_.Band -eq '5 GHz' -and $_.Channel -notmatch 'DFS' } | Sort-Object InterferenceScore | Select-Object -First 1
+        Write-Host ("  Least congested: 2.4 GHz channel {0}  |  5 GHz (non-DFS) block {1}" -f $best24.Channel, $best5.Channel) -ForegroundColor Cyan
+
+        # Own network checks
+        $mine = @($aps | Where-Object { $_.SSID -eq $ownSsid })
+        foreach ($m in ($mine | Where-Object Band -like '2.4*')) {
+            if ($m.Channel -notin 1, 6, 11) { $findings.Add("Your AP $($m.BSSID) uses 2.4 GHz channel $($m.Channel). Only 1, 6 and 11 don't overlap each other - an in-between channel gets interference from BOTH neighbours. Move it to channel $($best24.Channel).") }
+            $co = @($aps | Where-Object { $_.SSID -ne $ownSsid -and $_.Band -like '2.4*' -and [math]::Abs($_.Channel - $m.Channel) -lt 5 -and $_.SignalPct -ge 40 })
+            if ($co.Count -ge 3) { $findings.Add("$($co.Count) strong neighbouring networks overlap your 2.4 GHz channel $($m.Channel). Best 2.4 GHz channel here: $($best24.Channel). Better: get clients onto 5 GHz.") }
+        }
+        foreach ($m in ($mine | Where-Object Band -like '5*')) {
+            if ($m.Channel -ge 52 -and $m.Channel -le 144) { $findings.Add("Your AP $($m.BSSID) is on DFS channel $($m.Channel). If radar is detected the AP must leave the channel for a while - clients drop for 1+ minute. If drops happen at random, try a non-DFS channel (36-48 or 149-161).") }
+            $co = @($aps | Where-Object { $_.SSID -ne $ownSsid -and $_.Band -like '5*' -and $_.Channel -eq $m.Channel -and $_.SignalPct -ge 40 })
+            if ($co.Count -ge 2) { $findings.Add("$($co.Count) other strong networks share your 5 GHz channel $($m.Channel). Least congested non-DFS block here: $($best5.Channel).") }
+        }
+        foreach ($m in ($mine | Where-Object { $null -ne $_.UtilizationPct -and $_.UtilizationPct -ge 50 })) { $findings.Add("AP $($m.BSSID) (ch $($m.Channel)) reports $($m.UtilizationPct)% channel utilization - the airtime is congested. Above ~50% everyone on that AP slows down.") }
+        foreach ($m in ($mine | Where-Object { $null -ne $_.Stations -and $_.Stations -ge 30 })) { $findings.Add("AP $($m.BSSID) has $($m.Stations) clients connected - consider another AP / load balancing.") }
+        if ($conn) {
+            $better = $mine | Where-Object { $_.BSSID -ne $conn.ApBssid -and $_.SignalPct -ge ($conn.SignalPct + 20) } | Sort-Object SignalPct -Descending | Select-Object -First 1
+            if ($better) { $findings.Add("STICKY CLIENT: connected to $($conn.ApBssid) at $($conn.SignalPct)% while $($better.BSSID) (same network, $($better.Band) ch $($better.Channel)) is $($better.SignalPct)%. The PC isn't roaming - raise the adapter's 'Roaming Aggressiveness', or enable 802.11k/v/r on the APs.") }
+            if ($conn.BandName -like '2.4*') {
+                $five = $mine | Where-Object { $_.Band -notlike '2.4*' -and $_.SignalPct -ge 50 } | Sort-Object SignalPct -Descending | Select-Object -First 1
+                if ($five) { $findings.Add("Your network is also on $($five.Band) here at $($five.SignalPct)% but this PC chose 2.4 GHz. Set the adapter's 'Preferred Band' to 5 GHz or enable band steering on the AP.") }
+            }
+            $ssidCount = @($aps | Where-Object { $_.Band -eq $conn.BandName -and $_.SignalPct -ge 30 }).Count
+            if ($ssidCount -ge 20) { $findings.Add("Very crowded RF environment: $ssidCount networks audible on $($conn.BandName).") }
+        }
+        $hidden = @($aps | Where-Object SSID -eq '(hidden)').Count
+        if ($hidden) { Write-Host "  $hidden hidden network(s) nearby (normal for some mesh backhauls / IoT)." -ForegroundColor DarkGray }
+    }
+
+    # ---- 4. disconnect history --------------------------------------------------------
+    Write-Sub 'Disconnects and connection failures (WLAN-AutoConfig log, last 7 days)'
+    $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-WLAN-AutoConfig/Operational'; Id = 8001, 8002, 8003, 11004, 11005, 11006, 11010, 12011, 12012, 12013; StartTime = (Get-Date).AddDays(-7) } -ErrorAction SilentlyContinue)
+    if ($ev) {
+        $rows = $ev | ForEach-Object {
+            $reason = (($_.Message -split "`r?`n") | Where-Object { $_ -match '^\s*(Reason|Failure Reason|Reason Code)\s*:' } | Select-Object -First 1) -replace '^\s*[^:]+:\s*', ''
+            $reason = [string]($reason -join ' '); if (-not $reason.Trim()) { $reason = '-' }
+            $ssidLine = (($_.Message -split "`r?`n") | Where-Object { $_ -match '^\s*SSID\s*:' } | Select-Object -First 1) -replace '^\s*SSID\s*:\s*', ''
+            [pscustomobject]@{ Time = $_.TimeCreated; Id = $_.Id; Event = @{ 8001 = 'Connected'; 8002 = 'Connect FAILED'; 8003 = 'Disconnected'; 11004 = 'Security stopped'; 11005 = 'Security OK'; 11006 = 'Security FAILED'; 11010 = 'Security start'; 12011 = '802.1X start'; 12012 = '802.1X OK'; 12013 = '802.1X FAILED' }[$_.Id]; SSID = $ssidLine; Reason = $reason }
+        }
+        $rows | Export-Csv (Join-Path $dir 'WlanEvents.csv') -NoTypeInformation
+        $disc = @($rows | Where-Object Id -eq 8003); $fail = @($rows | Where-Object { $_.Id -in 8002, 11006, 12013 })
+        Write-Host ("  {0} disconnects, {1} failed connections in 7 days." -f $disc.Count, $fail.Count) -ForegroundColor $(if ($disc.Count -gt 10 -or $fail) { 'Yellow' } else { 'Green' })
+        if ($disc) { Write-Host '  Top disconnect reasons:'; $disc | Group-Object Reason | Sort-Object Count -Descending | Select-Object -First 6 Count, Name | Format-Table -AutoSize }
+        if ($fail) { Write-Host '  Failures:'; $fail | Select-Object -Last 8 Time, Event, SSID, Reason | Format-Table -AutoSize -Wrap }
+        $rows | Where-Object { $_.Id -in 8001, 8003 } | Select-Object -Last 12 Time, Event, SSID, Reason | Format-Table -AutoSize -Wrap
+        $perDay = $disc.Count / 7
+        if ($perDay -ge 3) { $findings.Add(("{0:N0} Wi-Fi disconnects per day on average. Top reason: {1}" -f $perDay, (($disc | Group-Object Reason | Sort-Object Count -Descending | Select-Object -First 1).Name))) }
+        if ($fail | Where-Object { $_.Reason -match 'key|password|4-way|handshake|authentication' }) { $findings.Add('Authentication/handshake failures logged - wrong saved password, WPA2/WPA3 mismatch, or a flaky AP. Forget and re-join the network.') }
+    } else { Write-Host '  No WLAN events (log disabled or nothing happened).' -ForegroundColor DarkGray }
+
+    # ---- 5. latency check (gateway, or internet host if the gateway ignores ping) ---------
+    if ($conn) {
+        $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+        $pingTarget = $null; $targetKind = $null
+        if ($gw -and (Test-PingResponds $gw)) { $pingTarget = $gw; $targetKind = 'gateway' }
+        else {
+            if ($gw) {
+                $arp = Get-NetNeighbor -IPAddress $gw -ErrorAction SilentlyContinue | Select-Object -First 1
+                $arpTxt = if ($arp -and $arp.LinkLayerAddress) { "MAC $($arp.LinkLayerAddress), state $($arp.State)" } else { 'no ARP entry' }
+                Write-Sub "Gateway $gw does not answer ping"
+                Write-Host "  Normal on guest / client-isolated networks - not counted as a fault. ($arpTxt)" -ForegroundColor DarkGray
+            }
+            if (Test-PingResponds '1.1.1.1') { $pingTarget = '1.1.1.1' } elseif (Test-PingResponds '8.8.8.8') { $pingTarget = '8.8.8.8' }
+            if ($pingTarget) { $targetKind = 'internet' } else { Write-Host '  Internet hosts 1.1.1.1 / 8.8.8.8 also do not answer ping (ICMP blocked or no internet) - latency test skipped. Try option 28 speed test.' -ForegroundColor Yellow }
+        }
+        if ($pingTarget) {
+            Write-Sub "Latency to the $targetKind $pingTarget (30 pings over Wi-Fi)"
+            $res = Invoke-LivePing -Target $pingTarget -Count 30 -WarnMs $(if ($targetKind -eq 'gateway') { 30 } else { 80 }) -BadMs $(if ($targetKind -eq 'gateway') { 100 } else { 200 })
+            if ($targetKind -eq 'gateway') {
+                if ($res.Loss -gt 2) { $findings.Add("$($res.Loss)% packet loss to the local gateway over Wi-Fi - the problem is the wireless link itself (signal/interference/driver), not the internet.") }
+                if ($res.Max -gt 150) { $findings.Add("Latency spikes up to $($res.Max) ms to the local gateway - classic sign of channel congestion, interference or Wi-Fi power saving.") }
+            } else {
+                if ($res.Loss -gt 2) { $findings.Add("$($res.Loss)% packet loss to $pingTarget (gateway ignores ping, so internet host used). Could be the Wi-Fi link OR the venue's internet/throttling - run option 32 to see whether it lines up with signal/roam events.") }
+                if ($res.Max -gt 300) { $findings.Add("Latency spikes up to $($res.Max) ms to $pingTarget - congested channel, or a busy/throttled internet connection behind the AP.") }
+            }
+        }
+    }
+
+    # ---- 6. Windows' own WLAN report --------------------------------------------------
+    netsh wlan show wlanreport 2>&1 | Out-Null
+    $rep = "$env:ProgramData\Microsoft\Windows\WlanReport\wlan-report-latest.html"
+    if (Test-Path $rep) { Copy-Item $rep (Join-Path $dir 'wlan-report.html') -Force }
+
+    # ---- findings -----------------------------------------------------------------------
+    Write-Sub 'FINDINGS'
+    if ($findings.Count) { $i = 0; foreach ($f in $findings) { $i++; Write-Host "  $i. $f" -ForegroundColor Yellow } }
+    else { Write-Host '  No Wi-Fi problems detected right now. For intermittent issues run the Wi-Fi live monitor while the problem happens.' -ForegroundColor Green }
+    $findings | Out-File (Join-Path $dir 'Findings.txt')
+    Write-Host "  Saved: $dir  (NearbyAPs.csv, ChannelAnalysis.csv, WlanEvents.csv, wlan-report.html, Findings.txt)" -ForegroundColor Green
+
+    # ---- fixes ---------------------------------------------------------------------------
+    if ($wa -and (Read-YesNo 'Apply the common Wi-Fi stability fixes (stop Windows powering off the adapter + turn Wi-Fi power saving off)?' $false)) {
+        if (Confirm-Change "On adapter '$($wa.Name)': stop Windows powering it off, set Wi-Fi power saving to Maximum Performance (AC and battery). Wi-Fi reconnects briefly.") {
+            try { Set-NetAdapterPowerManagement -Name $wa.Name -AllowComputerToTurnOffDevice Disabled -ErrorAction Stop; Write-Host '  Adapter power-off disabled.' -ForegroundColor Green } catch { Write-Host "  Power management: $($_.Exception.Message)" -ForegroundColor DarkYellow }
+            powercfg /setacvalueindex SCHEME_CURRENT 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 0
+            powercfg /setdcvalueindex SCHEME_CURRENT 19cbb8fa-5279-450e-9fac-8a3d5fedd0c1 12bbebe6-58d6-4636-95bb-3217ef867c1a 0
+            powercfg /setactive SCHEME_CURRENT
+            Write-Host '  Wi-Fi power saving set to Maximum Performance.' -ForegroundColor Green
+        }
+    }
+}
+
+function Invoke-WifiMonitor {
+    Write-Title 'Wi-Fi live monitor (catch intermittent drops, roams and lag)'
+    if (-not (Get-WifiInterfaces | Where-Object State -match '^connected')) { Write-Host '  Not connected to Wi-Fi.' -ForegroundColor Yellow; return }
+    $mins = Read-Int 'How many minutes to monitor' 15
+    $int  = Read-Int 'Seconds between samples' 5
+    $target = Read-Default 'Also ping an internet host (blank = gateway only)' '1.1.1.1'
+    $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+    if ($gw -and -not (Test-PingResponds $gw)) {
+        Write-Host "  Gateway $gw does not answer ping (normal on guest / client-isolated networks) - gateway column disabled." -ForegroundColor DarkGray
+        $gw = $null
+        if (-not $target) { $target = '1.1.1.1'; Write-Host '  Using 1.1.1.1 as the latency target instead.' -ForegroundColor DarkGray }
+    }
+    $csv = Join-Path (Get-OutDir 'Network') "WiFiMonitor_${env:COMPUTERNAME}_$(Get-Stamp).csv"
+    Write-Host "  Sampling every $int s for $mins min - press Q to stop early. Log: $csv" -ForegroundColor Cyan
+    Write-Host ('  {0,-8} {1,-18} {2,4} {3,7} {4,6} {5,6} {6,7} {7,8}  {8}' -f 'Time', 'AP BSSID', 'Ch', 'Signal', 'Rx', 'Tx', 'GW ms', 'Inet ms', 'Event') -ForegroundColor DarkGray
+    $end = (Get-Date).AddMinutes($mins); $last = $null; $samples = New-Object System.Collections.Generic.List[object]
+    $ping = New-Object System.Net.NetworkInformation.Ping
+    while ((Get-Date) -lt $end) {
+        $i = Get-WifiInterfaces | Select-Object -First 1
+        $up = $i.State -match '^connected'
+        $g = $null; $n = $null
+        if ($gw) { try { $r = $ping.Send($gw, 1000); if ($r.Status -eq 'Success') { $g = $r.RoundtripTime } } catch { } }
+        if ($target) { try { $r = $ping.Send($target, 1500); if ($r.Status -eq 'Success') { $n = $r.RoundtripTime } } catch { } }
+        $evt = @()
+        if (-not $up) { $evt += 'DISCONNECTED' }
+        if ($last -and $up -and $last.ApBssid -and $i.ApBssid -ne $last.ApBssid) { $evt += "ROAM from $($last.ApBssid)" }
+        if ($last -and $up -and $i.ChannelNum -ne $last.ChannelNum -and $i.ApBssid -eq $last.ApBssid) { $evt += "CHANNEL CHANGE $($last.ChannelNum)->$($i.ChannelNum)" }
+        if ($up -and $i.dBm -le -75) { $evt += 'weak' }
+        if ($gw -and $null -eq $g) { $evt += 'GW LOSS' } elseif ($g -gt 100) { $evt += 'GW LAG' }
+        if (-not $gw -and $target) { if ($null -eq $n) { $evt += 'INET LOSS' } elseif ($n -gt 250) { $evt += 'INET LAG' } }
+        $row = [pscustomobject]@{ Time = (Get-Date); State = $i.State; SSID = $i.SSID; ApBssid = $i.ApBssid; Band = $i.BandName; Channel = $i.ChannelNum; SignalPct = $i.SignalPct; dBm = $i.dBm
+            RxMbps = $i.'Receive rate (Mbps)'; TxMbps = $i.'Transmit rate (Mbps)'; GatewayMs = $g; InternetMs = $n; Events = ($evt -join '; ') }
+        $samples.Add($row); $row | Export-Csv $csv -NoTypeInformation -Append
+        $color = if ($evt -match 'DISCONNECTED|LOSS|ROAM|CHANNEL') { 'Red' } elseif ($evt) { 'Yellow' } else { 'Gray' }
+        Write-Host ('  {0,-8} {1,-18} {2,4} {3,7} {4,6} {5,6} {6,7} {7,8}  {8}' -f $row.Time.ToString('HH:mm:ss'), $row.ApBssid, $row.Channel, "$($row.dBm)dBm", $row.RxMbps, $row.TxMbps, $(if ($null -ne $g) { $g } else { '--' }), $(if ($null -ne $n) { $n } else { '--' }), $row.Events) -ForegroundColor $color
+        $last = $i
+        $until = (Get-Date).AddSeconds($int)
+        while ((Get-Date) -lt $until) { $q = $false; try { $q = [Console]::KeyAvailable -and [Console]::ReadKey($true).Key -eq 'Q' } catch { }; if ($q) { $end = Get-Date; break }; Start-Sleep -Milliseconds 200 }
+    }
+    Write-Sub 'Summary'
+    $s = $samples
+    $sig = $s | Where-Object { $_.State -match '^connected' }
+    [pscustomobject]@{
+        Samples = $s.Count
+        Disconnected = @($s | Where-Object { $_.State -notmatch '^connected' }).Count
+        Roams = @($s | Where-Object Events -match 'ROAM').Count
+        ChannelChanges = @($s | Where-Object Events -match 'CHANNEL').Count
+        'Signal dBm min/avg/max' = "{0} / {1} / {2}" -f ($sig | Measure-Object dBm -Minimum).Minimum, [math]::Round(($sig | Measure-Object dBm -Average).Average), ($sig | Measure-Object dBm -Maximum).Maximum
+        'Gateway loss %' = if ($gw) { [math]::Round(@($s | Where-Object { $null -eq $_.GatewayMs }).Count / [math]::Max(1, $s.Count) * 100, 1) } else { 'n/a' }
+        'Gateway ms avg/max' = if (-not $gw) { 'n/a (gateway ignores ping)' } else { "{0} / {1}" -f [math]::Round((($s | Where-Object { $null -ne $_.GatewayMs }) | Measure-Object GatewayMs -Average).Average), (($s | Where-Object { $null -ne $_.GatewayMs }) | Measure-Object GatewayMs -Maximum).Maximum }
+        'Internet ms avg/max' = if ($target) { "{0} / {1}" -f [math]::Round((($s | Where-Object { $null -ne $_.InternetMs }) | Measure-Object InternetMs -Average).Average), (($s | Where-Object { $null -ne $_.InternetMs }) | Measure-Object InternetMs -Maximum).Maximum } else { 'n/a' }
+        'Internet loss %' = if ($target) { [math]::Round(@($s | Where-Object { $null -eq $_.InternetMs }).Count / [math]::Max(1, $s.Count) * 100, 1) } else { 'n/a' }
+    } | Format-List
+    if ($gw) { Write-Host '  Gateway loss/lag = Wi-Fi link problem.  Gateway fine but internet loss = ISP / firewall problem.' -ForegroundColor DarkGray }
+    else { Write-Host '  Gateway ignores ping, so only internet latency is measured: loss/lag that lines up with weak signal, roams or channel changes = Wi-Fi; loss with a steady signal = venue internet / throttling.' -ForegroundColor DarkGray }
+    Write-Host '  Channel changes on the same AP = AP auto-channel or DFS radar.  Many roams = AP placement / roaming thresholds.' -ForegroundColor DarkGray
+    Write-Host "  Log: $csv" -ForegroundColor Green
+}
+
 # ---------- TOOLKIT ------------------------------------------------------------------
 
 function Set-OutputRoot {
@@ -3596,7 +3239,6 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Reliability history (Reliability Monitor data, stability index)';               Action = { Invoke-ReliabilityHistory } }
     @{ Test='safe'; Text = 'Performance snapshot (CPU / RAM / disk latency / network, 30 sec)';             Action = { Invoke-PerfSnapshot } }
     @{ Test='safe'; Text = 'Boot / logon performance (what slows startup)';                                 Action = { Invoke-BootPerformance } }
-    @{ Test='safe'; Text = 'Slow sign-out / logoff / shutdown / black screen / lag diagnostics';           Action = { Invoke-SlowLogoffDiag } }
     @{ Test='safe'; Text = 'Hardware health (SMART, disk errors, driver problems, battery, temps)';         Action = { Invoke-HardwareHealth } }
     @{ Test='safe'; Text = 'Pending reboot - detailed (CBS, WU, file renames, rename/join, ConfigMgr)';     Action = { Invoke-PendingReboot } }
     @{ Test='safe'; Text = 'Device join / Entra ID / Workplace join / PIN status (dsregcmd)';               Action = { Invoke-DeviceJoinStatus } }
@@ -3622,6 +3264,8 @@ $Script:Menu = @(
     @{ Test='net';  Text = 'Internet speed test (built-in Cloudflare test or Ookla Speedtest CLI)';       Action = { Invoke-SpeedTest } }
     @{ Test='safe'; Text = 'Ping / port reachability test (optional live monitor)';                         Action = { Invoke-ReachabilityTest } }
     @{ Test='slow'; Text = 'Advanced network diagnostics (DNS per server, loss, MTU, tracert, proxy, Wi-Fi)'; Action = { Invoke-NetworkDeepDive } }
+    @{ Test='safe'; Text = 'Wi-Fi deep diagnostics (signal, channels & congestion, neighbors, roaming, driver, drops)'; Action = { Invoke-WifiDiagnostics } }
+    @{               Text = 'Wi-Fi live monitor (signal / roams / channel changes / drops / lag over time)';    Action = { Invoke-WifiMonitor } }
     @{ Test='safe'; Text = 'Network connections & listening ports by process';                              Action = { Invoke-TcpConnections } }
     @{ Test='safe'; Text = 'SMTP / scan-to-email relay test + SPF/DMARC/MX lookup';                         Action = { Invoke-SmtpTest } }
     @{               Text = '[!] Network quick fixes (flush DNS / renew / Winsock + TCP/IP reset)';          Action = { Invoke-NetworkReset } }
@@ -3664,8 +3308,6 @@ $Script:Menu = @(
     @{ Section = 'SOFTWARE / INVENTORY / USERS' }
     @{ Test='safe'; Text = 'Installed software inventory (CSV)';                                            Action = { Invoke-SoftwareInventory } }
     @{ Test='slow'; Text = 'User profiles - size, last use (stale / temp profiles)';                        Action = { Invoke-UserProfiles } }
-    @{               Text = '[!] Rebuild a corrupted user profile (back up, reset, restore data)';            Action = { Invoke-ProfileRebuild } }
-    @{               Text = '[!] Folder redirection - which GPO/group applies it, point folders back to local (copy data)'; Action = { Invoke-FolderRedirectionReset } }
     @{ Test='slow'; Text = 'Migration inventory (full machine discovery)';                                  Action = { Invoke-MigrationInventory } }
     @{ Test='safe'; Text = 'Install provenance for a program (when/how/by whom)';                           Action = { Invoke-InstallProvenance } }
     @{ Test='safe'; Text = '.NET / Node.js / Java / Python / VC++ runtime versions';                         Action = { Invoke-DotNetVersion } }
@@ -3673,16 +3315,12 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Time sync (w32time) check / resync';                                            Action = { Invoke-TimeSync } }
     @{ Section = 'QUICK FIXES' }
     @{               Text = '[!] Print spooler reset (clear stuck jobs)';                                    Action = { Invoke-SpoolerReset } }
-    @{ Test='safe'; Text = 'Black screen / stuck sign-in after Windows Update (AppReadiness, Explorer) - diagnose + fix'; Action = { Invoke-PostUpdateBlackScreen } }
     @{               Text = '[!] Microsoft Teams cache clear (classic + new)';                               Action = { Invoke-TeamsCacheClear } }
     @{               Text = '[!] Office quick / online repair';                                              Action = { Invoke-OfficeRepair } }
-    @{ Test='safe'; Text = 'Outlook stuck on "Loading Profile" - diagnose + fix';                          Action = { Invoke-OutlookLoadingProfile } }
     @{               Text = '[!] OneDrive reset';                                                            Action = { Invoke-OneDriveReset } }
-    @{ Test='safe'; Text = 'OneDrive "can''t open file" errors (0x8007007A / cloud provider) - diagnose + repair'; Action = { Invoke-OneDriveFileAccess } }
     @{               Text = '[!] Repair .zip association / reset default browser (per user)';               Action = { Invoke-ZipBrowserRepair } }
     @{               Text = '[!] Remove bloatware (OEM + consumer Store apps)';                              Action = { Invoke-RemoveBloatware } }
     @{               Text = '[!] Power settings - never sleep / hibernate';                                  Action = { Invoke-PowerSettings } }
-    @{               Text = '[!] Windows Update driver updates - block / allow (use OEM driver tool instead)'; Action = { Invoke-WUDriverBlock } }
     @{ Section = 'SOFTWARE DEPLOYMENT (downloads to C:\temp\Tools)' }
     @{               Text = '[!] Install common apps with Ninite (Chrome, Firefox, 7-Zip, Zoom...)';         Action = { Invoke-NiniteInstall } }
     @{               Text = '[!] Install apps silently from the vendor (Chrome/Firefox/Edge MSI, Zoom, Teams, OneDrive)'; Action = { Invoke-DirectInstall } }
@@ -3708,7 +3346,6 @@ $Script:Menu = @(
     @{               Text = 'M365: Direct Send / connectors (scanner connector, RejectDirectSend)';            Action = { Invoke-M365 'DirectSend' } }
     @{               Text = 'M365: top inbound sender / outbound recipient domains (90 days)';                Action = { Invoke-M365TopDomains } }
     @{               Text = 'M365: mailbox permissions (Full Access / Send As / Send on Behalf)';             Action = { Invoke-M365Simple 'Mailbox permissions' 'MailboxPermissions' -OfferAll } }
-    @{               Text = '[!] M365: calendar permissions - grant / view / remove (bulk, adds to their Outlook)'; Action = { Invoke-M365 'CalendarPermissions' } }
     @{               Text = 'M365: mailbox sizes, quotas, archive status';                                   Action = { Invoke-M365 'MailboxSizes' } }
     @{               Text = 'M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe';    Action = { Invoke-M365Simple 'Mobile devices' 'MobileDevices' -AskUser } }
     @{               Text = 'M365: unified audit log search (user / operation / IP, up to 180 days)';          Action = { Invoke-M365 'AuditSearch' } }
@@ -3811,844 +3448,6 @@ function Show-Menu {
 # Stored as readable text - no encoding or compression. Lines that begin with the
 # here-string terminator are prefixed with #SDSI-ESC# and restored when extracted.
 $Script:Payloads = @{}
-
-# ======================= Repair-OneDriveFileAccess.ps1 =======================
-$Script:Payloads['Repair-OneDriveFileAccess'] = @'
-#Requires -Version 5.1
-<#
-.SYNOPSIS
-    Diagnoses and repairs OneDrive "can't open this file" errors on Windows 10/11 and RDS hosts.
-
-.DESCRIPTION
-    Prepared by Sigma Data Systems Inc. - https://sigmadatainc.com/
-
-    Targets the errors Explorer shows when an online-only OneDrive / SharePoint file will not open:
-      "The data area passed to a system call is too small."   (0x8007007A, error 122)
-      "The cloud file provider is not running."               (0x8007016A, error 362)
-      "The cloud operation was unsuccessful."                 (0x80070185, error 389)
-      "The cloud file provider exited unexpectedly."          (0x80070194, error 404)
-    They almost always mean a Files On-Demand placeholder could not be downloaded because the
-    OneDrive client (or the Windows Cloud Files filter driver, CldFlt) was not working at that moment.
-
-    CHECKS (read-only):
-      - Who is signed in (works when run as the user, elevated, or as SYSTEM from an RMM)
-      - OneDrive install type, version, age, standalone updater + its scheduled task
-      - OneDrive processes for that user (not running / several copies / not responding)
-      - Signed-in accounts, sync folders, SharePoint libraries, OneDrive policies
-      - Cloud Files filter driver (CldFlt): start type, running, attached (fltmc)
-      - Windows sync-root registration for each sync folder
-      - Sync folder scan: online-only / local / pinned counts, pinned-but-not-downloaded,
-        paths over 400 chars (OneDrive limit) or 218 chars (Excel/Office limit), blocked names
-      - Recent OneDrive / Explorer crashes and hangs, Cloud Files and Filter Manager events
-      - Optional test open of the file that failed (shows the real Windows error code)
-
-    FIXES (each asks first - type YES):
-      1. Restart OneDrive as the signed-in user (never elevated - an elevated OneDrive breaks Explorer)
-      2. Re-enable / start the Cloud Files driver (CldFlt)
-      3. Update OneDrive now (OneDriveStandaloneUpdater)
-      4. Pin a folder "Always keep on this device"
-      5. Reset OneDrive (re-sync; files are kept)
-      6. Collect OneDrive logs (zip) for escalation to Microsoft
-
-    LOGGING: the diagnosis is saved to a report + findings CSV. Every fix you choose (or decline)
-    is written, timestamped with before/after state, to an _Actions.log file, appended to the
-    report under "ACTIONS TAKEN", and written to the Windows Application event log
-    (source SDSI-ToolKit: 4100 diagnosis, 4101 fix OK, 4102 fix failed/partial,
-    4103 fix cancelled, 4104 session summary) so N-central can alert on it.
-
-    Nothing here is client- or machine-specific. Output goes to C:\temp\OneDrive by default.
-
-.PARAMETER OutputPath
-    Folder for the report, CSV files and log zip. Default C:\temp\OneDrive.
-.PARAMETER TestPath
-    Optional full path of a file that gave the error. It is test-opened (when running as that user).
-.PARAMETER UserName
-    Optional DOMAIN\user or user to check. Default = the signed-in user (owner of explorer.exe).
-.PARAMETER ScanFiles
-    Scan the sync folders for placeholder states, long paths and blocked names. Default $true.
-.PARAMETER MaxScanFiles
-    Stop scanning a sync folder after this many items. Default 200000.
-.PARAMETER ReportOnly
-    Diagnose only - no fixes are offered (RMM / unattended use).
-
-.EXAMPLE
-    powershell -ExecutionPolicy Bypass -File .\Repair-OneDriveFileAccess.ps1
-.EXAMPLE
-    .\Repair-OneDriveFileAccess.ps1 -TestPath "C:\Users\jdoe\OneDrive - Contoso\Budget.xlsx"
-.EXAMPLE
-    .\Repair-OneDriveFileAccess.ps1 -ReportOnly -ScanFiles:$false
-#>
-[CmdletBinding()]
-param(
-    [string]$OutputPath = 'C:\temp\OneDrive',
-    [string]$TestPath,
-    [string]$UserName,
-    [bool]$ScanFiles = $true,
-    [int]$MaxScanFiles = 200000,
-    [switch]$ReportOnly
-)
-
-$ErrorActionPreference = 'Continue'
-$stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-if (-not (Test-Path -LiteralPath $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
-$ReportFile   = Join-Path $OutputPath "OneDriveFileAccess_${env:COMPUTERNAME}_$stamp.txt"
-$FindingsCsv  = Join-Path $OutputPath "OneDriveFileAccess_${env:COMPUTERNAME}_${stamp}_Findings.csv"
-$ProblemCsv   = Join-Path $OutputPath "OneDriveFileAccess_${env:COMPUTERNAME}_${stamp}_ProblemPaths.csv"
-
-$Script:Findings  = New-Object System.Collections.Generic.List[object]
-$Script:Report    = New-Object System.Collections.Generic.List[string]
-$Script:Recommend = New-Object System.Collections.Generic.List[string]
-
-#region ------------------------------------------------------------ Helpers
-
-function Out-Line([string]$Text = '', [string]$Color = 'Gray') {
-    Write-Host $Text -ForegroundColor $Color
-    $Script:Report.Add($Text)
-}
-function Out-Head([string]$Text) { Out-Line ''; Out-Line "--- $Text ---" 'Yellow' }
-
-function Add-Finding {
-    param([ValidateSet('OK','INFO','WARN','FAIL')][string]$Level, [string]$Area, [string]$Text, [string]$FixId = '')
-    $Script:Findings.Add([pscustomobject]@{ Level = $Level; Area = $Area; Finding = $Text; SuggestedFix = $FixId })
-    $color = @{ OK = 'Green'; INFO = 'Gray'; WARN = 'Yellow'; FAIL = 'Red' }[$Level]
-    Out-Line ("  [{0,-4}] {1}" -f $Level, $Text) $color
-    if ($FixId -and -not $Script:Recommend.Contains($FixId)) { $Script:Recommend.Add($FixId) }
-}
-
-function Test-IsAdmin {
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Get-RegValue([string]$Path, [string]$Name) {
-    try { (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name } catch { $null }
-}
-
-function Get-Win32Text([int]$Code) {
-    try { (New-Object System.ComponentModel.Win32Exception($Code)).Message } catch { "Win32 error $Code" }
-}
-
-# Hints for the Win32 codes these "can't open" errors map to
-$Script:CodeHints = @{
-    122 = 'ERROR_INSUFFICIENT_BUFFER - the sync provider returned no/bad data. OneDrive not running, hung, elevated, or CldFlt problem. Restart OneDrive.'
-    362 = 'Cloud file provider not running - OneDrive is not running for this user. Start OneDrive.'
-    363 = 'Cloud file metadata is corrupt - reset OneDrive.'
-    377 = 'Cloud file not in sync - wait for sync, or restart OneDrive.'
-    386 = 'Cloud file authentication failed - OneDrive needs the user to sign in again.'
-    388 = 'Cloud file network unavailable - check internet / proxy / firewall.'
-    389 = 'Cloud operation was unsuccessful - restart OneDrive; reset if it repeats.'
-    395 = 'Cloud file access denied - permissions changed in SharePoint/OneDrive or file is blocked.'
-    404 = 'Cloud file provider exited unexpectedly - OneDrive crashed. Update / restart OneDrive.'
-}
-
-#endregion
-
-#region ----------------------------------------------- Who are we checking?
-
-$Script:IsAdmin   = Test-IsAdmin
-$me               = [Security.Principal.WindowsIdentity]::GetCurrent()
-$Script:MySid     = $me.User.Value
-$Script:IsSystem  = ($Script:MySid -eq 'S-1-5-18')
-
-Out-Line ('=' * 78) 'Cyan'
-Out-Line ' OneDrive file-open diagnostics & repair  -  Sigma Data Systems Inc.' 'Cyan'
-Out-Line ('=' * 78) 'Cyan'
-Out-Line ("  Computer: {0}   Run as: {1}   Admin: {2}   {3}" -f $env:COMPUTERNAME, $me.Name, $Script:IsAdmin, (Get-Date))
-$os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-if ($os) { Out-Line ("  OS: {0}  build {1}" -f $os.Caption, $os.BuildNumber) }
-
-# Interactive users = owners of explorer.exe
-$sessions = @()
-foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue)) {
-    $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
-    if ($o -and $o.User) { $sessions += [pscustomobject]@{ Account = "$($o.Domain)\$($o.User)"; SessionId = $p.SessionId } }
-}
-$sessions = @($sessions | Sort-Object Account -Unique)
-
-$Script:TargetAccount = $null
-if ($UserName) {
-    $Script:TargetAccount = if ($UserName -match '\\') { $UserName } else {
-        $hit = $sessions | Where-Object { $_.Account -like "*\$UserName" } | Select-Object -First 1
-        if ($hit) { $hit.Account } else { "$env:USERDOMAIN\$UserName" }
-    }
-} elseif ($sessions | Where-Object { $_.Account -eq $me.Name }) {
-    $Script:TargetAccount = $me.Name
-} elseif ($sessions.Count -eq 1) {
-    $Script:TargetAccount = $sessions[0].Account
-} elseif ($sessions.Count -gt 1) {
-    Out-Line "  Several users are signed in:"
-    for ($i = 0; $i -lt $sessions.Count; $i++) { Out-Line ("   {0,2}. {1}  (session {2})" -f ($i + 1), $sessions[$i].Account, $sessions[$i].SessionId) }
-    $pick = 1
-    if (-not $ReportOnly) {
-        $ans = Read-Host '  Which user saw the error? (number) [1]'
-        $n = 0; if ([int]::TryParse("$ans", [ref]$n) -and $n -ge 1 -and $n -le $sessions.Count) { $pick = $n }
-    }
-    $Script:TargetAccount = $sessions[$pick - 1].Account
-} elseif (-not $Script:IsSystem) {
-    $Script:TargetAccount = $me.Name
-}
-
-if (-not $Script:TargetAccount) {
-    Add-Finding FAIL 'User' 'Nobody is signed in to this computer (no explorer.exe). OneDrive runs per user - have the user log on and run this again.'
-    $Script:Report | Set-Content -Path $ReportFile -Encoding UTF8
-    exit 0
-}
-
-try {
-    $Script:TargetSid = (New-Object System.Security.Principal.NTAccount($Script:TargetAccount)).Translate([System.Security.Principal.SecurityIdentifier]).Value
-} catch { $Script:TargetSid = $null }
-$Script:IsTargetUser = ($Script:TargetSid -and $Script:TargetSid -eq $Script:MySid)
-$profilePath = if ($Script:TargetSid) { Get-RegValue "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($Script:TargetSid)" 'ProfileImagePath' } else { $null }
-if (-not $profilePath -and $Script:IsTargetUser) { $profilePath = $env:USERPROFILE }
-$localApp = if ($profilePath) { Join-Path $profilePath 'AppData\Local' } else { $env:LOCALAPPDATA }
-$Script:Hku = if ($Script:TargetSid -and (Test-Path "Registry::HKEY_USERS\$($Script:TargetSid)")) { "Registry::HKEY_USERS\$($Script:TargetSid)" } else { $null }
-
-Out-Line ("  Checking user: {0}   SID: {1}" -f $Script:TargetAccount, $Script:TargetSid)
-Out-Line ("  Profile: {0}" -f $profilePath)
-if (-not $Script:Hku) { Add-Finding WARN 'User' "The user's registry hive is not loaded - account/policy checks are limited (is the user logged on?)." }
-if (-not $Script:IsTargetUser -and -not $Script:IsAdmin) {
-    Add-Finding WARN 'User' "Not running as $($Script:TargetAccount) and not elevated - run elevated (or as the user) for full results."
-}
-
-#endregion
-
-#region -------------------------------------------------- OneDrive install
-
-Out-Head 'OneDrive client'
-$odExe = $null
-if ($Script:Hku) {
-    $trigger = Get-RegValue "$($Script:Hku)\Software\Microsoft\OneDrive" 'OneDriveTrigger'
-    if ($trigger -and (Test-Path -LiteralPath $trigger)) { $odExe = $trigger }
-}
-if (-not $odExe) {
-    $odExe = @(
-        (Join-Path $localApp 'Microsoft\OneDrive\OneDrive.exe'),
-        "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe",
-        "${env:ProgramFiles(x86)}\Microsoft OneDrive\OneDrive.exe"
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
-}
-$Script:OdExe = $odExe
-
-if (-not $odExe) {
-    Add-Finding FAIL 'Client' 'OneDrive.exe was not found for this user (not installed). Install OneDrive, then sign in.'
-} else {
-    $fi = Get-Item -LiteralPath $odExe
-    $perMachine = ($odExe -like "$env:ProgramFiles\*") -or (${env:ProgramFiles(x86)} -and $odExe -like "${env:ProgramFiles(x86)}\*")
-    $Script:PerMachine = $perMachine
-    $ageDays = [int]((Get-Date) - $fi.LastWriteTime).TotalDays
-    Out-Line ("  Path:     {0}  ({1})" -f $odExe, $(if ($perMachine) { 'per-machine install' } else { 'per-user install' }))
-    Out-Line ("  Version:  {0}   file date {1:yyyy-MM-dd} ({2} days old)" -f $fi.VersionInfo.ProductVersion, $fi.LastWriteTime, $ageDays)
-    if ($ageDays -gt 120) { Add-Finding WARN 'Client' "OneDrive build is $ageDays days old - it is probably not updating. Old clients are a common cause after Windows updates." 'Update' }
-    else { Add-Finding OK 'Client' 'OneDrive build is recent.' }
-
-    $Script:Updater = Join-Path (Split-Path $odExe -Parent) 'OneDriveStandaloneUpdater.exe'
-    if (-not (Test-Path -LiteralPath $Script:Updater)) {
-        $Script:Updater = Get-ChildItem -LiteralPath (Split-Path $odExe -Parent) -Filter 'OneDriveStandaloneUpdater.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-    }
-    if (-not $Script:Updater) { Add-Finding WARN 'Client' 'OneDriveStandaloneUpdater.exe not found - OneDrive cannot update itself.' }
-
-    $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'OneDrive*Update*' })
-    $mine  = @($tasks | Where-Object { -not $Script:TargetSid -or $_.TaskName -like "*$($Script:TargetSid)*" -or $_.TaskName -like '*Per-Machine*' })
-    if ($tasks.Count -eq 0) {
-        Add-Finding WARN 'Client' 'No "OneDrive Standalone Update Task" found - OneDrive will not auto-update.' 'Update'
-    } else {
-        foreach ($t in $(if ($mine) { $mine } else { $tasks })) {
-            Out-Line ("  Update task: {0}  State: {1}" -f $t.TaskName, $t.State)
-            if ($t.State -eq 'Disabled') { Add-Finding WARN 'Client' "Update task '$($t.TaskName)' is DISABLED." 'Update' }
-        }
-    }
-}
-
-# Policies that block or change OneDrive
-$polMachine = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
-$polBlock   = Get-RegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSyncNGSC'
-if ($polBlock -eq 1) { Add-Finding FAIL 'Policy' 'Group Policy "Prevent the usage of OneDrive for file storage" (DisableFileSyncNGSC=1) is ON - OneDrive is blocked.' }
-$pols = @()
-foreach ($pp in @($polMachine, $(if ($Script:Hku) { "$($Script:Hku)\Software\Policies\Microsoft\OneDrive" }))) {
-    if ($pp -and (Test-Path $pp)) {
-        $item = Get-ItemProperty -LiteralPath $pp
-        foreach ($prop in $item.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' }) { $pols += ("{0} = {1}" -f $prop.Name, $prop.Value) }
-    }
-}
-if ($pols) { Out-Line '  OneDrive policies:'; $pols | ForEach-Object { Out-Line "    $_" } }
-if ((Get-RegValue $polMachine 'FilesOnDemandEnabled') -eq 0) { Add-Finding INFO 'Policy' 'Files On-Demand is turned OFF by policy (all files should be local).' }
-
-#endregion
-
-#region ----------------------------------------------------- Processes
-
-Out-Head 'OneDrive process'
-$Script:OdProcs = @()
-foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='OneDrive.exe'" -ErrorAction SilentlyContinue)) {
-    $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
-    $acct = if ($o -and $o.User) { "$($o.Domain)\$($o.User)" } else { '?' }
-    $resp = $null; try { $resp = (Get-Process -Id $p.ProcessId -ErrorAction Stop).Responding } catch { }
-    $Script:OdProcs += [pscustomobject]@{ PID = $p.ProcessId; Account = $acct; Session = $p.SessionId; Started = $p.CreationDate; Responding = $resp; Path = $p.ExecutablePath }
-}
-$userProcs = @($Script:OdProcs | Where-Object { $_.Account -eq $Script:TargetAccount -or ($_.Account -eq '?' -and $Script:IsTargetUser) })
-if ($Script:OdProcs) { $Script:OdProcs | Format-Table PID, Account, Session, Started, Responding -AutoSize | Out-String -Width 200 | ForEach-Object { Out-Line $_.TrimEnd() } }
-if ($odExe) {
-    if ($userProcs.Count -eq 0) {
-        Add-Finding FAIL 'Process' "OneDrive is NOT running for $($Script:TargetAccount). Online-only files cannot open (error 122 / 0x8007016A). This is the #1 cause." 'Restart'
-    } elseif ($userProcs.Count -gt 1) {
-        Add-Finding WARN 'Process' "$($userProcs.Count) OneDrive processes are running for this user - a stuck/elevated copy can break file opens." 'Restart'
-    } else {
-        Add-Finding OK 'Process' "OneDrive is running for this user (PID $($userProcs[0].PID), started $($userProcs[0].Started))."
-    }
-    if ($userProcs | Where-Object { $_.Responding -eq $false }) { Add-Finding FAIL 'Process' 'OneDrive is NOT RESPONDING (hung).' 'Restart' }
-    if ($userProcs | Where-Object { $_.Path -and $_.Path -ne $odExe }) { Add-Finding WARN 'Process' 'A running OneDrive is from a different folder than the registered client (old install still running).' 'Restart' }
-}
-
-#endregion
-
-#region ------------------------------------------------ Accounts & folders
-
-Out-Head 'Accounts and sync folders'
-$Script:SyncRoots = New-Object System.Collections.Generic.List[string]
-if ($Script:Hku -and (Test-Path "$($Script:Hku)\Software\Microsoft\OneDrive\Accounts")) {
-    foreach ($a in Get-ChildItem "$($Script:Hku)\Software\Microsoft\OneDrive\Accounts" -ErrorAction SilentlyContinue) {
-        $ap = Get-ItemProperty -LiteralPath $a.PSPath
-        if (-not $ap.UserFolder -and -not $ap.UserEmail) { continue }
-        Out-Line ("  {0,-10} {1,-40} {2}" -f $a.PSChildName, $ap.UserEmail, $ap.UserFolder)
-        if ($ap.UserFolder) {
-            if (Test-Path -LiteralPath $ap.UserFolder) { $Script:SyncRoots.Add($ap.UserFolder) }
-            else { Add-Finding FAIL 'Account' "Sync folder '$($ap.UserFolder)' for $($ap.UserEmail) does not exist." 'Reset' }
-        }
-        # SharePoint libraries synced outside the main folder
-        $tp = Join-Path $a.PSPath 'Tenants'
-        if (Test-Path $tp) {
-            foreach ($t in Get-ChildItem $tp -ErrorAction SilentlyContinue) {
-                foreach ($prop in (Get-ItemProperty -LiteralPath $t.PSPath).PSObject.Properties | Where-Object { $_.Name -match '^[A-Za-z]:\\' }) {
-                    if ((Test-Path -LiteralPath $prop.Name) -and -not ($Script:SyncRoots | Where-Object { $prop.Name.StartsWith($_ + '\', 'OrdinalIgnoreCase') -or $prop.Name -eq $_ })) {
-                        Out-Line ("  {0,-10} {1,-40} {2}" -f '  library', $t.PSChildName, $prop.Name)
-                        $Script:SyncRoots.Add($prop.Name)
-                    }
-                }
-            }
-        }
-    }
-}
-if ($odExe -and $Script:Hku -and $Script:SyncRoots.Count -eq 0) {
-    Add-Finding FAIL 'Account' 'No signed-in OneDrive account / sync folder for this user. Sign in to OneDrive.' 'Restart'
-} elseif ($Script:SyncRoots.Count) {
-    Add-Finding OK 'Account' "$($Script:SyncRoots.Count) sync folder(s) found."
-}
-
-#endregion
-
-#region --------------------------------------------- Cloud Files driver
-
-Out-Head 'Windows Cloud Files filter driver (CldFlt)'
-$Script:CldBad = $false
-$cldStart = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\CldFlt' 'Start'
-$startText = @{ 0 = 'Boot'; 1 = 'System'; 2 = 'Automatic'; 3 = 'Manual'; 4 = 'DISABLED' }
-if ($null -eq $cldStart) {
-    Add-Finding FAIL 'CldFlt' 'CldFlt service key is missing - Files On-Demand cannot work. Run SFC/DISM.'
-    $Script:CldBad = $true
-} else {
-    Out-Line ("  Start type: {0} ({1})" -f $cldStart, $startText[[int]$cldStart])
-    if ($cldStart -eq 4) { Add-Finding FAIL 'CldFlt' 'CldFlt is DISABLED - online-only files can never open.' 'Driver'; $Script:CldBad = $true }
-}
-$scOut = (& sc.exe query cldflt 2>&1) -join ' '
-$running = $scOut -match 'STATE\s*:\s*\d+\s+RUNNING'
-Out-Line ("  Service state: {0}" -f $(if ($running) { 'RUNNING' } elseif ($scOut -match 'STATE\s*:\s*\d+\s+(\w+)') { $Matches[1] } else { 'unknown' }))
-if (-not $running) { Add-Finding FAIL 'CldFlt' 'CldFlt is not running.' 'Driver'; $Script:CldBad = $true }
-if ($Script:IsAdmin) {
-    $flt = (& fltmc.exe filters 2>&1) | Where-Object { $_ -match '^\s*CldFlt\s' }
-    if ($flt) { Out-Line ("  fltmc: {0}" -f ($flt -replace '\s+', ' ').Trim()) ; if (-not $Script:CldBad) { Add-Finding OK 'CldFlt' 'CldFlt is loaded and attached.' } }
-    else { Add-Finding FAIL 'CldFlt' 'CldFlt is not in the "fltmc filters" list (not loaded).' 'Driver'; $Script:CldBad = $true }
-} else { Out-Line '  (run elevated to check "fltmc filters")' 'DarkGray' }
-
-#endregion
-
-#region ------------------------------------------- Sync root registration
-
-Out-Head 'Sync-root registration (Windows SyncRootManager)'
-$srm = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager'
-$registered = @()
-foreach ($k in @(Get-ChildItem $srm -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -like 'OneDrive!*' -or $_.PSChildName -like 'SharePoint!*' })) {
-    if ($Script:TargetSid -and $k.PSChildName -notlike "*$($Script:TargetSid)*") { continue }
-    $usr = Join-Path $k.PSPath 'UserSyncRoots'
-    if (Test-Path $usr) {
-        foreach ($prop in (Get-ItemProperty -LiteralPath $usr).PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' }) {
-            $registered += "$($prop.Value)".TrimEnd('\')
-            Out-Line ("  {0}  ->  {1}" -f ($k.PSChildName -replace '!S-1-5-[\d-]+', '!<SID>'), $prop.Value)
-        }
-    }
-}
-foreach ($r in $Script:SyncRoots) {
-    if ($registered -and -not ($registered | Where-Object { $r.TrimEnd('\') -eq $_ -or $r.StartsWith($_ + '\', 'OrdinalIgnoreCase') })) {
-        Add-Finding FAIL 'SyncRoot' "Sync folder '$r' is not registered with Windows as a cloud sync root - placeholders in it cannot download. Reset OneDrive." 'Reset'
-    }
-}
-if ($Script:SyncRoots.Count -and -not $registered) {
-    Add-Finding FAIL 'SyncRoot' 'No OneDrive sync roots are registered with Windows for this user. Reset OneDrive.' 'Reset'
-} elseif ($registered) { Add-Finding OK 'SyncRoot' "$($registered.Count) sync root(s) registered." }
-
-#endregion
-
-#region ---------------------------------------------------- File scan
-
-$problems = New-Object System.Collections.Generic.List[object]
-if ($ScanFiles -and $Script:SyncRoots.Count) {
-    Out-Head "Sync folder scan (up to $MaxScanFiles items per folder, 5 min max each)"
-    $A_OFFLINE = 0x1000; $A_PINNED = 0x80000; $A_UNPINNED = 0x100000; $A_RECALL_DATA = 0x400000
-    $reserved = '^(CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(\..*)?$'
-    $officeExt = '\.(xlsx?|xlsm|xlsb|docx?|docm|pptx?|pptm|accdb|mdb|one)$'
-    $tot = [ordered]@{ Files = 0; Folders = 0; OnlineOnly = 0; Local = 0; Pinned = 0; PinnedNotDownloaded = 0; Over400 = 0; OfficeOver218 = 0; BadName = 0; AccessErrors = 0 }
-    $scanRoots = @($Script:SyncRoots | Sort-Object Length | Where-Object { $r = $_; -not ($Script:SyncRoots | Where-Object { $_ -ne $r -and $r.StartsWith($_ + '\', 'OrdinalIgnoreCase') }) })
-    foreach ($root in $scanRoots) {
-        Out-Line "  Scanning $root ..."
-        $sw = [Diagnostics.Stopwatch]::StartNew(); $count = 0
-        $stack = New-Object System.Collections.Generic.Stack[string]; $stack.Push($root)
-        while ($stack.Count -gt 0 -and $count -lt $MaxScanFiles -and $sw.Elapsed.TotalMinutes -lt 5) {
-            $dir = $stack.Pop()
-            try { $entries = (New-Object System.IO.DirectoryInfo($dir)).GetFileSystemInfos() }
-            catch { $tot.AccessErrors++; continue }
-            foreach ($e in $entries) {
-                $count++
-                $attr = [int]$e.Attributes
-                $isDir = ($attr -band 0x10) -ne 0
-                $issue = @()
-                if ($isDir) {
-                    $tot.Folders++
-                    $stack.Push($e.FullName)
-                } else {
-                    $tot.Files++
-                    $online = ($attr -band $A_RECALL_DATA) -ne 0 -or ($attr -band $A_OFFLINE) -ne 0
-                    if ($online) { $tot.OnlineOnly++ } else { $tot.Local++ }
-                    if ($attr -band $A_PINNED) { $tot.Pinned++; if ($online) { $tot.PinnedNotDownloaded++; $issue += 'Pinned (always keep) but NOT downloaded' } }
-                    if ($e.FullName.Length -gt 218 -and $e.Name -match $officeExt) { $tot.OfficeOver218++; $issue += "Office file path $($e.FullName.Length) chars (>218 - Excel/Word may refuse to open)" }
-                }
-                if ($e.FullName.Length -gt 400) { $tot.Over400++; $issue += "Path $($e.FullName.Length) chars (>400 - OneDrive cannot sync)" }
-                if ($e.Name -match $reserved -or $e.Name -like '*_vti_*' -or $e.Name -match '\.lock$' -or $e.Name -ne $e.Name.Trim() -or $e.Name.EndsWith('.')) {
-                    $tot.BadName++; $issue += 'Name not allowed in OneDrive/SharePoint'
-                }
-                if ($issue) {
-                    $state = if ($isDir) { 'Folder' } elseif (($attr -band $A_RECALL_DATA) -ne 0 -or ($attr -band $A_OFFLINE) -ne 0) { 'Online-only' } else { 'Local' }
-                    $problems.Add([pscustomobject]@{ Issue = ($issue -join '; '); State = $state; Length = $e.FullName.Length; Path = $e.FullName })
-                }
-                if ($count % 5000 -eq 0) { Write-Progress -Activity "Scanning $root" -Status "$count items" }
-            }
-        }
-        Write-Progress -Activity "Scanning $root" -Completed
-        if ($count -ge $MaxScanFiles -or $sw.Elapsed.TotalMinutes -ge 5) { Out-Line "    (stopped early after $count items - partial results)" 'DarkGray' }
-    }
-    Out-Line ("  Files {0:N0}  Folders {1:N0}  Online-only {2:N0}  Local {3:N0}  Pinned {4:N0}" -f $tot.Files, $tot.Folders, $tot.OnlineOnly, $tot.Local, $tot.Pinned)
-    if ($tot.PinnedNotDownloaded) { Add-Finding WARN 'Files' "$($tot.PinnedNotDownloaded) file(s) are set to 'Always keep' but are still online-only - downloads are stuck." 'Restart' }
-    if ($tot.Over400)        { Add-Finding WARN 'Files' "$($tot.Over400) item(s) have paths over 400 characters - shorten folder names." }
-    if ($tot.OfficeOver218)  { Add-Finding WARN 'Files' "$($tot.OfficeOver218) Office file(s) have paths over 218 characters - Excel/Word may refuse to open them." }
-    if ($tot.BadName)        { Add-Finding WARN 'Files' "$($tot.BadName) item(s) have names OneDrive/SharePoint does not allow." }
-    if ($tot.AccessErrors)   { Add-Finding INFO 'Files' "$($tot.AccessErrors) folder(s) could not be read (access denied / provider not available)." }
-    if ($tot.OnlineOnly -and -not $tot.PinnedNotDownloaded) { Add-Finding INFO 'Files' "$($tot.OnlineOnly) file(s) are online-only - they need OneDrive running to open. Pin folders the user needs offline." }
-    if ($problems.Count) {
-        $problems | Export-Csv -Path $ProblemCsv -NoTypeInformation -Encoding UTF8
-        Out-Line "  Problem paths: $ProblemCsv" 'Green'
-    } else { Add-Finding OK 'Files' 'No long paths, blocked names or stuck pinned files found.' }
-} elseif ($Script:SyncRoots.Count) { Out-Line ''; Out-Line '  (sync folder scan skipped)' 'DarkGray' }
-
-#endregion
-
-#region ------------------------------------------------- Test the file
-
-if ($TestPath) {
-    Out-Head 'Test open of the file that failed'
-    $TestPath = $TestPath.Trim().Trim('"')
-    if (-not (Test-Path -LiteralPath $TestPath)) {
-        Add-Finding WARN 'TestFile' "File not found: $TestPath"
-    } else {
-        $tf = Get-Item -LiteralPath $TestPath -Force
-        $attr = [int]$tf.Attributes
-        $online = ($attr -band 0x400000) -ne 0 -or ($attr -band 0x1000) -ne 0
-        Out-Line ("  {0}" -f $tf.FullName)
-        Out-Line ("  Size {0:N0} bytes   Path length {1}   Attributes {2}   State {3}" -f $tf.Length, $tf.FullName.Length, $tf.Attributes, $(if ($online) { 'ONLINE-ONLY' } else { 'local' }))
-        if (-not $Script:IsTargetUser) {
-            Out-Line "  Not running as $($Script:TargetAccount) - skipping the read test (another account can't download that user's files)." 'DarkGray'
-        } else {
-            try {
-                $fs = [System.IO.File]::Open($tf.FullName, 'Open', 'Read', 'ReadWrite')
-                try { $buf = New-Object byte[] 65536; $n = $fs.Read($buf, 0, $buf.Length) } finally { $fs.Close() }
-                Add-Finding OK 'TestFile' "File opened and read OK ($n bytes) - it opens right now. The error is intermittent (OneDrive state at the time)."
-            } catch {
-                $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }
-                $hr = $ex.HResult; $code = $hr -band 0xFFFF
-                $hint = $Script:CodeHints[[int]$code]
-                Add-Finding FAIL 'TestFile' ("Open failed: 0x{0:X8} (Win32 {1}) {2}" -f $hr, $code, (Get-Win32Text $code)) $(if ($code -in 122, 362, 389, 404, 377) { 'Restart' } elseif ($code -eq 363) { 'Reset' } else { '' })
-                if ($hint) { Out-Line "         $hint" 'Yellow' }
-            }
-        }
-    }
-}
-
-#endregion
-
-#region ------------------------------------------------------ Events
-
-Out-Head 'Recent events (last 7 days)'
-$since = (Get-Date).AddDays(-7)
-$crash = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1000, 1002; StartTime = $since } -ErrorAction SilentlyContinue |
-    Where-Object { $_.Message -match 'OneDrive\.exe|explorer\.exe|FileCoAuth\.exe|FileSyncHelper' })
-if ($crash) {
-    $od = @($crash | Where-Object { $_.Message -match 'OneDrive\.exe|FileCoAuth|FileSyncHelper' }).Count
-    $ex = @($crash | Where-Object { $_.Message -match 'explorer\.exe' }).Count
-    Add-Finding $(if ($od) { 'WARN' } else { 'INFO' }) 'Events' "Crashes/hangs: OneDrive $od, Explorer $ex in 7 days." $(if ($od) { 'Update' } else { '' })
-    $crash | Select-Object -First 8 | ForEach-Object { Out-Line ("    {0:yyyy-MM-dd HH:mm}  {1}  {2}" -f $_.TimeCreated, $(if ($_.Id -eq 1002) { 'HANG ' } else { 'CRASH' }), (($_.Message -split "`n")[0]).Trim()) }
-} else { Add-Finding OK 'Events' 'No OneDrive or Explorer crashes/hangs in 7 days.' }
-
-$cfLogs = @(Get-WinEvent -ListLog '*CloudFile*', '*OneDrive*' -ErrorAction SilentlyContinue | Where-Object { $_.RecordCount -gt 0 })
-foreach ($l in $cfLogs) {
-    $ev = @(Get-WinEvent -FilterHashtable @{ LogName = $l.LogName; Level = 1, 2, 3; StartTime = $since } -MaxEvents 10 -ErrorAction SilentlyContinue)
-    if ($ev) {
-        Out-Line "  $($l.LogName): $($ev.Count) error/warning event(s) (newest 10)"
-        $ev | Select-Object -First 5 | ForEach-Object { Out-Line ("    {0:yyyy-MM-dd HH:mm}  ID {1}  {2}" -f $_.TimeCreated, $_.Id, (($_.Message -split "`n")[0]).Trim()) }
-    }
-}
-$fm = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-FilterManager'; Level = 1, 2, 3; StartTime = $since } -MaxEvents 10 -ErrorAction SilentlyContinue)
-if ($fm) {
-    Add-Finding WARN 'Events' "$($fm.Count) Filter Manager warning/error event(s) - a file-system filter (AV/EDR/backup) may be failing to attach."
-    $fm | Select-Object -First 5 | ForEach-Object { Out-Line ("    {0:yyyy-MM-dd HH:mm}  ID {1}  {2}" -f $_.TimeCreated, $_.Id, (($_.Message -split "`n")[0]).Trim()) }
-}
-
-#endregion
-
-#region ----------------------------------------------------- Summary
-
-Out-Head 'Summary'
-$Script:Findings | Where-Object { $_.Level -in 'FAIL', 'WARN' } | ForEach-Object {
-    Out-Line ("  [{0,-4}] {1,-9} {2}" -f $_.Level, $_.Area, $_.Finding) $(if ($_.Level -eq 'FAIL') { 'Red' } else { 'Yellow' })
-}
-if (-not ($Script:Findings | Where-Object { $_.Level -in 'FAIL', 'WARN' })) {
-    Out-Line '  No problems found right now. The error is intermittent - next time it appears, run this again BEFORE' 'Green'
-    Out-Line '  clicking OK, or pin the folder the user works in ("Always keep on this device").' 'Green'
-}
-$fixNames = @{ Driver = 'Re-enable / start CldFlt'; Restart = 'Restart OneDrive'; Update = 'Update OneDrive'; Reset = 'Reset OneDrive' }
-$order = 'Driver', 'Restart', 'Update', 'Reset'
-$rec = @($order | Where-Object { $Script:Recommend.Contains($_) })
-if ($rec) { Out-Line ("  Recommended fixes, in order: {0}" -f (($rec | ForEach-Object { $fixNames[$_] }) -join '  ->  ')) 'Cyan' }
-
-$Script:Findings | Export-Csv -Path $FindingsCsv -NoTypeInformation -Encoding UTF8
-$Script:Report | Set-Content -Path $ReportFile -Encoding UTF8
-Out-Line "  Report:   $ReportFile" 'Green'
-Out-Line "  Findings: $FindingsCsv" 'Green'
-
-#endregion
-
-#region ------------------------------------------------- Action log
-
-# Every fix is recorded three ways:
-#   1. ActionLog file  - OneDriveFileAccess_<PC>_<time>_Actions.log (timestamped, one line per step)
-#   2. Report file     - the same lines are appended to the report under "ACTIONS TAKEN"
-#   3. Windows Application event log - source "SDSI-ToolKit" (visible to N-central event monitors)
-#        4100 diagnosis summary   4101 fix succeeded   4102 fix failed / partial
-#        4103 fix cancelled       4104 session summary
-$ActionLog = Join-Path $OutputPath "OneDriveFileAccess_${env:COMPUTERNAME}_${stamp}_Actions.log"
-$Script:Actions    = New-Object System.Collections.Generic.List[object]
-$Script:CurrentFix = $null
-$Script:EventSrc   = 'SDSI-ToolKit'
-$Script:EventOK    = $false
-try { $Script:EventOK = [System.Diagnostics.EventLog]::SourceExists($Script:EventSrc) } catch { $Script:EventOK = $false }
-if (-not $Script:EventOK -and $Script:IsAdmin) {
-    try { New-EventLog -LogName Application -Source $Script:EventSrc -ErrorAction Stop; $Script:EventOK = $true } catch { }
-}
-
-function Write-ToolEvent([int]$Id, [string]$Type, [string]$Message) {
-    if (-not $Script:EventOK) { return }
-    $msg = "Repair-OneDriveFileAccess (Sigma Data Systems Inc.)`r`nComputer: $env:COMPUTERNAME`r`nRun by: $($me.Name)`r`nUser checked: $($Script:TargetAccount)`r`n`r`n$Message"
-    try { Write-EventLog -LogName Application -Source $Script:EventSrc -EventId $Id -EntryType $Type -Message $msg -ErrorAction Stop } catch { }
-}
-
-$Script:ActionHeaderDone = $false
-function Write-Act([ValidateSet('INFO','OK','WARN','FAIL','USER')][string]$Level, [string]$Text) {
-    $line = "{0:yyyy-MM-dd HH:mm:ss}  [{1,-4}]  {2}" -f (Get-Date), $Level, $Text
-    $color = @{ INFO = 'Gray'; OK = 'Green'; WARN = 'Yellow'; FAIL = 'Red'; USER = 'Cyan' }[$Level]
-    Write-Host "  $Text" -ForegroundColor $color
-    if (-not $Script:ActionHeaderDone) {
-        $hdr = @('', ('=' * 78), " ACTIONS TAKEN  -  run by $($me.Name) on $env:COMPUTERNAME for $($Script:TargetAccount)", ('=' * 78))
-        try { Add-Content -Path $ReportFile -Value $hdr -Encoding UTF8 } catch { }
-        try { Add-Content -Path $ActionLog -Value ("Repair-OneDriveFileAccess action log - Sigma Data Systems Inc.`r`nComputer: $env:COMPUTERNAME   Run by: $($me.Name)   Admin: $($Script:IsAdmin)   User checked: $($Script:TargetAccount)`r`nDiagnosis report: $ReportFile`r`n" + ('-' * 78)) -Encoding UTF8 } catch { }
-        $Script:ActionHeaderDone = $true
-    }
-    try { Add-Content -Path $ActionLog -Value $line -Encoding UTF8 } catch { }
-    try { Add-Content -Path $ReportFile -Value $line -Encoding UTF8 } catch { }
-    if ($Script:CurrentFix -and $Level -ne 'INFO') { $Script:CurrentFix.Steps.Add("[$Level] $Text") }
-}
-
-function Get-ODState {
-    $p = @(Get-UserOneDriveProcs)
-    $ver = if ($Script:OdExe -and (Test-Path -LiteralPath $Script:OdExe)) { (Get-Item -LiteralPath $Script:OdExe).VersionInfo.ProductVersion } else { 'n/a' }
-    $cs = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\CldFlt' 'Start'
-    $cr = if (((& sc.exe query cldflt 2>&1) -join ' ') -match 'RUNNING') { 'running' } else { 'NOT running' }
-    "OneDrive {0} (version {1}); CldFlt start={2}, {3}" -f $(if ($p) { "running, PID $(($p.ProcessId) -join ',')" } else { 'NOT running' }), $ver, $cs, $cr
-}
-
-function Start-Fix([string]$Name) {
-    $Script:CurrentFix = [pscustomobject]@{ Fix = $Name; Started = Get-Date; Result = 'UNKNOWN'; Steps = (New-Object System.Collections.Generic.List[string]); Before = ''; After = '' }
-    Write-Host ''
-    Write-Act INFO "===== $Name ====="
-    $Script:CurrentFix.Before = Get-ODState
-    Write-Act INFO "Before: $($Script:CurrentFix.Before)"
-}
-
-function Stop-Fix([ValidateSet('OK','WARN','FAIL','CANCELLED','SKIPPED')][string]$Result, [string]$Summary) {
-    if (-not $Script:CurrentFix) { return }
-    $f = $Script:CurrentFix
-    $f.Result = $Result
-    if ($Result -in 'OK', 'WARN', 'FAIL') { $f.After = Get-ODState; Write-Act INFO "After:  $($f.After)" }
-    $lvl = switch ($Result) { 'OK' { 'OK' } 'FAIL' { 'FAIL' } default { 'WARN' } }
-    Write-Act $lvl "RESULT: $($f.Fix) - $Result. $Summary"
-    $Script:Actions.Add([pscustomobject]@{ Time = $f.Started; Fix = $f.Fix; Result = $Result; Summary = $Summary })
-    $body = "Fix: $($f.Fix)`r`nResult: $Result`r`n$Summary"
-    if ($f.Before) { $body += "`r`n`r`nBefore: $($f.Before)" }
-    if ($f.After)  { $body += "`r`nAfter:  $($f.After)" }
-    if ($f.Steps.Count) { $body += "`r`n`r`nSteps:`r`n" + ($f.Steps -join "`r`n") }
-    switch ($Result) {
-        'OK'        { Write-ToolEvent 4101 'Information' $body }
-        'CANCELLED' { Write-ToolEvent 4103 'Information' $body }
-        'SKIPPED'   { Write-ToolEvent 4103 'Information' $body }
-        default     { Write-ToolEvent 4102 'Warning' $body }
-    }
-    $Script:CurrentFix = $null
-}
-
-# Confirm-Fix records the technician's answer in the action log
-function Confirm-Fix([string]$What) {
-    Write-Host ''
-    Write-Host '  [!] This will CHANGE this machine:' -ForegroundColor Yellow
-    Write-Host "      $What" -ForegroundColor Yellow
-    if ((Read-Host '  Type YES to continue') -ceq 'YES') { Write-Act USER "Confirmed by $($me.Name): $What"; return $true }
-    Write-Act USER "Declined by $($me.Name): $What"
-    return $false
-}
-
-# Diagnosis summary event (written for every run, including -ReportOnly from an RMM)
-$nFail = @($Script:Findings | Where-Object Level -eq 'FAIL').Count
-$nWarn = @($Script:Findings | Where-Object Level -eq 'WARN').Count
-$diag = "Diagnosis: $nFail FAIL, $nWarn WARN.`r`n" + (($Script:Findings | Where-Object { $_.Level -in 'FAIL', 'WARN' } | ForEach-Object { "[$($_.Level)] $($_.Area): $($_.Finding)" }) -join "`r`n")
-if ($rec) { $diag += "`r`n`r`nRecommended fixes: " + (($rec | ForEach-Object { $fixNames[$_] }) -join ' -> ') }
-$diag += "`r`n`r`nReport: $ReportFile"
-Write-ToolEvent 4100 $(if ($nFail) { 'Warning' } else { 'Information' }) $diag
-if ($Script:EventOK) { Out-Line "  Event log: Application log, source '$($Script:EventSrc)' (IDs 4100-4104)" 'Green' }
-else { Out-Line '  Event log: not written (run elevated once to register the SDSI-ToolKit event source).' 'DarkGray' }
-
-#endregion
-
-#region ------------------------------------------------------- Fixes
-
-# Runs a program as the signed-in user (not elevated). From an elevated or SYSTEM session this
-# goes through a temporary scheduled task in the user's interactive session.
-function Invoke-AsTargetUser([string]$Exe, [string]$Arguments = '', [switch]$Wait, [int]$TimeoutSec = 300) {
-    $shown = "$([IO.Path]::GetFileName($Exe)) $Arguments".Trim()
-    if ($Script:IsTargetUser -and -not $Script:IsAdmin) {
-        Write-Act INFO "Running as current user: $shown"
-        $sp = @{ FilePath = $Exe; PassThru = $true }; if ($Arguments) { $sp.ArgumentList = $Arguments }
-        try { $p = Start-Process @sp -ErrorAction Stop } catch { Write-Act FAIL "Could not start $shown : $($_.Exception.Message)"; return $false }
-        if ($Wait) { $p | Wait-Process -Timeout $TimeoutSec -ErrorAction SilentlyContinue }
-        return $true
-    }
-    if (-not $Script:IsAdmin) { Write-Act FAIL "Cannot run '$shown' as $($Script:TargetAccount) - run elevated or as that user."; return $false }
-    $name = 'SDSI-OneDriveFix-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
-    try {
-        Write-Act INFO "Running as $($Script:TargetAccount) (not elevated) via temporary task ${name}: $shown"
-        $act = if ($Arguments) { New-ScheduledTaskAction -Execute $Exe -Argument $Arguments } else { New-ScheduledTaskAction -Execute $Exe }
-        $pr  = New-ScheduledTaskPrincipal -UserId $Script:TargetAccount -LogonType Interactive -RunLevel Limited
-        $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-        Register-ScheduledTask -TaskName $name -Action $act -Principal $pr -Settings $set -Force -ErrorAction Stop | Out-Null
-        Start-ScheduledTask -TaskName $name -ErrorAction Stop
-        Start-Sleep -Seconds 3
-        if ($Wait) {
-            $sw = [Diagnostics.Stopwatch]::StartNew()
-            while ($sw.Elapsed.TotalSeconds -lt $TimeoutSec -and (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue).State -eq 'Running') { Start-Sleep -Seconds 2 }
-            if ($sw.Elapsed.TotalSeconds -ge $TimeoutSec) { Write-Act WARN "'$shown' still running after $TimeoutSec seconds - continuing." }
-        }
-        return $true
-    } catch {
-        Write-Act FAIL "Could not run '$shown' as $($Script:TargetAccount): $($_.Exception.Message)"
-        return $false
-    } finally {
-        Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
-    }
-}
-
-function Get-UserOneDriveProcs {
-    @(Get-CimInstance Win32_Process -Filter "Name='OneDrive.exe'" -ErrorAction SilentlyContinue | Where-Object {
-        $o = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
-        ($o -and "$($o.Domain)\$($o.User)" -eq $Script:TargetAccount) -or (-not $o.User -and $Script:IsTargetUser)
-    })
-}
-
-function Start-OneDriveAsUser {
-    # explorer.exe hands the launch to the user's shell, so OneDrive is never elevated and
-    # is not tied to the temporary task
-    [void](Invoke-AsTargetUser "$env:SystemRoot\explorer.exe" "`"$($Script:OdExe)`"")
-    for ($i = 0; $i -lt 15; $i++) { Start-Sleep -Seconds 2; if (Get-UserOneDriveProcs) { break } }
-    $p = @(Get-UserOneDriveProcs)
-    if ($p) { Write-Act OK "OneDrive started (PID $(($p.ProcessId) -join ','))."; return $true }
-    Write-Act FAIL 'OneDrive did not start within 30 seconds - start it from the Start menu as the user.'
-    return $false
-}
-
-function Fix-Restart {
-    Start-Fix 'Restart OneDrive'
-    if (-not $Script:OdExe) { Write-Act FAIL 'OneDrive is not installed.'; Stop-Fix FAIL 'OneDrive is not installed.'; return }
-    if (-not (Confirm-Fix "Close and restart OneDrive for $($Script:TargetAccount) (not elevated). Nothing is deleted.")) { Stop-Fix CANCELLED 'Technician declined.'; return }
-    $running = @(Get-UserOneDriveProcs)
-    if ($running) {
-        Write-Act INFO "Asking OneDrive to shut down (PID $(($running.ProcessId) -join ','))..."
-        [void](Invoke-AsTargetUser $Script:OdExe '/shutdown' -Wait -TimeoutSec 30)
-        Start-Sleep -Seconds 3
-        foreach ($p in Get-UserOneDriveProcs) {
-            try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; Write-Act WARN "Force-ended stuck OneDrive PID $($p.ProcessId)." }
-            catch { Write-Act FAIL "Could not end OneDrive PID $($p.ProcessId): $($_.Exception.Message)" }
-        }
-    } else { Write-Act INFO 'OneDrive was not running - starting it.' }
-    if (Start-OneDriveAsUser) { Stop-Fix OK 'OneDrive restarted as the user. Ask the user to open the file again.' }
-    else { Stop-Fix FAIL 'OneDrive did not come back up.' }
-}
-
-function Fix-Driver {
-    Start-Fix 'Re-enable / start Cloud Files driver (CldFlt)'
-    if (-not $Script:IsAdmin) { Write-Act FAIL 'Needs Administrator rights.'; Stop-Fix FAIL 'Not elevated.'; return }
-    if (-not (Confirm-Fix 'Set the Cloud Files driver (CldFlt) to Automatic and start it.')) { Stop-Fix CANCELLED 'Technician declined.'; return }
-    $old = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\CldFlt' 'Start'
-    try {
-        Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\CldFlt' -Name Start -Value 2 -Type DWord -ErrorAction Stop
-        Write-Act OK "Registry HKLM\SYSTEM\CurrentControlSet\Services\CldFlt Start: $old -> 2 (Automatic)."
-    } catch { Write-Act FAIL "Could not set CldFlt start type: $($_.Exception.Message)" }
-    $load = (& fltmc.exe load cldflt 2>&1) -join ' '
-    Write-Act INFO "fltmc load cldflt: $(if ($load) { $load } else { 'OK' })"
-    if (((& sc.exe query cldflt 2>&1) -join ' ') -match 'RUNNING') { Stop-Fix OK 'CldFlt is running. Restart OneDrive next.' }
-    else { Stop-Fix WARN 'CldFlt did not start - a REBOOT is needed, then run this again.' }
-}
-
-function Fix-Update {
-    Start-Fix 'Update OneDrive'
-    if (-not $Script:Updater) { Write-Act FAIL 'OneDriveStandaloneUpdater.exe not found.'; Stop-Fix FAIL 'Updater missing - reinstall OneDrive from https://go.microsoft.com/fwlink/?linkid=844652'; return }
-    if (-not (Confirm-Fix 'Run the OneDrive updater now (OneDrive restarts itself if an update installs).')) { Stop-Fix CANCELLED 'Technician declined.'; return }
-    $before = (Get-Item -LiteralPath $Script:OdExe).VersionInfo.ProductVersion
-    Write-Act INFO "Running $($Script:Updater) (up to 10 minutes)..."
-    if ($Script:PerMachine -and $Script:IsAdmin) {
-        try { Start-Process -FilePath $Script:Updater -Wait -WindowStyle Hidden -ErrorAction Stop } catch { Write-Act FAIL "Updater failed to run: $($_.Exception.Message)" }
-    } else { [void](Invoke-AsTargetUser $Script:Updater '' -Wait -TimeoutSec 600) }
-    Start-Sleep -Seconds 5
-    if ($Script:Hku) { $t = Get-RegValue "$($Script:Hku)\Software\Microsoft\OneDrive" 'OneDriveTrigger'; if ($t -and (Test-Path -LiteralPath $t)) { $Script:OdExe = $t } }
-    $after = (Get-Item -LiteralPath $Script:OdExe).VersionInfo.ProductVersion
-    if ($after -ne $before) { Write-Act OK "OneDrive version: $before -> $after" } else { Write-Act WARN "Version unchanged ($after) - already current, or the update is still downloading." }
-    if (-not (Get-UserOneDriveProcs)) { [void](Start-OneDriveAsUser) }
-    foreach ($t in @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -like 'OneDrive*Update*' -and $_.State -eq 'Disabled' })) {
-        if ($Script:IsAdmin -and (Confirm-Fix "Re-enable the disabled scheduled task '$($t.TaskName)'.")) {
-            try { $t | Enable-ScheduledTask -ErrorAction Stop | Out-Null; Write-Act OK "Scheduled task '$($t.TaskName)' re-enabled." }
-            catch { Write-Act FAIL "Could not enable '$($t.TaskName)': $($_.Exception.Message)" }
-        }
-    }
-    if ($after -ne $before) { Stop-Fix OK "Updated $before -> $after." } else { Stop-Fix WARN "No new version installed ($after)." }
-}
-
-function Fix-Pin {
-    Start-Fix 'Pin folder "Always keep on this device"'
-    $def = if ($Script:SyncRoots.Count) { $Script:SyncRoots[0] } else { '' }
-    $f = Read-Host "  Folder to keep on this device (full path) [$def]"
-    if ([string]::IsNullOrWhiteSpace($f)) { $f = $def }
-    $f = $f.Trim().Trim('"').TrimEnd('\')
-    Write-Act INFO "Folder chosen: $f"
-    if (-not $f -or -not (Test-Path -LiteralPath $f -PathType Container)) { Write-Act FAIL 'Folder not found.'; Stop-Fix SKIPPED "Folder not found: $f"; return }
-    if (-not ($Script:SyncRoots | Where-Object { $f -eq $_ -or $f.StartsWith($_ + '\', 'OrdinalIgnoreCase') })) { Write-Act FAIL 'That folder is not inside a OneDrive sync folder.'; Stop-Fix SKIPPED "Not a OneDrive folder: $f"; return }
-    if (-not (Confirm-Fix "Mark '$f' and everything in it 'Always keep on this device' (downloads it all - check free disk space).")) { Stop-Fix CANCELLED 'Technician declined.'; return }
-    $cmdArgs = "/c attrib +P -U `"$f`" & attrib +P -U /S /D `"$f\*`""
-    if (Invoke-AsTargetUser "$env:SystemRoot\System32\cmd.exe" $cmdArgs -Wait -TimeoutSec 600) {
-        $pinned = (([int](Get-Item -LiteralPath $f -Force).Attributes) -band 0x80000) -ne 0
-        if ($pinned) { Stop-Fix OK "'$f' is set to Always keep on this device - OneDrive is downloading it." }
-        else { Stop-Fix WARN "attrib ran but '$f' does not show the Pinned attribute yet - check in Explorer." }
-    } else { Stop-Fix FAIL "Could not pin '$f'." }
-}
-
-function Fix-Reset {
-    Start-Fix 'Reset OneDrive'
-    if (-not $Script:OdExe) { Write-Act FAIL 'OneDrive is not installed.'; Stop-Fix FAIL 'OneDrive is not installed.'; return }
-    if (-not (Confirm-Fix "Reset OneDrive for $($Script:TargetAccount). Files are kept; OneDrive re-checks every file, which can take hours on big libraries. SharePoint libraries may need to be re-synced from the browser.")) { Stop-Fix CANCELLED 'Technician declined.'; return }
-    [void](Invoke-AsTargetUser $Script:OdExe '/reset' -Wait -TimeoutSec 120)
-    Write-Act INFO 'Reset sent. Waiting 20 seconds for OneDrive to come back...'
-    Start-Sleep -Seconds 20
-    $ok = $true
-    if (-not (Get-UserOneDriveProcs)) { $ok = Start-OneDriveAsUser } else { Write-Act OK 'OneDrive restarted by itself.' }
-    if ($ok) { Stop-Fix OK 'OneDrive reset and running. If it asks the user to sign in, sign in and choose the SAME folder location.' }
-    else { Stop-Fix FAIL 'Reset sent but OneDrive did not restart.' }
-}
-
-function Fix-Logs {
-    Start-Fix 'Collect OneDrive logs'
-    $logRoot = Join-Path $localApp 'Microsoft\OneDrive\logs'
-    if (-not (Test-Path -LiteralPath $logRoot)) { Write-Act FAIL "No OneDrive log folder at $logRoot"; Stop-Fix FAIL 'No log folder.'; return }
-    $tmp = Join-Path $env:TEMP ("ODLogs_" + [guid]::NewGuid().ToString('N').Substring(0, 6))
-    New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-    $cut = (Get-Date).AddDays(-3); $n = 0
-    foreach ($f in Get-ChildItem -LiteralPath $logRoot -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $cut }) {
-        $dest = Join-Path $tmp ($f.FullName.Substring($logRoot.Length).TrimStart('\'))
-        New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
-        try { Copy-Item -LiteralPath $f.FullName -Destination $dest -Force -ErrorAction Stop; $n++ } catch { }
-    }
-    foreach ($x in $ReportFile, $ActionLog, $FindingsCsv) { Copy-Item -LiteralPath $x -Destination $tmp -ErrorAction SilentlyContinue }
-    $zip = Join-Path $OutputPath "OneDriveLogs_${env:COMPUTERNAME}_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
-    try { Compress-Archive -Path (Join-Path $tmp '*') -DestinationPath $zip -Force -ErrorAction Stop; Stop-Fix OK "$n log file(s) from the last 3 days + report zipped to $zip" }
-    catch { Write-Act FAIL "Could not zip logs: $($_.Exception.Message)"; Stop-Fix FAIL 'Zip failed.' }
-    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-function Write-SessionSummary {
-    if ($Script:CurrentFix) { Stop-Fix WARN 'Interrupted before it finished.' }
-    if (-not $Script:Actions.Count) { return }
-    Write-Host ''
-    Write-Act INFO '===== Session summary ====='
-    foreach ($a in $Script:Actions) { Write-Act INFO ("{0:HH:mm:ss}  {1,-9}  {2}  -  {3}" -f $a.Time, $a.Result, $a.Fix, $a.Summary) }
-    Write-Act INFO "Final state: $(Get-ODState)"
-    $body = "Fixes run this session:`r`n" + (($Script:Actions | ForEach-Object { "{0:HH:mm:ss}  {1}  {2} - {3}" -f $_.Time, $_.Result, $_.Fix, $_.Summary }) -join "`r`n") + "`r`n`r`nFinal state: $(Get-ODState)`r`nAction log: $ActionLog"
-    Write-ToolEvent 4104 $(if ($Script:Actions | Where-Object { $_.Result -in 'FAIL', 'WARN' }) { 'Warning' } else { 'Information' }) $body
-    Write-Host ''
-    Write-Host "  Action log: $ActionLog" -ForegroundColor Green
-    Write-Host "  Report (actions appended): $ReportFile" -ForegroundColor Green
-}
-
-if (-not $ReportOnly) {
-    try {
-        while ($true) {
-            Write-Host ''
-            Write-Host ('-' * 78) -ForegroundColor DarkGray
-            Write-Host " Fixes for $($Script:TargetAccount)  (each asks first - everything is logged)" -ForegroundColor Cyan
-            if ($rec) { Write-Host ("  Recommended: {0}" -f (($rec | ForEach-Object { $fixNames[$_] }) -join ' -> ')) -ForegroundColor Cyan }
-            Write-Host '  1. Restart OneDrive (as the user, not elevated)'
-            Write-Host '  2. Re-enable / start the Cloud Files driver (CldFlt)'
-            Write-Host '  3. Update OneDrive now'
-            Write-Host '  4. Pin a folder "Always keep on this device"'
-            Write-Host '  5. Reset OneDrive (re-sync, files kept)'
-            Write-Host '  6. Collect OneDrive logs (zip) for escalation'
-            if ($rec) { Write-Host '  A. Apply the recommended fixes in order' }
-            Write-Host '  Q. Done'
-            $c = "$(Read-Host '  Choose')".Trim().ToUpper()
-            if ($c -in 'Q', '') { break }
-            switch ($c) {
-                '1' { Fix-Restart }
-                '2' { Fix-Driver }
-                '3' { Fix-Update }
-                '4' { Fix-Pin }
-                '5' { Fix-Reset }
-                '6' { Fix-Logs }
-                'A' {
-                    if (-not $rec) { Write-Host '  No recommended fixes.' -ForegroundColor DarkGray; break }
-                    Write-Act USER "Apply recommended fixes chosen: $(($rec | ForEach-Object { $fixNames[$_] }) -join ' -> ')"
-                    foreach ($r in $rec) {
-                        switch ($r) { 'Driver' { Fix-Driver } 'Restart' { Fix-Restart } 'Update' { Fix-Update } 'Reset' { Fix-Reset } }
-                    }
-                }
-                default { Write-Host '  Not a valid choice.' -ForegroundColor Red }
-            }
-        }
-    } finally {
-        Write-SessionSummary
-    }
-}
-
-#endregion
-exit 0
-'@
 
 # ======================= Audit-GPOs.ps1 =======================
 $Script:Payloads['Audit-GPOs'] = @'
@@ -7471,12 +6270,10 @@ function Invoke-StandardCleanup {
 function Invoke-ExtendedCleanup {
     Write-Log "Starting extended cleanup pass."
 
-    # Keep crash/black-screen evidence: only dumps older than 30 days are removed (LiveKernelReports is never touched here)
-    $dumpCutoff = (Get-Date).AddDays(-30)
-    foreach ($dumpPath in @("C:\Windows\Minidump", "C:\Windows\MEMORY.DMP")) {
-        try { Get-ChildItem -Path $dumpPath -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $dumpCutoff } | Remove-Item -Force -ErrorAction SilentlyContinue } catch { }
+    foreach ($dumpPath in @("C:\Windows\Minidump\*", "C:\Windows\MEMORY.DMP")) {
+        try { Remove-Item -Path $dumpPath -Recurse -Force -ErrorAction SilentlyContinue } catch { }
     }
-    Write-Log "Cleared crash dump files older than 30 days (Minidump/MEMORY.DMP) - recent dumps kept for troubleshooting."
+    Write-Log "Cleared crash dump files (Minidump/MEMORY.DMP)."
 
     try {
         if (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue) {
@@ -16506,109 +15303,6 @@ switch ($Action) {
     Write-Host '  Over ~45 GB of a 50 GB quota: enable the archive (and auto-expanding archive) or clean up.' -ForegroundColor DarkGray
 }
 
-# ======================================================================== EXCHANGE: CALENDAR PERMISSIONS
-'CalendarPermissions' {
-    Connect-EXO
-    Write-H 'Calendar permissions'
-    Write-Host '  1. Grant / change a user''s access to one or more calendars (sharing invite adds it to their Outlook)'
-    Write-Host '  2. View who has access to one or more calendars'
-    Write-Host '  3. Remove a user''s access from one or more calendars'
-    $mode = Ask 'Choose' '1'
-    if ($mode -notin '1', '2', '3') { break }
-
-    $ownersRaw = Ask 'Calendar OWNER mailbox(es) - separate several with commas, spaces or semicolons' $UserPrincipalName
-    $owners = @("$ownersRaw" -split '[,;\s]+' | Where-Object { $_ } | Select-Object -Unique)
-    if (-not $owners) { Write-Host '  No calendar owners entered.' -ForegroundColor Yellow; break }
-
-    # The calendar folder name is localized (Calendrier, Kalender...), so look it up per mailbox.
-    function Get-CalendarFolderId([string]$Owner) {
-        $n = (Get-MailboxFolderStatistics -Identity $Owner -FolderScope Calendar -ErrorAction Stop | Where-Object { $_.FolderType -eq 'Calendar' } | Select-Object -First 1).Name
-        if (-not $n) { $n = 'Calendar' }
-        return "${Owner}:\$n"
-    }
-    function Get-CalendarRows([string[]]$Owners, [string]$OnlyUser) {
-        foreach ($o in $Owners) {
-            try {
-                $id = Get-CalendarFolderId $o
-                $perms = if ($OnlyUser) { Get-MailboxFolderPermission -Identity $id -User $OnlyUser -ErrorAction SilentlyContinue } else { Get-MailboxFolderPermission -Identity $id -ErrorAction Stop }
-                foreach ($p in @($perms)) { if ($p) { [pscustomobject]@{ Owner = $o; User = "$($p.User)"; AccessRights = ($p.AccessRights -join ','); SharingFlags = ($p.SharingPermissionFlags -join ',') } } }
-            } catch { [pscustomobject]@{ Owner = $o; User = ''; AccessRights = "ERROR: $($_.Exception.Message)"; SharingFlags = '' } }
-        }
-    }
-
-    switch ($mode) {
-        '1' {
-            $delegate = Ask 'Give access TO (user UPN)' ''
-            if (-not $delegate) { break }
-            Write-Host '  Access level:'
-            Write-Host '    1. AvailabilityOnly  - free/busy only'
-            Write-Host '    2. LimitedDetails    - free/busy + subject + location'
-            Write-Host '    3. Reviewer          - read everything (read-only)'
-            Write-Host '    4. Editor            - read, create, change, delete'
-            Write-Host '    5. Editor + Delegate - Editor, and also receives their meeting requests'
-            $lvl = Ask 'Choose' '3'
-            $rights = switch ($lvl) { '1' { 'AvailabilityOnly' } '2' { 'LimitedDetails' } '4' { 'Editor' } '5' { 'Editor' } default { 'Reviewer' } }
-            $flags = if ($lvl -eq '5') { 'Delegate' } else { $null }
-            if ($flags -and ((Ask 'Can the delegate also see PRIVATE items? Y/N' 'N') -match '^[Yy]')) { $flags = 'Delegate,CanViewPrivateItems' }
-            $notify = (Ask 'Send a sharing invitation so the calendar shows up in their Outlook? Y/N' 'Y') -match '^[Yy]'
-            if (-not (AskYes "Give $delegate '$rights$(if ($flags) { " + $flags" })' on $($owners.Count) calendar(s): $($owners -join ', ')")) { break }
-
-            $rows = foreach ($o in $owners) {
-                $result = ''
-                try {
-                    $id = Get-CalendarFolderId $o
-                    $p = @{ Identity = $id; User = $delegate; AccessRights = $rights; ErrorAction = 'Stop' }
-                    if ($notify) { $p.SendNotificationToUser = $true }
-                    $existing = Get-MailboxFolderPermission -Identity $id -User $delegate -ErrorAction SilentlyContinue
-                    if ($flags) { $p.SharingPermissionFlags = $flags }
-                    elseif ($existing -and ($existing.SharingPermissionFlags -join '') -notmatch '^(None)?$') { $p.SharingPermissionFlags = 'None' }
-                    if ($existing) { Set-MailboxFolderPermission @p | Out-Null; $result = "Updated (was $($existing.AccessRights -join ','))" }
-                    else { Add-MailboxFolderPermission @p | Out-Null; $result = 'Added' }
-                    Write-Host ("  {0,-8} {1}" -f $(if ($existing) { 'UPDATED' } else { 'ADDED' }), $o) -ForegroundColor Green
-                } catch {
-                    $result = "FAILED: $($_.Exception.Message)"
-                    Write-Host ("  FAILED   {0} : {1}" -f $o, $_.Exception.Message) -ForegroundColor Red
-                }
-                [pscustomobject]@{ Owner = $o; User = $delegate; AccessRights = $rights; SharingFlags = "$flags"; InviteSent = $notify; Result = $result }
-            }
-            Write-H "Check: $delegate on each calendar"
-            Get-CalendarRows $owners $delegate | Format-Table -AutoSize
-            Save-Csv $rows "CalendarPermissions_Grant_$($delegate -replace '[^\w]','_')" | Out-Null
-            if ($notify) {
-                Write-Host "  $delegate gets one sharing email per calendar (usually within a few minutes, up to ~30). Accept adds it under Shared Calendars." -ForegroundColor Cyan
-                Write-Host '  Not arrived? Check Junk / Other, or add it directly: Outlook > Calendar > Add Calendar > From Address Book.' -ForegroundColor DarkGray
-            } else {
-                Write-Host '  No invite sent - the user adds each one in Outlook: Calendar > Add Calendar > From Address Book.' -ForegroundColor Cyan
-            }
-        }
-        '2' {
-            Write-H "Calendar permissions on $($owners.Count) calendar(s)"
-            $rows = @(Get-CalendarRows $owners '')
-            $rows | Format-Table -AutoSize
-            Write-Host '  Default = everyone in the organization; Anonymous = external / unauthenticated.' -ForegroundColor DarkGray
-            if ($rows) { Save-Csv $rows 'CalendarPermissions' | Out-Null }
-        }
-        '3' {
-            $delegate = Ask 'Remove access for (user UPN)' ''
-            if (-not $delegate) { break }
-            if (-not (AskYes "Remove $delegate's access from $($owners.Count) calendar(s): $($owners -join ', ')")) { break }
-            $rows = foreach ($o in $owners) {
-                $result = ''
-                try {
-                    $id = Get-CalendarFolderId $o
-                    if (Get-MailboxFolderPermission -Identity $id -User $delegate -ErrorAction SilentlyContinue) {
-                        Remove-MailboxFolderPermission -Identity $id -User $delegate -Confirm:$false -ErrorAction Stop
-                        $result = 'Removed'; Write-Host "  REMOVED  $o" -ForegroundColor Green
-                    } else { $result = 'No access to remove'; Write-Host "  NONE     $o" -ForegroundColor DarkGray }
-                } catch { $result = "FAILED: $($_.Exception.Message)"; Write-Host "  FAILED   $o : $($_.Exception.Message)" -ForegroundColor Red }
-                [pscustomobject]@{ Owner = $o; User = $delegate; Result = $result }
-            }
-            Save-Csv $rows "CalendarPermissions_Remove_$($delegate -replace '[^\w]','_')" | Out-Null
-            Write-Host '  The shared calendar may stay listed in their Outlook until they remove it (right-click > Delete Calendar).' -ForegroundColor DarkGray
-        }
-    }
-}
-
 # ======================================================================== EXCHANGE: AUDIT LOG
 'AuditSearch' {
     Connect-EXO
@@ -18198,14 +16892,13 @@ function Invoke-IISLogCleanup {
 }
 
 function Invoke-DumpCleanup {
-    param([string]$Server, [int]$RetainDays = 30)
+    param([string]$Server)
     if (Should-Skip "Dumps") { Write-Log "[$Server] Skipping dump cleanup." "WARN"; return 0 }
 
-    Write-Log "[$Server] Removing crash dumps older than $RetainDays days (recent dumps are kept as evidence)..." "ACTION"
+    Write-Log "[$Server] Removing old crash dumps..." "ACTION"
 
     $result = Invoke-Target $Server {
-        param($dryRun, $retainDays)
-        $cutoff = (Get-Date).AddDays(-$retainDays)
+        param($dryRun)
         $dumpPaths = @(
             "C:\Windows\Minidump",
             "C:\Windows\MEMORY.DMP",
@@ -18214,17 +16907,27 @@ function Invoke-DumpCleanup {
         $totalSize = 0
         foreach ($p in $dumpPaths) {
             if (Test-Path $p) {
-                $old = @(Get-ChildItem $p -Recurse -File -Force -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff })
-                $m = $old | Measure-Object Length -Sum -ErrorAction SilentlyContinue
-                $totalSize += if ($m -and $m.Sum) { [long]$m.Sum } else { 0 }
-                if (-not $dryRun) { $old | Remove-Item -Force -ErrorAction SilentlyContinue }
+                $size = if ((Get-Item $p).PSIsContainer) {
+                    $m = Get-ChildItem $p -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum -ErrorAction SilentlyContinue
+                    if ($m -and $m.Sum) { [long]$m.Sum } else { 0 }
+                } else {
+                    (Get-Item $p).Length
+                }
+                $totalSize += if ($size) { $size } else { 0 }
+                if (-not $dryRun) {
+                    if ((Get-Item $p).PSIsContainer) {
+                        Remove-Item "$p\*" -Force -Recurse -ErrorAction SilentlyContinue
+                    } else {
+                        Remove-Item $p -Force -ErrorAction SilentlyContinue
+                    }
+                }
             }
         }
         return $totalSize
-    } -ArgumentList $DryRun, $RetainDays
+    } -ArgumentList $DryRun
 
     if ($DryRun) {
-        Write-Log "[$Server] [DRYRUN] Would remove crash dumps older than $RetainDays days (~$(Format-Bytes $result))." "DRYRUN"
+        Write-Log "[$Server] [DRYRUN] Would remove crash dumps (~$(Format-Bytes $result))." "DRYRUN"
     } else {
         Write-Log "[$Server] Crash dumps removed. Freed ~$(Format-Bytes $result)." "SUCCESS"
     }

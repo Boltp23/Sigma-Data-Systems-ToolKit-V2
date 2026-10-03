@@ -2,7 +2,7 @@
 
 *Prepared by [Sigma Data Systems Inc.](https://sigmadatainc.com/)*
 
-<!-- AUTO-VERSION -->**Current version: v2.0** | 130 options | updated 2026-10-02<!-- /AUTO-VERSION -->
+<!-- AUTO-VERSION -->**Current version: v2.0** | 124 options | updated 2026-10-03<!-- /AUTO-VERSION -->
 
 ```
   _____ _____ _____ __  __            _____       _______
@@ -14,7 +14,7 @@
 ```
 
 One PowerShell file you can copy to any Windows workstation or server and run.
-It opens a numbered menu of **130 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
+It opens a numbered menu of **124 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
 Each option either checks something and writes a report, or makes a fix after asking you to confirm.
 
 - **One file, nothing to install.** 34 longer scripts (plus 2 data files) are built into the file as plain, readable text.
@@ -54,7 +54,7 @@ Each option either checks something and writes a report, or makes a fix after as
 | **PowerShell** | Windows PowerShell 5.1 (built in). Built-in tools always run in 5.1, even if you start the menu from PowerShell 7. |
 | **Rights** | Run as **Administrator**. If you don't, the toolkit offers to restart itself elevated. |
 | **Optional modules** | Hyper-V, ActiveDirectory, GroupPolicy, DhcpServer, DnsServer, WebAdministration. Options that need a missing module say so and go back to the menu. |
-| **Microsoft 365** | ExchangeOnlineManagement 3.7+ and Microsoft.Graph.Authentication (the full Microsoft.Graph SDK for the compromised-account and posture audits). Option **90** installs them for the current user. Sign in with an Exchange / Global Reader role for audits and an admin role for changes. |
+| **Microsoft 365** | ExchangeOnlineManagement 3.7+ and Microsoft.Graph.Authentication (the full Microsoft.Graph SDK for the compromised-account and posture audits). Option **92** installs them for the current user. Sign in with an Exchange / Global Reader role for audits and an admin role for changes. |
 | **Internet** | Only needed for the download options (Sysinternals, NirSoft, Ninite, Office, SetupDiag, TSS) and the Windows Update search. |
 
 ---
@@ -92,7 +92,7 @@ The home screen shows the banner, a line about the machine (host, domain, OS, ad
 | Type | Does |
 |---|---|
 | A section letter (`A`, `C`, `D`...) | Open that section |
-| Any option number (`1`-`130`) | Run that option directly, from any screen |
+| Any option number (`1`-`124`) | Run that option directly, from any screen |
 | `ALL` | List every option |
 | `B` | Back to the section list |
 | `O` | Change the output folder |
@@ -110,7 +110,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 ## All options
 
 <!-- AUTO-OPTIONS:START -->
-<details><summary><b>Quick index of all 130 options</b> (auto-generated from the script, 2026-10-02)</summary>
+<details><summary><b>Quick index of all 124 options</b> (auto-generated from the script, 2026-10-03)</summary>
 
 **A. SYSTEM HEALTH**
 
@@ -122,164 +122,158 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 6. Reliability history (Reliability Monitor data, stability index)
 7. Performance snapshot (CPU / RAM / disk latency / network, 30 sec)
 8. Boot / logon performance (what slows startup)
-9. Slow sign-out / logoff / shutdown / black screen / lag diagnostics
-10. Hardware health (SMART, disk errors, driver problems, battery, temps)
-11. Pending reboot - detailed (CBS, WU, file renames, rename/join, ConfigMgr)
-12. Device join / Entra ID / Workplace join / PIN status (dsregcmd)
-13. Patch & reboot history report (HTML)
-14. [!] Enable crash dumps (Automatic memory dump)
+9. Hardware health (SMART, disk errors, driver problems, battery, temps)
+10. Pending reboot - detailed (CBS, WU, file renames, rename/join, ConfigMgr)
+11. Device join / Entra ID / Workplace join / PIN status (dsregcmd)
+12. Patch & reboot history report (HTML)
+13. [!] Enable crash dumps (Automatic memory dump)
 
 **C. WINDOWS UPDATE / UPGRADE / REPAIR**
 
-15. Windows Update - list available updates + history (optional install)
-16. [!] Reset Windows Update components (Windows 10/11)
-17. [!] Repair Windows Update (Windows Server 2016+)
-18. [!] System file repair (DISM RestoreHealth + SFC)
-19. Windows 11 upgrade troubleshooter (status, SetupDiag, logs...)
-20. Microsoft SetupDiag - why did an upgrade fail? (downloads from Microsoft)
-21. System Reserved / EFI partition - check & free space
+14. Windows Update - list available updates + history (optional install)
+15. [!] Reset Windows Update components (Windows 10/11)
+16. [!] Repair Windows Update (Windows Server 2016+)
+17. [!] System file repair (DISM RestoreHealth + SFC)
+18. Windows 11 upgrade troubleshooter (status, SetupDiag, logs...)
+19. Microsoft SetupDiag - why did an upgrade fail? (downloads from Microsoft)
+20. System Reserved / EFI partition - check & free space
 
 **D. DISK SPACE**
 
-22. Disk space check - what can be reclaimed (read-only)
-23. [!] Disk space cleanup (workstation / general)
-24. Disk space analyze & resolve - servers (dry run by default)
-25. Find largest folders
-26. Event log folder bloat (Archive-*.evtx) - check / clean up
-27. [!] Clear Dell SupportAssist remediation cache
+21. Disk space check - what can be reclaimed (read-only)
+22. [!] Disk space cleanup (workstation / general)
+23. Disk space analyze & resolve - servers (dry run by default)
+24. Find largest folders
+25. Event log folder bloat (Archive-*.evtx) - check / clean up
+26. [!] Clear Dell SupportAssist remediation cache
 
 **E. NETWORK / DHCP / DNS / SHARES**
 
-28. What is my public IP? (IPv4/IPv6, ISP, location, proxy check)
-29. Internet speed test (built-in Cloudflare test or Ookla Speedtest CLI)
-30. Ping / port reachability test (optional live monitor)
-31. Advanced network diagnostics (DNS per server, loss, MTU, tracert, proxy, Wi-Fi)
-32. Network connections & listening ports by process
-33. SMTP / scan-to-email relay test + SPF/DMARC/MX lookup
-34. [!] Network quick fixes (flush DNS / renew / Winsock + TCP/IP reset)
-35. DHCP Event 1059 / DC authorization diagnostics
-36. DHCP mobile device lease audit / cleanup
-37. DNS server forwarders - check / set
-38. File shares, sessions and open files (close locked files)
+27. What is my public IP? (IPv4/IPv6, ISP, location, proxy check)
+28. Internet speed test (built-in Cloudflare test or Ookla Speedtest CLI)
+29. Ping / port reachability test (optional live monitor)
+30. Advanced network diagnostics (DNS per server, loss, MTU, tracert, proxy, Wi-Fi)
+31. Wi-Fi deep diagnostics (signal, channels & congestion, neighbors, roaming, driver, drops)
+32. Wi-Fi live monitor (signal / roams / channel changes / drops / lag over time)
+33. Network connections & listening ports by process
+34. SMTP / scan-to-email relay test + SPF/DMARC/MX lookup
+35. [!] Network quick fixes (flush DNS / renew / Winsock + TCP/IP reset)
+36. DHCP Event 1059 / DC authorization diagnostics
+37. DHCP mobile device lease audit / cleanup
+38. DNS server forwarders - check / set
+39. File shares, sessions and open files (close locked files)
 
 **F. REMOTE DESKTOP (RDP / RDS)**
 
-39. RDP / RDS server health (services, sessions, licensing, Sept 2026 update hang)
-40. [!] RDS fix - September 2026 update hang (restart / OOB KB / override)
-41. [!] RDP clipboard/drive "redirection" popup - apply / remove stopgap
+40. RDP / RDS server health (services, sessions, licensing, Sept 2026 update hang)
+41. [!] RDS fix - September 2026 update hang (restart / OOB KB / override)
+42. [!] RDP clipboard/drive "redirection" popup - apply / remove stopgap
 
 **G. HYPER-V / VIRTUAL MACHINES**
 
-42. HOST: VM hang / host-side diagnostics (pick a VM)
-43. HOST: Guest Status (Hyper-V) failure diagnostics
-44. HOST: capture evidence from a HUNG VM (before Turn Off)
-45. HOST: integration services (Time Sync, VSS, Heartbeat) check / enable
-46. GUEST: VM hang diagnostics (run inside the VM)
-47. GUEST: hang timeline / NMI crash-dump readiness
+43. HOST: VM hang / host-side diagnostics (pick a VM)
+44. HOST: Guest Status (Hyper-V) failure diagnostics
+45. HOST: capture evidence from a HUNG VM (before Turn Off)
+46. HOST: integration services (Time Sync, VSS, Heartbeat) check / enable
+47. GUEST: VM hang diagnostics (run inside the VM)
+48. GUEST: hang timeline / NMI crash-dump readiness
 
 **H. SERVER / ACTIVE DIRECTORY / BACKUP**
 
-48. Server roles & key services (SQL, IIS, Exchange, QuickBooks, Sage, backup...)
-49. Windows server audit (roles, shares, software, IIS, SMTP) HTML
-50. Active Directory / DC health (dcdiag, repadmin, FSMO, SYSVOL/DFSR)
-51. Group Policy audit (HTML + CSV)
-52. Group Policy results for this machine (gpresult HTML + GP errors)
-53. AD users - true last logon (all DCs)
-54. Export BitLocker recovery keys from AD
-55. Export LAPS passwords from AD (legacy + Windows LAPS)
-56. Azure AD / Entra Connect Sync (ADSync) status + self-heal
-57. Backup / VSS health (VSS writers, shadow storage, WSB, backup agents)
-58. Folder permissions (ACL) export
-59. SharePoint/OneDrive migration - bad names, long paths, QB/Access/PST blockers
+49. Server roles & key services (SQL, IIS, Exchange, QuickBooks, Sage, backup...)
+50. Windows server audit (roles, shares, software, IIS, SMTP) HTML
+51. Active Directory / DC health (dcdiag, repadmin, FSMO, SYSVOL/DFSR)
+52. Group Policy audit (HTML + CSV)
+53. Group Policy results for this machine (gpresult HTML + GP errors)
+54. AD users - true last logon (all DCs)
+55. Export BitLocker recovery keys from AD
+56. Export LAPS passwords from AD (legacy + Windows LAPS)
+57. Azure AD / Entra Connect Sync (ADSync) status + self-heal
+58. Backup / VSS health (VSS writers, shadow storage, WSB, backup agents)
+59. Folder permissions (ACL) export
+60. SharePoint/OneDrive migration - bad names, long paths, QB/Access/PST blockers
 
 **I. SECURITY / INCIDENT RESPONSE / RMM**
 
-60. Security posture (AV, firewall, BitLocker, TPM, SMBv1, admins, certs, activation)
-61. Sysinternals Autoruns - startup/persistence report (unsigned flagged)
-62. Sysinternals Sigcheck - unsigned executables in user/ProgramData folders
-63. N-central compromise IOC hunt
-64. Unknown / adware program hunt (Prefetch, browser notifications, startup)
-65. Incident response log collection for a time window (4688, PS, Defender, WMI)
-66. N-able Take Control / agent service diagnostics
+61. Security posture (AV, firewall, BitLocker, TPM, SMBv1, admins, certs, activation)
+62. Sysinternals Autoruns - startup/persistence report (unsigned flagged)
+63. Sysinternals Sigcheck - unsigned executables in user/ProgramData folders
+64. N-central compromise IOC hunt
+65. Unknown / adware program hunt (Prefetch, browser notifications, startup)
+66. Incident response log collection for a time window (4688, PS, Defender, WMI)
+67. N-able Take Control / agent service diagnostics
 
 **J. SOFTWARE / INVENTORY / USERS**
 
-67. Installed software inventory (CSV)
-68. User profiles - size, last use (stale / temp profiles)
-69. [!] Rebuild a corrupted user profile (back up, reset, restore data)
-70. [!] Folder redirection - which GPO/group applies it, point folders back to local (copy data)
-71. Migration inventory (full machine discovery)
-72. Install provenance for a program (when/how/by whom)
-73. .NET / Node.js / Java / Python / VC++ runtime versions
-74. Citrix Workspace app - install state
-75. Time sync (w32time) check / resync
+68. Installed software inventory (CSV)
+69. User profiles - size, last use (stale / temp profiles)
+70. Migration inventory (full machine discovery)
+71. Install provenance for a program (when/how/by whom)
+72. .NET / Node.js / Java / Python / VC++ runtime versions
+73. Citrix Workspace app - install state
+74. Time sync (w32time) check / resync
 
 **K. QUICK FIXES**
 
-76. [!] Print spooler reset (clear stuck jobs)
-77. Black screen / stuck sign-in after Windows Update (AppReadiness, Explorer) - diagnose + fix
-78. [!] Microsoft Teams cache clear (classic + new)
-79. [!] Office quick / online repair
-80. Outlook stuck on "Loading Profile" - diagnose + fix
-81. [!] OneDrive reset
-82. OneDrive "can't open file" errors (0x8007007A / cloud provider) - diagnose + repair
-83. [!] Repair .zip association / reset default browser (per user)
-84. [!] Remove bloatware (OEM + consumer Store apps)
-85. [!] Power settings - never sleep / hibernate
-86. [!] Windows Update driver updates - block / allow (use OEM driver tool instead)
+75. [!] Print spooler reset (clear stuck jobs)
+76. [!] Microsoft Teams cache clear (classic + new)
+77. [!] Office quick / online repair
+78. [!] OneDrive reset
+79. [!] Repair .zip association / reset default browser (per user)
+80. [!] Remove bloatware (OEM + consumer Store apps)
+81. [!] Power settings - never sleep / hibernate
 
 **L. SOFTWARE DEPLOYMENT (downloads to C:\temp\Tools)**
 
-87. [!] Install common apps with Ninite (Chrome, Firefox, 7-Zip, Zoom...)
-88. [!] Install apps silently from the vendor (Chrome/Firefox/Edge MSI, Zoom, Teams, OneDrive)
-89. [!] Install Microsoft 365 Apps / Office (ODT, removes OEM Office first)
-90. [!] Remove ALL existing Office (OEM preinstalls, extra languages, MSI)
+82. [!] Install common apps with Ninite (Chrome, Firefox, 7-Zip, Zoom...)
+83. [!] Install apps silently from the vendor (Chrome/Firefox/Edge MSI, Zoom, Teams, OneDrive)
+84. [!] Install Microsoft 365 Apps / Office (ODT, removes OEM Office first)
+85. [!] Remove ALL existing Office (OEM preinstalls, extra languages, MSI)
 
 **M. SYSINTERNALS / NIRSOFT / MICROSOFT TOOLS (downloaded on demand)**
 
-91. NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimes, LastActivity, USB
-92. Sysinternals Handle - what is locking this file?
-93. Sysinternals ProcDump - dump a hung / crashing program
-94. Download & launch a GUI tool (ProcExp, ProcMon, Autoruns, TCPView, ShellExView...)
-95. Microsoft TSS - official support log collection (SDP)
+86. NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimes, LastActivity, USB
+87. Sysinternals Handle - what is locking this file?
+88. Sysinternals ProcDump - dump a hung / crashing program
+89. Download & launch a GUI tool (ProcExp, ProcMon, Autoruns, TCPView, ShellExView...)
+90. Microsoft TSS - official support log collection (SDP)
 
 **N. MICROSOFT 365 (Exchange Online / Entra ID / Intune)**
 
-96. M365: set admin account & client tenant (GDAP / partner) for the options below
-97. M365: install / repair PowerShell modules (EXO, Graph, SPO, Teams; EXO 3.7.1 conflict fix)
-98. M365: compromised account AUDIT (rules, forwarding, sign-ins, MFA, apps - HTML)
-99. [!] M365: CONTAIN compromised account (block, revoke, reset, rules, forwarding, unblock send)
-100. M365: inbox rules - one or all mailboxes, suspicious flagged, WHEN created (audit log)
-101. M365: forwarding audit (mailbox forwarding, external forward rules, tenant policy)
-102. M365: message trace (sender / recipient / subject, up to 90 days, delivery detail)
-103. M365: quarantine - find & release messages (shows Spam / Bulk / Phish reason)
-104. M365: why is this sender filtered? (rules, BCL vs SCL, TABL, impersonation) + fixes
-105. M365: SPF / DKIM / DMARC / MX check for all domains (lookup count, DKIM status)
-106. M365: Direct Send / connectors (scanner connector, RejectDirectSend)
-107. M365: top inbound sender / outbound recipient domains (90 days)
-108. M365: mailbox permissions (Full Access / Send As / Send on Behalf)
-109. [!] M365: calendar permissions - grant / view / remove (bulk, adds to their Outlook)
-110. M365: mailbox sizes, quotas, archive status
-111. M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe
-112. M365: unified audit log search (user / operation / IP, up to 180 days)
-113. M365: sign-in log for a user (IPs, countries, legacy protocols)
-114. M365: MFA registration report (admins without MFA flagged)
-115. M365: stale / never-used / guest / disabled-but-licensed accounts
-116. M365: admin role members (Global Admin count check)
-117. M365: license report (subscriptions, who has what, wasted licenses)
-118. [!] M365: assign / remove licenses (users, group-based, remove direct)
-119. [!] M365: create a new user (random temp password, license, groups)
-120. M365: app consent audit + admin-consent link (risky app permissions)
-121. M365: app registration secrets / certificates expiring soon
-122. M365: Intune devices (compliance, stale, BitLocker key missing in Entra)
-123. M365: OneDrive folder sharing / permissions for a user
-124. [!] M365: exclude a SharePoint site from a retention policy
-125. M365: tenant hardening audit (legacy auth, forwarding, audit log, Defender, alerts)
-126. M365: security posture audit (134 checks, license-aware, client HTML report)
-127. M365: remediation plan from a posture audit (technical + client summary)
-128. [!] M365: create app registration for unattended automation (cert auth)
-129. [!] THIS PC: force a Hybrid Entra ID join attempt
-130. [!] THIS PC: back up BitLocker recovery key to Entra ID
+91. M365: set admin account & client tenant (GDAP / partner) for the options below
+92. M365: install / repair PowerShell modules (EXO, Graph, SPO, Teams; EXO 3.7.1 conflict fix)
+93. M365: compromised account AUDIT (rules, forwarding, sign-ins, MFA, apps - HTML)
+94. [!] M365: CONTAIN compromised account (block, revoke, reset, rules, forwarding, unblock send)
+95. M365: inbox rules - one or all mailboxes, suspicious flagged, WHEN created (audit log)
+96. M365: forwarding audit (mailbox forwarding, external forward rules, tenant policy)
+97. M365: message trace (sender / recipient / subject, up to 90 days, delivery detail)
+98. M365: quarantine - find & release messages (shows Spam / Bulk / Phish reason)
+99. M365: why is this sender filtered? (rules, BCL vs SCL, TABL, impersonation) + fixes
+100. M365: SPF / DKIM / DMARC / MX check for all domains (lookup count, DKIM status)
+101. M365: Direct Send / connectors (scanner connector, RejectDirectSend)
+102. M365: top inbound sender / outbound recipient domains (90 days)
+103. M365: mailbox permissions (Full Access / Send As / Send on Behalf)
+104. M365: mailbox sizes, quotas, archive status
+105. M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe
+106. M365: unified audit log search (user / operation / IP, up to 180 days)
+107. M365: sign-in log for a user (IPs, countries, legacy protocols)
+108. M365: MFA registration report (admins without MFA flagged)
+109. M365: stale / never-used / guest / disabled-but-licensed accounts
+110. M365: admin role members (Global Admin count check)
+111. M365: license report (subscriptions, who has what, wasted licenses)
+112. [!] M365: assign / remove licenses (users, group-based, remove direct)
+113. [!] M365: create a new user (random temp password, license, groups)
+114. M365: app consent audit + admin-consent link (risky app permissions)
+115. M365: app registration secrets / certificates expiring soon
+116. M365: Intune devices (compliance, stale, BitLocker key missing in Entra)
+117. M365: OneDrive folder sharing / permissions for a user
+118. [!] M365: exclude a SharePoint site from a retention policy
+119. M365: tenant hardening audit (legacy auth, forwarding, audit log, Defender, alerts)
+120. M365: security posture audit (134 checks, license-aware, client HTML report)
+121. M365: remediation plan from a posture audit (technical + client summary)
+122. [!] M365: create app registration for unattended automation (cert auth)
+123. [!] THIS PC: force a Hybrid Entra ID join attempt
+124. [!] THIS PC: back up BitLocker recovery key to Entra ID
 
 </details>
 <!-- AUTO-OPTIONS:END -->
@@ -331,137 +325,139 @@ Legend: **[!]** = changes the machine (asks first) | **slow** = can take several
 | 28 | Internet speed test | Built-in test against Cloudflare's speed servers (nothing to download), or the Ookla Speedtest CLI (dl). Keeps a history per machine in `C:\temp\Network\SpeedTest_History.csv` |
 | 29 | Ping / port reachability test | Optional live monitor that logs up/down changes |
 | 30 | Advanced network diagnostics | DNS per server, packet loss, path MTU, tracert, proxy, Wi-Fi report. slow |
-| 31 | Network connections & listening ports by process | |
-| 32 | SMTP / scan-to-email relay test + SPF / DMARC / MX lookup | For copier / scanner mail problems |
-| 33 | **[!]** Network quick fixes | Flush DNS / DHCP renew / Winsock + TCP/IP reset |
-| 34 | DHCP Event 1059 / DC authorization diagnostics | |
-| 35 | DHCP mobile device lease audit / cleanup | Audit only by default |
-| 36 | DNS server forwarders - check / set | |
-| 37 | File shares, sessions and open files | Can force-close locked files |
+| 31 | Wi-Fi deep diagnostics | Signal in dBm, link rate, band, every nearby AP (fresh scan) with channel, client count and **channel utilization**. 2.4 GHz overlap scoring on 1/6/11, 5 GHz congestion per 80 MHz block, DFS warnings, sticky-client and wrong-band detection, driver age, adapter power saving, 7-day disconnect reasons, gateway loss/lag. Plain-English findings with the best channel to move to. Optional fix: adapter power saving off |
+| 32 | Wi-Fi live monitor | Samples signal, AP, channel, link rate and gateway/internet ping every few seconds. Flags roams, channel changes (DFS/auto-channel), disconnects, loss and lag. CSV log - run it while the problem is happening |
+| 33 | Network connections & listening ports by process | |
+| 34 | SMTP / scan-to-email relay test + SPF / DMARC / MX lookup | For copier / scanner mail problems |
+| 35 | **[!]** Network quick fixes | Flush DNS / DHCP renew / Winsock + TCP/IP reset |
+| 36 | DHCP Event 1059 / DC authorization diagnostics | |
+| 37 | DHCP mobile device lease audit / cleanup | Audit only by default |
+| 38 | DNS server forwarders - check / set | |
+| 39 | File shares, sessions and open files | Can force-close locked files |
 
 ### F. Remote Desktop (RDP / RDS)
 | # | Option | Notes |
 |---|---|---|
-| 38 | RDP / RDS server health | Services, sessions, licensing, September 2026 update hang |
-| 39 | **[!]** RDS fix - September 2026 update hang | Restart services / install the fix update / registry workaround (backed up first) |
-| 40 | **[!]** RDP clipboard / drive "redirection" popup | Apply or remove the `RedirectionWarningDialogVersion` stopgap |
+| 40 | RDP / RDS server health | Services, sessions, licensing, September 2026 update hang |
+| 41 | **[!]** RDS fix - September 2026 update hang | Restart services / install the fix update / registry workaround (backed up first) |
+| 42 | **[!]** RDP clipboard / drive "redirection" popup | Apply or remove the `RedirectionWarningDialogVersion` stopgap |
 
 ### G. Hyper-V / virtual machines
 | # | Option | Notes |
 |---|---|---|
-| 41 | HOST: VM hang / host-side diagnostics | Lists the VMs to pick from |
-| 42 | HOST: Guest Status (Hyper-V) failure diagnostics | |
-| 43 | HOST: capture evidence from a hung VM (before Turn Off) | Console screenshot, WinRM checks, optional NMI |
-| 44 | HOST: integration services (Time Sync, VSS, Heartbeat) check / enable | |
-| 45 | GUEST: VM hang diagnostics (run inside the VM) | slow |
-| 46 | GUEST: hang timeline / NMI crash-dump readiness | |
+| 43 | HOST: VM hang / host-side diagnostics | Lists the VMs to pick from |
+| 44 | HOST: Guest Status (Hyper-V) failure diagnostics | |
+| 45 | HOST: capture evidence from a hung VM (before Turn Off) | Console screenshot, WinRM checks, optional NMI |
+| 46 | HOST: integration services (Time Sync, VSS, Heartbeat) check / enable | |
+| 47 | GUEST: VM hang diagnostics (run inside the VM) | slow |
+| 48 | GUEST: hang timeline / NMI crash-dump readiness | |
 
 ### H. Server / Active Directory / backup
 | # | Option | Notes |
 |---|---|---|
-| 47 | Server roles & key services | SQL, IIS, Exchange, QuickBooks, Sage, backup agents |
-| 48 | Windows server audit | Roles, shares, software, IIS, SMTP. HTML. slow |
-| 49 | Active Directory / DC health | dcdiag, repadmin, FSMO, SYSVOL / DFSR |
-| 50 | Group Policy audit | HTML + CSV |
-| 51 | Group Policy results for this machine | gpresult HTML + Group Policy errors |
-| 52 | AD users - true last logon | Queries every DC. slow |
-| 53 | Export BitLocker recovery keys from AD | **Secret output - handle securely** |
-| 54 | Export LAPS passwords from AD (legacy + Windows LAPS) | **Secret output - handle securely** |
-| 55 | Azure AD / Entra Connect Sync (ADSync) status | Offers to restart the service if it's stopped |
-| 56 | Backup / VSS health | VSS writers, shadow storage, Windows Server Backup, backup agents |
-| 57 | Folder permissions (ACL) export | |
-| 58 | SharePoint / OneDrive migration check | Bad names, long paths, QuickBooks / Access / PST blockers. Optional auto-rename |
+| 49 | Server roles & key services | SQL, IIS, Exchange, QuickBooks, Sage, backup agents |
+| 50 | Windows server audit | Roles, shares, software, IIS, SMTP. HTML. slow |
+| 51 | Active Directory / DC health | dcdiag, repadmin, FSMO, SYSVOL / DFSR |
+| 52 | Group Policy audit | HTML + CSV |
+| 53 | Group Policy results for this machine | gpresult HTML + Group Policy errors |
+| 54 | AD users - true last logon | Queries every DC. slow |
+| 55 | Export BitLocker recovery keys from AD | **Secret output - handle securely** |
+| 56 | Export LAPS passwords from AD (legacy + Windows LAPS) | **Secret output - handle securely** |
+| 57 | Azure AD / Entra Connect Sync (ADSync) status | Offers to restart the service if it's stopped |
+| 58 | Backup / VSS health | VSS writers, shadow storage, Windows Server Backup, backup agents |
+| 59 | Folder permissions (ACL) export | |
+| 60 | SharePoint / OneDrive migration check | Bad names, long paths, QuickBooks / Access / PST blockers. Optional auto-rename |
 
 ### I. Security / incident response / RMM
 | # | Option | Notes |
 |---|---|---|
-| 59 | Security posture | AV, firewall, BitLocker, TPM, Secure Boot, SMBv1, RDP NLA, local admins, expiring certificates, activation |
-| 60 | Sysinternals Autoruns - startup / persistence report | Unsigned items flagged. dl |
-| 61 | Sysinternals Sigcheck - unsigned executables in user / ProgramData folders | dl |
-| 62 | N-central compromise IOC hunt | |
-| 63 | Unknown / adware program hunt | Prefetch, browser notification permissions, startup, scheduled tasks |
-| 64 | Incident response log collection for a time window | 4688, PowerShell, Defender, WMI, logons. Zipped. slow |
-| 65 | N-able Take Control / agent service diagnostics | Local or remote |
+| 61 | Security posture | AV, firewall, BitLocker, TPM, Secure Boot, SMBv1, RDP NLA, local admins, expiring certificates, activation |
+| 62 | Sysinternals Autoruns - startup / persistence report | Unsigned items flagged. dl |
+| 63 | Sysinternals Sigcheck - unsigned executables in user / ProgramData folders | dl |
+| 64 | N-central compromise IOC hunt | |
+| 65 | Unknown / adware program hunt | Prefetch, browser notification permissions, startup, scheduled tasks |
+| 66 | Incident response log collection for a time window | 4688, PowerShell, Defender, WMI, logons. Zipped. slow |
+| 67 | N-able Take Control / agent service diagnostics | Local or remote |
 
 ### J. Software / inventory / users
 | # | Option | Notes |
 |---|---|---|
-| 66 | Installed software inventory | CSV |
-| 67 | User profiles - size, last use | slow |
-| 68 | Migration inventory (full machine discovery) | slow |
-| 69 | Install provenance for a program (when / how / by whom) | |
-| 70 | .NET / Node.js / Java / Python / VC++ runtime versions | |
-| 71 | Citrix Workspace app - install state | |
-| 72 | Time sync (w32time) check / resync | |
+| 68 | Installed software inventory | CSV |
+| 69 | User profiles - size, last use | slow |
+| 70 | Migration inventory (full machine discovery) | slow |
+| 71 | Install provenance for a program (when / how / by whom) | |
+| 72 | .NET / Node.js / Java / Python / VC++ runtime versions | |
+| 73 | Citrix Workspace app - install state | |
+| 74 | Time sync (w32time) check / resync | |
 
 ### K. Quick fixes
 | # | Option |
 |---|---|
-| 73 | **[!]** Print spooler reset (clear stuck jobs) |
-| 74 | **[!]** Microsoft Teams cache clear (classic + new) |
-| 75 | **[!]** Office quick / online repair |
-| 76 | **[!]** OneDrive reset |
-| 77 | **[!]** Repair `.zip` association / reset default browser (per user) |
-| 78 | **[!]** Remove bloatware (OEM + consumer Store apps) |
-| 79 | **[!]** Power settings - never sleep / hibernate |
+| 75 | **[!]** Print spooler reset (clear stuck jobs) |
+| 76 | **[!]** Microsoft Teams cache clear (classic + new) |
+| 77 | **[!]** Office quick / online repair |
+| 78 | **[!]** OneDrive reset |
+| 79 | **[!]** Repair `.zip` association / reset default browser (per user) |
+| 80 | **[!]** Remove bloatware (OEM + consumer Store apps) |
+| 81 | **[!]** Power settings - never sleep / hibernate |
 
 ### L. Software deployment (downloads to `C:\temp\Tools`)
 | # | Option | Notes |
 |---|---|---|
-| 80 | **[!]** Install common apps with Ninite | Chrome, Firefox, 7-Zip, Zoom, Notepad++ and more. dl |
-| 81 | **[!]** Install apps silently from the vendor | Chrome / Firefox / Edge enterprise MSI, Zoom, Teams, OneDrive. dl |
-| 82 | **[!]** Install Microsoft 365 Apps / Office (Office Deployment Tool) | Removes OEM Office first. Turns on Shared Computer Activation for RDS. dl |
-| 83 | **[!]** Remove ALL existing Office | OEM preinstalls, extra languages, MSI Office. dl |
+| 82 | **[!]** Install common apps with Ninite | Chrome, Firefox, 7-Zip, Zoom, Notepad++ and more. dl |
+| 83 | **[!]** Install apps silently from the vendor | Chrome / Firefox / Edge enterprise MSI, Zoom, Teams, OneDrive. dl |
+| 84 | **[!]** Install Microsoft 365 Apps / Office (Office Deployment Tool) | Removes OEM Office first. Turns on Shared Computer Activation for RDS. dl |
+| 85 | **[!]** Remove ALL existing Office | OEM preinstalls, extra languages, MSI Office. dl |
 
 ### M. Sysinternals / NirSoft / Microsoft tools (downloaded on demand)
 | # | Option | Notes |
 |---|---|---|
-| 84 | NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimesView, LastActivityView, USBDeview, DriverView | HTML. dl |
-| 85 | Sysinternals Handle - what is locking this file? | dl |
-| 86 | Sysinternals ProcDump - dump a hung or crashing program | dl |
-| 87 | Download & launch a GUI tool | Process Explorer, Process Monitor, Autoruns, TCPView, RAMMap, ShellExView, CurrPorts... dl |
-| 88 | Microsoft TSS - official support log collection (SDP) | dl |
+| 86 | NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimesView, LastActivityView, USBDeview, DriverView | HTML. dl |
+| 87 | Sysinternals Handle - what is locking this file? | dl |
+| 88 | Sysinternals ProcDump - dump a hung or crashing program | dl |
+| 89 | Download & launch a GUI tool | Process Explorer, Process Monitor, Autoruns, TCPView, RAMMap, ShellExView, CurrPorts... dl |
+| 90 | Microsoft TSS - official support log collection (SDP) | dl |
 
 
 ### N. Microsoft 365 (Exchange Online / Entra ID / Intune)
-Each option runs in its own PowerShell window and signs in only to the services it needs, so Exchange Online and Microsoft Graph never conflict. Set the admin account / client tenant once with **89** and every option reuses it, including partner / GDAP access to client tenants. Graph calls use `Invoke-MgGraphRequest`, so most options only need the `Microsoft.Graph.Authentication` module.
+Each option runs in its own PowerShell window and signs in only to the services it needs, so Exchange Online and Microsoft Graph never conflict. Set the admin account / client tenant once with **91** and every option reuses it, including partner / GDAP access to client tenants. Graph calls use `Invoke-MgGraphRequest`, so most options only need the `Microsoft.Graph.Authentication` module.
 
 | # | Option | Notes |
 |---|---|---|
-| 89 | Set admin account & client tenant | Admin UPN, `DelegatedOrganization` (Exchange) and tenant (Graph) |
-| 90 | Install / repair PowerShell modules | EXO, Graph, SPO, Teams. Also installs EXO 3.7.1 side by side to fix the EXO + Graph "method not found" conflict |
-| 91 | Compromised account **audit** | Rules, forwarding, sign-ins and risk, MFA methods, delegates, OAuth apps, recent sends, admin roles. HTML report |
-| 92 | **[!]** **Contain** a compromised account | Step 1 (Entra): block sign-in, revoke sessions, reset password (cloud or on-prem AD), review MFA methods and app consents. Step 2 (Exchange): remove forwarding, disable malicious rules, lift the outbound-spam send restriction, check delegates |
-| 93 | Inbox rules - one or all mailboxes | Flags forward / delete / hide rules, and uses the **audit log to show when each rule was created** (useful for proving a "new rules" alert is wrong) |
-| 94 | Forwarding audit | Mailbox forwarding, external-forwarding rules, tenant auto-forward policy |
-| 95 | Message trace | Sender / recipient / subject, up to 90 days (10-day chunks), delivery detail |
-| 96 | Quarantine - find & release | Shows *why*: Spam / **Bulk (BCL)** / Phish / Malware. Never releases malware or high-confidence phish |
-| 97 | Why is this sender filtered? | Mail flow rules, BCL vs SCL, Tenant Allow/Block List, impersonation exclusions. One-step fixes: allow sender, exclude domain from impersonation, add `BulkStamping=0` to a rule |
-| 98 | SPF / DKIM / DMARC / MX check | Every accepted domain. Flags SPF lookup count, multiple SPF records, `+all`, DMARC `p=none`, missing or disabled M365 DKIM |
-| 99 | Direct Send / connectors | Lists connectors. **[!]** Creates an IP-restricted connector for scanners and apps, and turns RejectDirectSend on or off |
-| 100 | Top inbound / outbound domains | 90 days. Useful for pre-whitelisting top senders before a mail-filter cut-over |
-| 101 | Mailbox permissions | Full Access / Send As / Send on Behalf |
-| 102 | Mailbox sizes, quotas, archive | |
-| 103 | Mobile devices for a user | Lost phone or iPad: last sync. **[!]** Account-only wipe, block, or full wipe |
-| 104 | Unified audit log search | User / operation / free text (IP, file name...), up to 180 days |
-| 105 | Sign-in log for a user | IPs, countries, legacy-protocol sign-ins (needs Entra ID P1) |
-| 106 | MFA registration report | Admins without MFA flagged. Falls back to a per-user lookup without P1 |
-| 107 | Stale / never-used / guest / disabled-but-licensed accounts | |
-| 108 | Admin role members | Global Admin count check |
-| 109 | License report | Subscriptions, who has what, licenses wasted on disabled users. Uses Microsoft's friendly-name list |
-| 110 | **[!]** Assign / remove licenses | Users (sets usage location), group-based licensing, remove direct assignments |
-| 111 | **[!]** Create a new user | Random temporary password, license, groups |
-| 112 | App consent audit + admin-consent link | User-consent setting, admin-consent workflow, risky delegated permissions, a ready-made tenant-wide consent URL |
-| 113 | App registration secrets / certificates expiring | Catches app secrets that break integrations (room panels, scanners, backup apps) when they expire |
-| 114 | Intune devices | Compliance, stale devices, **BitLocker key missing in Entra** |
-| 115 | OneDrive folder sharing / permissions for a user | Flags "Anyone" links |
-| 116 | **[!]** Exclude a SharePoint site from a retention policy | Security & Compliance PowerShell |
-| 117 | Tenant hardening audit | Legacy auth, forwarding, audit log, Defender policies, alert policies, admins |
-| 118 | Security posture audit | 134 checks, license-aware, client-ready HTML + JSON |
-| 119 | Remediation plan from a posture audit | Technical HTML (exact commands) + plain-English client summary |
-| 120 | **[!]** Create an app registration for unattended automation | Certificate auth, admin consent granted in code |
-| 121 | **[!]** THIS PC: force a Hybrid Entra ID join attempt | gpupdate + Automatic-Device-Join task, with troubleshooting hints |
-| 122 | **[!]** THIS PC: back up the BitLocker recovery key to Entra ID | |
+| 91 | Set admin account & client tenant | Admin UPN, `DelegatedOrganization` (Exchange) and tenant (Graph) |
+| 92 | Install / repair PowerShell modules | EXO, Graph, SPO, Teams. Also installs EXO 3.7.1 side by side to fix the EXO + Graph "method not found" conflict |
+| 93 | Compromised account **audit** | Rules, forwarding, sign-ins and risk, MFA methods, delegates, OAuth apps, recent sends, admin roles. HTML report |
+| 94 | **[!]** **Contain** a compromised account | Step 1 (Entra): block sign-in, revoke sessions, reset password (cloud or on-prem AD), review MFA methods and app consents. Step 2 (Exchange): remove forwarding, disable malicious rules, lift the outbound-spam send restriction, check delegates |
+| 95 | Inbox rules - one or all mailboxes | Flags forward / delete / hide rules, and uses the **audit log to show when each rule was created** (useful for proving a "new rules" alert is wrong) |
+| 96 | Forwarding audit | Mailbox forwarding, external-forwarding rules, tenant auto-forward policy |
+| 97 | Message trace | Sender / recipient / subject, up to 90 days (10-day chunks), delivery detail |
+| 98 | Quarantine - find & release | Shows *why*: Spam / **Bulk (BCL)** / Phish / Malware. Never releases malware or high-confidence phish |
+| 99 | Why is this sender filtered? | Mail flow rules, BCL vs SCL, Tenant Allow/Block List, impersonation exclusions. One-step fixes: allow sender, exclude domain from impersonation, add `BulkStamping=0` to a rule |
+| 100 | SPF / DKIM / DMARC / MX check | Every accepted domain. Flags SPF lookup count, multiple SPF records, `+all`, DMARC `p=none`, missing or disabled M365 DKIM |
+| 101 | Direct Send / connectors | Lists connectors. **[!]** Creates an IP-restricted connector for scanners and apps, and turns RejectDirectSend on or off |
+| 102 | Top inbound / outbound domains | 90 days. Useful for pre-whitelisting top senders before a mail-filter cut-over |
+| 103 | Mailbox permissions | Full Access / Send As / Send on Behalf |
+| 104 | Mailbox sizes, quotas, archive | |
+| 105 | Mobile devices for a user | Lost phone or iPad: last sync. **[!]** Account-only wipe, block, or full wipe |
+| 106 | Unified audit log search | User / operation / free text (IP, file name...), up to 180 days |
+| 107 | Sign-in log for a user | IPs, countries, legacy-protocol sign-ins (needs Entra ID P1) |
+| 108 | MFA registration report | Admins without MFA flagged. Falls back to a per-user lookup without P1 |
+| 109 | Stale / never-used / guest / disabled-but-licensed accounts | |
+| 110 | Admin role members | Global Admin count check |
+| 111 | License report | Subscriptions, who has what, licenses wasted on disabled users. Uses Microsoft's friendly-name list |
+| 112 | **[!]** Assign / remove licenses | Users (sets usage location), group-based licensing, remove direct assignments |
+| 113 | **[!]** Create a new user | Random temporary password, license, groups |
+| 114 | App consent audit + admin-consent link | User-consent setting, admin-consent workflow, risky delegated permissions, a ready-made tenant-wide consent URL |
+| 115 | App registration secrets / certificates expiring | Catches app secrets that break integrations (room panels, scanners, backup apps) when they expire |
+| 116 | Intune devices | Compliance, stale devices, **BitLocker key missing in Entra** |
+| 117 | OneDrive folder sharing / permissions for a user | Flags "Anyone" links |
+| 118 | **[!]** Exclude a SharePoint site from a retention policy | Security & Compliance PowerShell |
+| 119 | Tenant hardening audit | Legacy auth, forwarding, audit log, Defender policies, alert policies, admins |
+| 120 | Security posture audit | 134 checks, license-aware, client-ready HTML + JSON |
+| 121 | Remediation plan from a posture audit | Technical HTML (exact commands) + plain-English client summary |
+| 122 | **[!]** Create an app registration for unattended automation | Certificate auth, admin consent granted in code |
+| 123 | **[!]** THIS PC: force a Hybrid Entra ID join attempt | gpupdate + Automatic-Device-Join task, with troubleshooting hints |
+| 124 | **[!]** THIS PC: back up the BitLocker recovery key to Entra ID | |
 
 ---
 
@@ -522,8 +518,8 @@ C:\temp\
 +-- Tools\            downloaded tools (Sysinternals, NirSoft, Ninite, Office ODT, TSS, SetupDiag)
 ```
 
-> **Secret output:** options 53 (BitLocker keys) and 54 (LAPS passwords) write secrets to disk.
-> Options 92 and 111 show a new temporary password **once** on screen; it is never written to disk.
+> **Secret output:** options 55 (BitLocker keys) and 56 (LAPS passwords) write secrets to disk.
+> Options 94 and 113 show a new temporary password **once** on screen; it is never written to disk.
 > Move those files somewhere secure and delete them from the machine.
 
 ---
@@ -651,8 +647,9 @@ SigmaDataSystems-ToolKit-v2.ps1
 ## Changelog
 
 ### v2.0 (2026-10)
-- **Microsoft 365 section (options 89-122)**: compromised-account audit and containment, inbox rules with audit-log timestamps, forwarding, message trace, quarantine release, sender filtering diagnosis (BCL vs SCL), SPF / DKIM / DMARC, Direct Send connectors, mobile device wipe, audit log, sign-ins, MFA, stale accounts, admin roles, licenses, new users, app consent, expiring app secrets, Intune / BitLocker escrow, OneDrive sharing, retention exclusions, tenant hardening, posture audit and remediation plan, app registration, hybrid join and BitLocker-to-Entra on the PC. Works for client tenants via GDAP.
+- **Microsoft 365 section (options 91-124)**: compromised-account audit and containment, inbox rules with audit-log timestamps, forwarding, message trace, quarantine release, sender filtering diagnosis (BCL vs SCL), SPF / DKIM / DMARC, Direct Send connectors, mobile device wipe, audit log, sign-ins, MFA, stale accounts, admin roles, licenses, new users, app consent, expiring app secrets, Intune / BitLocker escrow, OneDrive sharing, retention exclusions, tenant hardening, posture audit and remediation plan, app registration, hybrid join and BitLocker-to-Entra on the PC. Works for client tenants via GDAP.
 - Section menu: section letters, direct option numbers, `ALL`, `B` back.
+- **Wi-Fi deep diagnostics and live monitor**: channel overlap and congestion scoring, channel utilization, DFS, sticky-client / wrong-band detection, driver and power-saving checks, disconnect history, roam/drop/lag monitoring.
 - **Public IP** lookup (also shown in the quick snapshot) and an **internet speed test** (built-in Cloudflare test or Ookla CLI, with history).
 - Built-in **self-test** (`-SelfTest`, `-IncludeSlow`, `-IncludeDownloads`, menu `T`).
 - New diagnostics: security posture, hardware / SMART health, reliability history, performance snapshot, boot performance, detailed pending reboot, Windows Update list / install, AD / DC health, backup / VSS health, shares / open files, advanced network, server roles & services, gpresult, software inventory, user profiles, time sync.
