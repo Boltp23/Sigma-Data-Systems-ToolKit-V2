@@ -2,7 +2,7 @@
 
 *Prepared by [Sigma Data Systems Inc.](https://sigmadatainc.com/)*
 
-<!-- AUTO-VERSION -->**Current version: v2.0** | 131 options | updated 2026-10-05<!-- /AUTO-VERSION -->
+<!-- AUTO-VERSION -->**Current version: v2.0** | 132 options | updated 2026-10-05<!-- /AUTO-VERSION -->
 
 ```
   _____ _____ _____ __  __            _____       _______
@@ -14,7 +14,7 @@
 ```
 
 One PowerShell file you can copy to any Windows workstation or server and run.
-It opens a numbered menu of **131 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
+It opens a numbered menu of **132 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
 Each option either checks something and writes a report, or makes a fix after asking you to confirm.
 
 - **One file, nothing to install.** 36 longer scripts (plus 2 data files) are built into the file as plain, readable text.
@@ -92,7 +92,7 @@ The home screen shows the banner, a line about the machine (host, domain, OS, ad
 | Type | Does |
 |---|---|
 | A section letter (`A`, `C`, `D`...) | Open that section |
-| Any option number (`1`-`131`) | Run that option directly, from any screen |
+| Any option number (`1`-`132`) | Run that option directly, from any screen |
 | `ALL` | List every option |
 | `B` | Back to the section list |
 | `O` | Change the output folder |
@@ -110,7 +110,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 ## All options
 
 <!-- AUTO-OPTIONS:START -->
-<details><summary><b>Quick index of all 131 options</b> (auto-generated from the script, 2026-10-05)</summary>
+<details><summary><b>Quick index of all 132 options</b> (auto-generated from the script, 2026-10-05)</summary>
 
 **A. SYSTEM HEALTH**
 
@@ -223,64 +223,65 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 80. [!] Repair .zip association / reset default browser (per user)
 81. [!] Remove bloatware (OEM + consumer Store apps)
 82. [!] Power settings - never sleep / hibernate
+83. Check scanner (Panini etc.) hangs / not detected - diagnostics + optional USB power fix
 
 **L. SOFTWARE DEPLOYMENT (downloads to C:\temp\Tools)**
 
-83. [!] Install common apps with Ninite (Chrome, Firefox, 7-Zip, Zoom...)
-84. [!] Install apps silently from the vendor (Chrome/Firefox/Edge MSI, Zoom, Teams, OneDrive)
-85. [!] Install Microsoft 365 Apps / Office (ODT, removes OEM Office first)
-86. [!] Remove ALL existing Office (OEM preinstalls, extra languages, MSI)
+84. [!] Install common apps with Ninite (Chrome, Firefox, 7-Zip, Zoom...)
+85. [!] Install apps silently from the vendor (Chrome/Firefox/Edge MSI, Zoom, Teams, OneDrive)
+86. [!] Install Microsoft 365 Apps / Office (ODT, removes OEM Office first)
+87. [!] Remove ALL existing Office (OEM preinstalls, extra languages, MSI)
 
 **M. SYSINTERNALS / NIRSOFT / MICROSOFT TOOLS (downloaded on demand)**
 
-87. NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimes, LastActivity, USB
-88. Sysinternals Handle - what is locking this file?
-89. Sysinternals ProcDump - dump a hung / crashing program
-90. Download & launch a GUI tool (ProcExp, ProcMon, Autoruns, TCPView, ShellExView...)
-91. Microsoft TSS - official support log collection (SDP)
+88. NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimes, LastActivity, USB
+89. Sysinternals Handle - what is locking this file?
+90. Sysinternals ProcDump - dump a hung / crashing program
+91. Download & launch a GUI tool (ProcExp, ProcMon, Autoruns, TCPView, ShellExView...)
+92. Microsoft TSS - official support log collection (SDP)
 
 **N. MICROSOFT 365 (Exchange Online / Entra ID / Intune)**
 
-92. M365: set admin account & client tenant (GDAP / partner) for the options below
-93. M365: install / repair PowerShell modules (EXO, Graph, SPO, Teams; EXO 3.7.1 conflict fix)
-94. M365: compromised account AUDIT (rules, forwarding, sign-ins, MFA, apps - HTML)
-95. [!] M365: CONTAIN compromised account (block, revoke, reset, rules, forwarding, unblock send)
-96. M365: inbox rules - one or all mailboxes, suspicious flagged, WHEN created (audit log)
-97. M365: forwarding audit (mailbox forwarding, external forward rules, tenant policy)
-98. M365: message trace (sender / recipient / subject, up to 90 days, delivery detail)
-99. M365: quarantine - find & release messages (shows Spam / Bulk / Phish reason)
-100. M365: why is this sender filtered? (rules, BCL vs SCL, TABL, impersonation) + fixes
-101. M365: SPF / DKIM / DMARC / MX check for all domains (lookup count, DKIM status)
-102. M365: Direct Send / connectors (scanner connector, RejectDirectSend)
-103. M365: top inbound sender / outbound recipient domains (90 days)
-104. M365: mailbox permissions (Full Access / Send As / Send on Behalf)
-105. M365: mailbox sizes, quotas, archive status
-106. M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe
-107. M365: unified audit log search (user / operation / IP, up to 180 days)
-108. M365: sign-in log for a user (IPs, countries, legacy protocols)
-109. M365: MFA registration report (admins without MFA flagged)
-110. M365: stale / never-used / guest / disabled-but-licensed accounts
-111. M365: admin role members (Global Admin count check)
-112. M365: license report (subscriptions, who has what, wasted licenses)
-113. [!] M365: assign / remove licenses (users, group-based, remove direct)
-114. [!] M365: create a new user (random temp password, license, groups)
-115. M365: app consent audit + admin-consent link (risky app permissions)
-116. M365: app registration secrets / certificates expiring soon
-117. M365: Intune devices (compliance, stale, BitLocker key missing in Entra)
-118. M365: OneDrive folder sharing / permissions for a user
-119. [!] M365: exclude a SharePoint site from a retention policy
-120. M365: tenant hardening audit (legacy auth, forwarding, audit log, Defender, alerts)
-121. M365: security posture audit (134 checks, license-aware, client HTML report)
-122. M365: remediation plan from a posture audit (technical + client summary)
-123. [!] M365: create app registration for unattended automation (cert auth)
-124. [!] THIS PC: force a Hybrid Entra ID join attempt
-125. [!] THIS PC: back up BitLocker recovery key to Entra ID
-126. M365: failed sign-in ALERT check - user + IP -> error codes -> verdict (Augmentt)
-127. M365 IR: Microsoft-Extractor-Suite (Invictus IR) - evidence triage, user or tenant
-128. M365 IR: Hawk - compromised user / tenant investigation
-129. M365 audit: CISA ScubaGear - SCuBA secure-baseline assessment (HTML)
-130. M365 audit: Maester - automated Entra / Exchange / CISA security tests (HTML)
-131. M365: domain impersonation / spoofing - headers, SPF/DMARC, look-alike domains, Direct Send
+93. M365: set admin account & client tenant (GDAP / partner) for the options below
+94. M365: install / repair PowerShell modules (EXO, Graph, SPO, Teams; EXO 3.7.1 conflict fix)
+95. M365: compromised account AUDIT (rules, forwarding, sign-ins, MFA, apps - HTML)
+96. [!] M365: CONTAIN compromised account (block, revoke, reset, rules, forwarding, unblock send)
+97. M365: inbox rules - one or all mailboxes, suspicious flagged, WHEN created (audit log)
+98. M365: forwarding audit (mailbox forwarding, external forward rules, tenant policy)
+99. M365: message trace (sender / recipient / subject, up to 90 days, delivery detail)
+100. M365: quarantine - find & release messages (shows Spam / Bulk / Phish reason)
+101. M365: why is this sender filtered? (rules, BCL vs SCL, TABL, impersonation) + fixes
+102. M365: SPF / DKIM / DMARC / MX check for all domains (lookup count, DKIM status)
+103. M365: Direct Send / connectors (scanner connector, RejectDirectSend)
+104. M365: top inbound sender / outbound recipient domains (90 days)
+105. M365: mailbox permissions (Full Access / Send As / Send on Behalf)
+106. M365: mailbox sizes, quotas, archive status
+107. M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe
+108. M365: unified audit log search (user / operation / IP, up to 180 days)
+109. M365: sign-in log for a user (IPs, countries, legacy protocols)
+110. M365: MFA registration report (admins without MFA flagged)
+111. M365: stale / never-used / guest / disabled-but-licensed accounts
+112. M365: admin role members (Global Admin count check)
+113. M365: license report (subscriptions, who has what, wasted licenses)
+114. [!] M365: assign / remove licenses (users, group-based, remove direct)
+115. [!] M365: create a new user (random temp password, license, groups)
+116. M365: app consent audit + admin-consent link (risky app permissions)
+117. M365: app registration secrets / certificates expiring soon
+118. M365: Intune devices (compliance, stale, BitLocker key missing in Entra)
+119. M365: OneDrive folder sharing / permissions for a user
+120. [!] M365: exclude a SharePoint site from a retention policy
+121. M365: tenant hardening audit (legacy auth, forwarding, audit log, Defender, alerts)
+122. M365: security posture audit (134 checks, license-aware, client HTML report)
+123. M365: remediation plan from a posture audit (technical + client summary)
+124. [!] M365: create app registration for unattended automation (cert auth)
+125. [!] THIS PC: force a Hybrid Entra ID join attempt
+126. [!] THIS PC: back up BitLocker recovery key to Entra ID
+127. M365: failed sign-in ALERT check - user + IP -> error codes -> verdict (Augmentt)
+128. M365 IR: Microsoft-Extractor-Suite (Invictus IR) - evidence triage, user or tenant
+129. M365 IR: Hawk - compromised user / tenant investigation
+130. M365 audit: CISA ScubaGear - SCuBA secure-baseline assessment (HTML)
+131. M365 audit: Maester - automated Entra / Exchange / CISA security tests (HTML)
+132. M365: domain impersonation / spoofing - headers, SPF/DMARC, look-alike domains, Direct Send
 
 </details>
 <!-- AUTO-OPTIONS:END -->
@@ -408,23 +409,24 @@ Legend: **[!]** = changes the machine (asks first) | **slow** = can take several
 | 80 | **[!]** Repair `.zip` association / reset default browser (per user) |
 | 81 | **[!]** Remove bloatware (OEM + consumer Store apps) |
 | 82 | **[!]** Power settings - never sleep / hibernate |
+| 83 | Check scanner (Panini etc.) hangs / not detected - diagnostics: scanner device, driver and problem codes, USB selective suspend / device power-off, duplicate or competing scanner/deposit software, helper services and localhost ports, browser local-network policies, AV/EDR, crash/hang and USB disconnect events, helper log tails; optional **[!]** USB power fix + service restart |
 
 ### L. Software deployment (downloads to `C:\temp\Tools`)
 | # | Option | Notes |
 |---|---|---|
-| 83 | **[!]** Install common apps with Ninite | Chrome, Firefox, 7-Zip, Zoom, Notepad++ and more. dl |
-| 84 | **[!]** Install apps silently from the vendor | Chrome / Firefox / Edge enterprise MSI, Zoom, Teams, OneDrive. dl |
-| 85 | **[!]** Install Microsoft 365 Apps / Office (Office Deployment Tool) | Removes OEM Office first. Turns on Shared Computer Activation for RDS. dl |
-| 86 | **[!]** Remove ALL existing Office | OEM preinstalls, extra languages, MSI Office. dl |
+| 84 | **[!]** Install common apps with Ninite | Chrome, Firefox, 7-Zip, Zoom, Notepad++ and more. dl |
+| 85 | **[!]** Install apps silently from the vendor | Chrome / Firefox / Edge enterprise MSI, Zoom, Teams, OneDrive. dl |
+| 86 | **[!]** Install Microsoft 365 Apps / Office (Office Deployment Tool) | Removes OEM Office first. Turns on Shared Computer Activation for RDS. dl |
+| 87 | **[!]** Remove ALL existing Office | OEM preinstalls, extra languages, MSI Office. dl |
 
 ### M. Sysinternals / NirSoft / Microsoft tools (downloaded on demand)
 | # | Option | Notes |
 |---|---|---|
-| 87 | NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimesView, LastActivityView, USBDeview, DriverView | HTML. dl |
-| 88 | Sysinternals Handle - what is locking this file? | dl |
-| 89 | Sysinternals ProcDump - dump a hung or crashing program | dl |
-| 90 | Download & launch a GUI tool | Process Explorer, Process Monitor, Autoruns, TCPView, RAMMap, ShellExView, CurrPorts... dl |
-| 91 | Microsoft TSS - official support log collection (SDP) | dl |
+| 88 | NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimesView, LastActivityView, USBDeview, DriverView | HTML. dl |
+| 89 | Sysinternals Handle - what is locking this file? | dl |
+| 90 | Sysinternals ProcDump - dump a hung or crashing program | dl |
+| 91 | Download & launch a GUI tool | Process Explorer, Process Monitor, Autoruns, TCPView, RAMMap, ShellExView, CurrPorts... dl |
+| 92 | Microsoft TSS - official support log collection (SDP) | dl |
 
 
 ### N. Microsoft 365 (Exchange Online / Entra ID / Intune)
@@ -432,48 +434,48 @@ Each option runs in its own PowerShell window and signs in only to the services 
 
 | # | Option | Notes |
 |---|---|---|
-| 92 | Set admin account & client tenant | Admin UPN, `DelegatedOrganization` (Exchange) and tenant (Graph) |
-| 93 | Install / repair PowerShell modules | EXO, Graph, SPO, Teams. Also installs EXO 3.7.1 side by side to fix the EXO + Graph "method not found" conflict |
-| 94 | Compromised account **audit** | Rules, forwarding, sign-ins and risk, MFA methods, delegates, OAuth apps, recent sends, admin roles. HTML report |
-| 95 | **[!]** **Contain** a compromised account | Step 1 (Entra): block sign-in, revoke sessions, reset password (cloud or on-prem AD), review MFA methods and app consents. Step 2 (Exchange): remove forwarding, disable malicious rules, lift the outbound-spam send restriction, check delegates |
-| 96 | Inbox rules - one or all mailboxes | Flags forward / delete / hide rules, and uses the **audit log to show when each rule was created** (useful for proving a "new rules" alert is wrong) |
-| 97 | Forwarding audit | Mailbox forwarding, external-forwarding rules, tenant auto-forward policy |
-| 98 | Message trace | Sender / recipient / subject, up to 90 days (10-day chunks), delivery detail |
-| 99 | Quarantine - find & release | Shows *why*: Spam / **Bulk (BCL)** / Phish / Malware. Never releases malware or high-confidence phish |
-| 100 | Why is this sender filtered? | Mail flow rules, BCL vs SCL, Tenant Allow/Block List, impersonation exclusions. One-step fixes: allow sender, exclude domain from impersonation, add `BulkStamping=0` to a rule |
-| 101 | SPF / DKIM / DMARC / MX check | Every accepted domain. Flags SPF lookup count, multiple SPF records, `+all`, DMARC `p=none`, missing or disabled M365 DKIM |
-| 102 | Direct Send / connectors | Lists connectors. **[!]** Creates an IP-restricted connector for scanners and apps, and turns RejectDirectSend on or off |
-| 103 | Top inbound / outbound domains | 90 days. Useful for pre-whitelisting top senders before a mail-filter cut-over |
-| 104 | Mailbox permissions | Full Access / Send As / Send on Behalf |
-| 105 | Mailbox sizes, quotas, archive | |
-| 106 | Mobile devices for a user | Lost phone or iPad: last sync. **[!]** Account-only wipe, block, or full wipe |
-| 107 | Unified audit log search | User / operation / free text (IP, file name...), up to 180 days |
-| 108 | Sign-in log for a user | IPs, countries, legacy-protocol sign-ins (needs Entra ID P1) |
-| 109 | MFA registration report | Admins without MFA flagged. Falls back to a per-user lookup without P1 |
-| 110 | Stale / never-used / guest / disabled-but-licensed accounts | |
-| 111 | Admin role members | Global Admin count check |
-| 112 | License report | Subscriptions, who has what, licenses wasted on disabled users. Uses Microsoft's friendly-name list |
-| 113 | **[!]** Assign / remove licenses | Users (sets usage location), group-based licensing, remove direct assignments |
-| 114 | **[!]** Create a new user | Random temporary password, license, groups |
-| 115 | App consent audit + admin-consent link | User-consent setting, admin-consent workflow, risky delegated permissions, a ready-made tenant-wide consent URL |
-| 116 | App registration secrets / certificates expiring | Catches app secrets that break integrations (room panels, scanners, backup apps) when they expire |
-| 117 | Intune devices | Compliance, stale devices, **BitLocker key missing in Entra** |
-| 118 | OneDrive folder sharing / permissions for a user | Flags "Anyone" links |
-| 119 | **[!]** Exclude a SharePoint site from a retention policy | Security & Compliance PowerShell |
-| 120 | Tenant hardening audit | Legacy auth, forwarding, audit log, Defender policies, alert policies, admins |
-| 121 | Security posture audit | 134 checks, license-aware, client-ready HTML + JSON |
-| 122 | Remediation plan from a posture audit | Technical HTML (exact commands) + plain-English client summary |
-| 123 | **[!]** Create an app registration for unattended automation | Certificate auth, admin consent granted in code |
-| 124 | **[!]** THIS PC: force a Hybrid Entra ID join attempt | gpupdate + Automatic-Device-Join task, with troubleshooting hints |
-| 125 | **[!]** THIS PC: back up the BitLocker recovery key to Entra ID | |
-| 126 | Failed sign-in **alert check** (user + IP) | For Augmentt / Defender "failed logins from outside operating country" alerts. Translates every Entra error code and gives a verdict: password **not known** (50126 / 50053), password **known** and stopped at MFA (50074 / 50076 / 500121 / 53003...), or **compromised** (success). Also shows Security Defaults, Conditional Access and the user's MFA methods, and flags tenant-wide sprays and Azure-management / PowerShell targets. Graph sign-in logs (P1), automatic fallback to the Unified Audit Log for tenants without P1 |
-| 127 | Microsoft-Extractor-Suite (Invictus IR) | `Start-MESTriage` Quick / Standard / Comprehensive for one or more users or the whole tenant: sign-in and audit logs, UAL operations, MFA, mailbox rules, OAuth apps, risky users, devices. CSV output in `C:\temp\M365\ExtractorSuite` |
-| 128 | Hawk | User investigation (mailbox config, rules, forwarding, auth history, mailbox audit, message trace, mobile devices) or tenant investigation (admin / config changes, consent grants, transport rules). Output in `C:\temp\M365\Hawk` |
-| 129 | CISA ScubaGear | Tenant configuration vs. CISA SCuBA baselines (Entra, Defender, Exchange, SharePoint, Teams, optional Power Platform / Power BI). HTML report. Windows PowerShell 5.1; sign in with an account **in** the client tenant (Global Reader is enough), GDAP is not supported |
-| 130 | Maester | Hundreds of Entra / Exchange / CISA / EIDSCA Pester tests with an HTML pass/fail report and the fix for each. Test library kept in `C:\temp\Maester\tests` and updated on request |
-| 131 | Domain impersonation / spoofing | 1) Header analysis of a suspicious message: real sender, sending IP and country, SPF / DKIM / DMARC / CompAuth with reason codes explained, Microsoft category, **Direct Send** (anonymous mail claiming your own domain), Reply-To / Return-Path mismatches, look-alike sender domain, free-mail display-name impersonation, plain-English verdict. 2) Domain spoofability: SPF with DNS-lookup count, DMARC policy, DKIM selectors, MX gateway, MTA-STS. 3) dnstwist-style look-alike scan in pure PowerShell (typo, homoglyph, hyphen, keyword and TLD variants; registered, MX, RDAP age, risk). 4) Tenant: RejectDirectSend, inbound connectors, anti-phishing impersonation settings, spoof intelligence and a message trace for mail from registered look-alikes. 5) Tenant-wide spoof hunt ("is it still happening?"): every message claiming your own domains that entered from an outside IP (not a connector, trusted IP or Microsoft 365), grouped by IP with hosting/ISP flag, per-day counts and before-vs-after a fix date; a look-alike sweep of every outside sender domain in the trace; spoof intelligence; and a ready-made Defender advanced-hunting query (Plan 2) that also covers display-name impersonation. Output in `C:\temp\M365\Impersonation` |
+| 93 | Set admin account & client tenant | Admin UPN, `DelegatedOrganization` (Exchange) and tenant (Graph) |
+| 94 | Install / repair PowerShell modules | EXO, Graph, SPO, Teams. Also installs EXO 3.7.1 side by side to fix the EXO + Graph "method not found" conflict |
+| 95 | Compromised account **audit** | Rules, forwarding, sign-ins and risk, MFA methods, delegates, OAuth apps, recent sends, admin roles. HTML report |
+| 96 | **[!]** **Contain** a compromised account | Step 1 (Entra): block sign-in, revoke sessions, reset password (cloud or on-prem AD), review MFA methods and app consents. Step 2 (Exchange): remove forwarding, disable malicious rules, lift the outbound-spam send restriction, check delegates |
+| 97 | Inbox rules - one or all mailboxes | Flags forward / delete / hide rules, and uses the **audit log to show when each rule was created** (useful for proving a "new rules" alert is wrong) |
+| 98 | Forwarding audit | Mailbox forwarding, external-forwarding rules, tenant auto-forward policy |
+| 99 | Message trace | Sender / recipient / subject, up to 90 days (10-day chunks), delivery detail |
+| 100 | Quarantine - find & release | Shows *why*: Spam / **Bulk (BCL)** / Phish / Malware. Never releases malware or high-confidence phish |
+| 101 | Why is this sender filtered? | Mail flow rules, BCL vs SCL, Tenant Allow/Block List, impersonation exclusions. One-step fixes: allow sender, exclude domain from impersonation, add `BulkStamping=0` to a rule |
+| 102 | SPF / DKIM / DMARC / MX check | Every accepted domain. Flags SPF lookup count, multiple SPF records, `+all`, DMARC `p=none`, missing or disabled M365 DKIM |
+| 103 | Direct Send / connectors | Lists connectors. **[!]** Creates an IP-restricted connector for scanners and apps, and turns RejectDirectSend on or off |
+| 104 | Top inbound / outbound domains | 90 days. Useful for pre-whitelisting top senders before a mail-filter cut-over |
+| 105 | Mailbox permissions | Full Access / Send As / Send on Behalf |
+| 106 | Mailbox sizes, quotas, archive | |
+| 107 | Mobile devices for a user | Lost phone or iPad: last sync. **[!]** Account-only wipe, block, or full wipe |
+| 108 | Unified audit log search | User / operation / free text (IP, file name...), up to 180 days |
+| 109 | Sign-in log for a user | IPs, countries, legacy-protocol sign-ins (needs Entra ID P1) |
+| 110 | MFA registration report | Admins without MFA flagged. Falls back to a per-user lookup without P1 |
+| 111 | Stale / never-used / guest / disabled-but-licensed accounts | |
+| 112 | Admin role members | Global Admin count check |
+| 113 | License report | Subscriptions, who has what, licenses wasted on disabled users. Uses Microsoft's friendly-name list |
+| 114 | **[!]** Assign / remove licenses | Users (sets usage location), group-based licensing, remove direct assignments |
+| 115 | **[!]** Create a new user | Random temporary password, license, groups |
+| 116 | App consent audit + admin-consent link | User-consent setting, admin-consent workflow, risky delegated permissions, a ready-made tenant-wide consent URL |
+| 117 | App registration secrets / certificates expiring | Catches app secrets that break integrations (room panels, scanners, backup apps) when they expire |
+| 118 | Intune devices | Compliance, stale devices, **BitLocker key missing in Entra** |
+| 119 | OneDrive folder sharing / permissions for a user | Flags "Anyone" links |
+| 120 | **[!]** Exclude a SharePoint site from a retention policy | Security & Compliance PowerShell |
+| 121 | Tenant hardening audit | Legacy auth, forwarding, audit log, Defender policies, alert policies, admins |
+| 122 | Security posture audit | 134 checks, license-aware, client-ready HTML + JSON |
+| 123 | Remediation plan from a posture audit | Technical HTML (exact commands) + plain-English client summary |
+| 124 | **[!]** Create an app registration for unattended automation | Certificate auth, admin consent granted in code |
+| 125 | **[!]** THIS PC: force a Hybrid Entra ID join attempt | gpupdate + Automatic-Device-Join task, with troubleshooting hints |
+| 126 | **[!]** THIS PC: back up the BitLocker recovery key to Entra ID | |
+| 127 | Failed sign-in **alert check** (user + IP) | For Augmentt / Defender "failed logins from outside operating country" alerts. Translates every Entra error code and gives a verdict: password **not known** (50126 / 50053), password **known** and stopped at MFA (50074 / 50076 / 500121 / 53003...), or **compromised** (success). Also shows Security Defaults, Conditional Access and the user's MFA methods, and flags tenant-wide sprays and Azure-management / PowerShell targets. Graph sign-in logs (P1), automatic fallback to the Unified Audit Log for tenants without P1 |
+| 128 | Microsoft-Extractor-Suite (Invictus IR) | `Start-MESTriage` Quick / Standard / Comprehensive for one or more users or the whole tenant: sign-in and audit logs, UAL operations, MFA, mailbox rules, OAuth apps, risky users, devices. CSV output in `C:\temp\M365\ExtractorSuite` |
+| 129 | Hawk | User investigation (mailbox config, rules, forwarding, auth history, mailbox audit, message trace, mobile devices) or tenant investigation (admin / config changes, consent grants, transport rules). Output in `C:\temp\M365\Hawk` |
+| 130 | CISA ScubaGear | Tenant configuration vs. CISA SCuBA baselines (Entra, Defender, Exchange, SharePoint, Teams, optional Power Platform / Power BI). HTML report. Windows PowerShell 5.1; sign in with an account **in** the client tenant (Global Reader is enough), GDAP is not supported |
+| 131 | Maester | Hundreds of Entra / Exchange / CISA / EIDSCA Pester tests with an HTML pass/fail report and the fix for each. Test library kept in `C:\temp\Maester\tests` and updated on request |
+| 132 | Domain impersonation / spoofing | 1) Header analysis of a suspicious message: real sender, sending IP and country, SPF / DKIM / DMARC / CompAuth with reason codes explained, Microsoft category, **Direct Send** (anonymous mail claiming your own domain), Reply-To / Return-Path mismatches, look-alike sender domain, free-mail display-name impersonation, plain-English verdict. 2) Domain spoofability: SPF with DNS-lookup count, DMARC policy, DKIM selectors, MX gateway, MTA-STS. 3) dnstwist-style look-alike scan in pure PowerShell (typo, homoglyph, hyphen, keyword and TLD variants; registered, MX, RDAP age, risk). 4) Tenant: RejectDirectSend, inbound connectors, anti-phishing impersonation settings, spoof intelligence and a message trace for mail from registered look-alikes. 5) Tenant-wide spoof hunt ("is it still happening?"): every message claiming your own domains that entered from an outside IP (not a connector, trusted IP or Microsoft 365), grouped by IP with hosting/ISP flag, per-day counts and before-vs-after a fix date; a look-alike sweep of every outside sender domain in the trace; spoof intelligence; and a ready-made Defender advanced-hunting query (Plan 2) that also covers display-name impersonation. Output in `C:\temp\M365\Impersonation` |
 
-Options 126-130 install their PowerShell Gallery modules for the current user on first use (you're asked first), and offer an update when a newer version is published. Options 127, 128 and 130 load Microsoft Graph and Exchange Online in the same session, which can clash in Windows PowerShell 5.1 ("GetTokenAsync ... does not have an implementation" / "method not found"). They therefore run in **PowerShell 7** (`pwsh.exe`) when it's installed, and offer to install it (Microsoft-signed MSI from GitHub, silent) when it isn't. If you decline, they run in 5.1 with Graph loaded before Exchange. ScubaGear (129) always runs in Windows PowerShell 5.1, as it requires.
+Options 127-131 install their PowerShell Gallery modules for the current user on first use (you're asked first), and offer an update when a newer version is published. Options 128, 129 and 131 load Microsoft Graph and Exchange Online in the same session, which can clash in Windows PowerShell 5.1 ("GetTokenAsync ... does not have an implementation" / "method not found"). They therefore run in **PowerShell 7** (`pwsh.exe`) when it's installed, and offer to install it (Microsoft-signed MSI from GitHub, silent) when it isn't. If you decline, they run in 5.1 with Graph loaded before Exchange. ScubaGear (130) always runs in Windows PowerShell 5.1, as it requires.
 
 ---
 
@@ -535,7 +537,7 @@ C:\temp\
 ```
 
 > **Secret output:** options 55 (BitLocker keys) and 56 (LAPS passwords) write secrets to disk.
-> Options 95 and 114 show a new temporary password **once** on screen; it is never written to disk.
+> Options 96 and 115 show a new temporary password **once** on screen; it is never written to disk.
 > Move those files somewhere secure and delete them from the machine.
 
 ---
@@ -565,7 +567,7 @@ Before a downloaded `.exe` / `.msi` is run:
 | Hawk (PowerShell Gallery) | https://github.com/T0pCyber/hawk |
 | CISA ScubaGear (PowerShell Gallery) | https://github.com/cisagov/ScubaGear |
 | Maester (PowerShell Gallery) | https://maester.dev |
-| dnstwist (reference for option 131) | https://github.com/elceef/dnstwist |
+| dnstwist (reference for option 132) | https://github.com/elceef/dnstwist |
 | openSquat | https://github.com/atenreiro/opensquat |
 | Microsoft Message Header Analyzer | https://github.com/microsoft/MHA |
 | parsedmarc | https://github.com/domainaware/parsedmarc |
@@ -671,10 +673,11 @@ SigmaDataSystems-ToolKit-v2.ps1
 ## Changelog
 
 ### v2.0 (2026-10)
+- **Check scanner diagnostics (option 83)**: for Panini (and other USB check/deposit scanners) that hang or aren't detected in web-based scanning apps. Checks the device and driver, USB power management, duplicate or competing scanner/deposit software, helper services and their localhost ports (with a connect test), Chrome/Edge local-network policies, AV/EDR, application hang/crash and USB disconnect events, and copies recent helper log tails. Can optionally turn off USB selective suspend and device power-off and restart scanner services (asks first). Options after 82 moved down by one.
 - **OneDrive won't start / sync diagnostics (option 78)**: finds the silent "Prevent the usage of OneDrive for file storage" block (DisableFileSyncNGSC) and names the GPO that sets it, plus tenant allow/block lists, install conflicts, disabled or stale startup entries, missing sync / redirected folders and endpoint reachability; checks every signed-in user even when run as an admin or RMM account, collects OneDrive's own logs, and can remove a registry-only block. The OneDrive reset (79) now warns when a block is on or the wrong user is running it.
-- **Domain impersonation / spoofing investigation (option 131)**: header analysis with Direct Send detection, SPF/DMARC/DKIM spoofability check, built-in look-alike domain scan, tenant spoof-intelligence and look-alike message trace, and a tenant-wide spoof hunt with before/after-fix comparison.
-- **M365 incident response / audit (options 126-130)**: failed sign-in alert check with error-code verdict (Graph, with Unified Audit Log fallback for tenants without P1), Microsoft-Extractor-Suite (Invictus IR) triage, Hawk user / tenant investigation, CISA ScubaGear baseline assessment, Maester security tests.
-- **Microsoft 365 section (options 92-125)**: compromised-account audit and containment, inbox rules with audit-log timestamps, forwarding, message trace, quarantine release, sender filtering diagnosis (BCL vs SCL), SPF / DKIM / DMARC, Direct Send connectors, mobile device wipe, audit log, sign-ins, MFA, stale accounts, admin roles, licenses, new users, app consent, expiring app secrets, Intune / BitLocker escrow, OneDrive sharing, retention exclusions, tenant hardening, posture audit and remediation plan, app registration, hybrid join and BitLocker-to-Entra on the PC. Works for client tenants via GDAP.
+- **Domain impersonation / spoofing investigation (option 132)**: header analysis with Direct Send detection, SPF/DMARC/DKIM spoofability check, built-in look-alike domain scan, tenant spoof-intelligence and look-alike message trace, and a tenant-wide spoof hunt with before/after-fix comparison.
+- **M365 incident response / audit (options 127-131)**: failed sign-in alert check with error-code verdict (Graph, with Unified Audit Log fallback for tenants without P1), Microsoft-Extractor-Suite (Invictus IR) triage, Hawk user / tenant investigation, CISA ScubaGear baseline assessment, Maester security tests.
+- **Microsoft 365 section (options 93-126)**: compromised-account audit and containment, inbox rules with audit-log timestamps, forwarding, message trace, quarantine release, sender filtering diagnosis (BCL vs SCL), SPF / DKIM / DMARC, Direct Send connectors, mobile device wipe, audit log, sign-ins, MFA, stale accounts, admin roles, licenses, new users, app consent, expiring app secrets, Intune / BitLocker escrow, OneDrive sharing, retention exclusions, tenant hardening, posture audit and remediation plan, app registration, hybrid join and BitLocker-to-Entra on the PC. Works for client tenants via GDAP.
 - Section menu: section letters, direct option numbers, `ALL`, `B` back.
 - **Wi-Fi deep diagnostics and live monitor**: channel overlap and congestion scoring, channel utilization, DFS, sticky-client / wrong-band detection, driver and power-saving checks, disconnect history, roam/drop/lag monitoring.
 - **Public IP** lookup (also shown in the quick snapshot) and an **internet speed test** (built-in Cloudflare test or Ookla CLI, with history).

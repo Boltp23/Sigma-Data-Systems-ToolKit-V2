@@ -1025,6 +1025,17 @@ function Invoke-DotNetVersion {
         Select-Object DisplayName, DisplayVersion, InstallDate | Sort-Object DisplayName | Format-Table -AutoSize
 }
 
+function Invoke-CheckScannerDiag {
+    Write-Title 'Check scanner (Panini etc.) hangs / not detected - diagnostics'
+    Write-Host '  Checks the scanner device and driver, USB power settings, scanner/deposit software,'
+    Write-Host '  helper services and localhost ports, browser policies, AV/EDR, event logs and helper logs.'
+    $days  = Read-Int 'Days of event log history' 7
+    $extra = Read-Default 'Extra name to match (vendor/app not in the built-in list, blank = none)' ''
+    $fix   = Read-YesNo 'Also apply fixes (disable USB selective suspend + USB power-off, restart scanner services)?' $false
+    if ($fix -and -not (Confirm-Change 'Disable USB selective suspend on the active power plan, turn off "allow the computer to turn off this device" for the scanner and USB hubs, and restart scanner-related services.')) { $fix = $false }
+    Invoke-Tool 'Get-CheckScannerDiagnostics' ([ordered]@{ Days = $days; ExtraPattern = $extra; ApplyFixes = $fix; OutputPath = (Get-OutDir 'CheckScanner') }) | Out-Null
+}
+
 function Invoke-CitrixState {
     Write-Title 'Citrix Workspace app - install state'
     Write-Sub 'reg.exe: HKLM\SOFTWARE\Citrix'
@@ -3865,6 +3876,7 @@ $Script:Menu = @(
     @{               Text = '[!] Repair .zip association / reset default browser (per user)';               Action = { Invoke-ZipBrowserRepair } }
     @{               Text = '[!] Remove bloatware (OEM + consumer Store apps)';                              Action = { Invoke-RemoveBloatware } }
     @{               Text = '[!] Power settings - never sleep / hibernate';                                  Action = { Invoke-PowerSettings } }
+    @{ Test='safe'; Text = 'Check scanner (Panini etc.) hangs / not detected - diagnostics + optional USB power fix'; Action = { Invoke-CheckScannerDiag } }
     @{ Section = 'SOFTWARE DEPLOYMENT (downloads to C:\temp\Tools)' }
     @{               Text = '[!] Install common apps with Ninite (Chrome, Firefox, 7-Zip, Zoom...)';         Action = { Invoke-NiniteInstall } }
     @{               Text = '[!] Install apps silently from the vendor (Chrome/Firefox/Edge MSI, Zoom, Teams, OneDrive)'; Action = { Invoke-DirectInstall } }
@@ -7308,6 +7320,398 @@ if ($NoRestart) {
     Start-Sleep -Seconds 30
     Restart-Computer -Force
 }
+'@
+
+# ======================= Get-CheckScannerDiagnostics.ps1 =======================
+$Script:Payloads['Get-CheckScannerDiagnostics'] = @'
+<#
+.SYNOPSIS
+    Check scanner diagnostics (Panini and other USB check/deposit scanners) - why does the
+    scanning app hang, not see the scanner, or stall mid-scan?
+
+.DESCRIPTION
+    Prepared by Sigma Data Systems Inc. - https://sigmadatainc.com/
+
+    Universal - nothing client-specific. Read-only unless -ApplyFixes is used.
+
+    Collects:
+      - Scanner device(s) in Device Manager: status, problem code, driver version/date/provider
+      - Any USB / imaging devices in an error state
+      - USB power management: selective suspend (power plan) and "Allow the computer to turn off
+        this device" on the scanner and USB root hubs / controllers
+      - Installed scanner / deposit software (Panini, Entrata, Digital Check / Ranger, Ensenta,
+        bank RDC helpers ...) - duplicate or competing installs are a common cause of hangs
+      - Scanner-related services and processes, and the local (localhost) ports they listen on
+        (web-based scanning apps talk to a local helper service on a localhost port)
+      - Browser versions and Chrome/Edge local-network-access policies (can block a web page
+        from reaching the local scanner helper)
+      - Antivirus / EDR products registered on the machine
+      - Event log: app crashes/hangs of scanner or browser processes, scanner-related
+        errors, USB/PnP device problems and disconnects
+      - Recent scanner/helper log files (tail copied into the report folder)
+      - A summary of findings with suggested next steps
+
+    With -ApplyFixes (asks nothing itself - the ToolKit confirms first):
+      - Disables USB selective suspend on the active power plan (AC + DC)
+      - Turns off "Allow the computer to turn off this device" on the scanner and USB hubs
+      - Restarts scanner-related services
+
+.PARAMETER Days
+    Days of event log history to check. Default 7.
+
+.PARAMETER OutputPath
+    Folder for the report. Default C:\temp\CheckScanner.
+
+.PARAMETER ExtraPattern
+    Extra regex for device / software / service names to treat as scanner-related
+    (e.g. a vendor name not in the built-in list).
+
+.PARAMETER ApplyFixes
+    Apply the USB power fixes and restart scanner services.
+
+.EXAMPLE
+    powershell.exe -ExecutionPolicy Bypass -File .\Get-CheckScannerDiagnostics.ps1
+
+.EXAMPLE
+    .\Get-CheckScannerDiagnostics.ps1 -Days 14 -ApplyFixes
+#>
+[CmdletBinding()]
+param(
+    [int]$Days = 7,
+    [string]$OutputPath = 'C:\temp\CheckScanner',
+    [string]$ExtraPattern = '',
+    [switch]$ApplyFixes
+)
+
+$ErrorActionPreference = 'Continue'
+
+# Scanner / deposit software & device name patterns (generic vendor + product names only)
+$Pattern = 'Panini|DocScan|Property Solutions|Vision ?X|I:?Deal|mI:?Deal|Everest|wI:?Deal|Entrata|Digital ?Check|TellerScan|CheXpress|Ranger|Silver ?Bullet|Ensenta|Epson TM-?S|Canon CR-|RDM EC|Remote ?Deposit|Check ?Scan|Cheque|WebScan|Scanner ?Service|Scan ?Utility'
+if ($ExtraPattern) { $Pattern = "$Pattern|$ExtraPattern" }
+# Processes that can hold the scanner open at the same time as the main app
+$CompetingPattern = 'DocScan|Ranger|Ensenta|Panini|DigitalCheck|RDC|Deposit|CheckScan|WebScan|TellerScan|SilverBullet'
+$BrowserPattern  = '^(chrome|msedge|firefox|iexplore)$'
+
+$stamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+$runDir = Join-Path $OutputPath ("CheckScanner_{0}_{1}" -f $env:COMPUTERNAME, $stamp)
+$logDir = Join-Path $runDir 'ScannerLogs'
+New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+$Report = Join-Path $runDir 'CheckScannerDiagnostics.txt'
+$Findings = New-Object System.Collections.Generic.List[object]
+$since = (Get-Date).AddDays(-$Days)
+
+function Out-Report { param([Parameter(ValueFromPipeline)]$InputObject)
+    # Buffer the whole pipeline first: Format-Table/Format-List emit several formatting
+    # objects that must reach Out-String together, in order.
+    begin   { $buf = New-Object System.Collections.Generic.List[object] }
+    process { if ($null -ne $InputObject) { $buf.Add($InputObject) } }
+    end {
+        if ($buf.Count -eq 0) { return }
+        if ($buf.Count -eq 1 -and $buf[0] -is [string]) { $t = $buf[0] }
+        else { $t = ($buf.ToArray() | Out-String -Width 250).TrimEnd() }
+        Add-Content -Path $Report -Value $t
+        Write-Host $t
+    }
+}
+function Section([string]$Title) {
+    $line = '=' * 78
+    Out-Report ''
+    Add-Content -Path $Report -Value "$line`r`n $Title`r`n$line"
+    Write-Host "`n$line`n $Title`n$line" -ForegroundColor Cyan
+}
+function Add-Finding([string]$Level, [string]$Text) {
+    $Findings.Add([pscustomobject]@{ Level = $Level; Finding = $Text })
+}
+
+Out-Report "Check Scanner Diagnostics - $env:COMPUTERNAME - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Out-Report "Prepared by Sigma Data Systems Inc.   Script v1.2   History: $Days day(s)   Fix mode: $([bool]$ApplyFixes)"
+try {
+    $os = Get-CimInstance Win32_OperatingSystem
+    Out-Report ("OS: {0} {1} (build {2})   Last boot: {3}" -f $os.Caption, $os.OSArchitecture, $os.BuildNumber, $os.LastBootUpTime)
+} catch {}
+
+# ------------------------------------------------------------------ 1. Devices
+Section '1. SCANNER DEVICES (Device Manager)'
+$allPnp = @(Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue)
+$scanDev = @($allPnp | Where-Object { "$($_.Name) $($_.Manufacturer) $($_.Description)" -match $Pattern })
+if ($scanDev.Count -eq 0) {
+    Out-Report 'No device matching a known check-scanner name was found.'
+    Out-Report '(If the scanner is plugged in and powered on, it may be showing as an unknown/other device - see the next list.)'
+    Add-Finding 'FAIL' 'No check scanner found in Device Manager - check cable/power, try a rear USB port, reinstall the scanner driver.'
+} else {
+    $scanDev | Select-Object Name, Manufacturer, PNPClass, Status, ConfigManagerErrorCode, PNPDeviceID | Format-List | Out-Report
+    foreach ($d in $scanDev) {
+        if ($d.ConfigManagerErrorCode -ne 0) { Add-Finding 'FAIL' "Device '$($d.Name)' has problem code $($d.ConfigManagerErrorCode) - reinstall/update its driver." }
+    }
+    $phys = @($scanDev | Where-Object { $_.PNPDeviceID -notlike 'ROOT\*' -and $_.PNPDeviceID -notlike 'SWD\*' })
+    if ($phys.Count -eq 0) { Add-Finding 'FAIL' "Only a virtual/root scanner driver was found ($(($scanDev | Select-Object -ExpandProperty PNPDeviceID) -join ', ')) - no physical scanner is enumerated on USB. Make sure the scanner is plugged in and powered ON, then re-run; if it still doesn't appear, try another rear USB port/cable and reinstall the driver." }
+    if ($scanDev | Where-Object { $_.ConfigManagerErrorCode -eq 0 }) { Add-Finding 'OK' "Scanner device(s) present: $(($scanDev | Select-Object -ExpandProperty Name -Unique) -join '; ')" }
+}
+
+Out-Report ''
+Out-Report '-- Drivers for scanner devices --'
+$drv = @(Get-CimInstance Win32_PnPSignedDriver -ErrorAction SilentlyContinue | Where-Object { "$($_.DeviceName) $($_.Manufacturer) $($_.DriverProviderName)" -match $Pattern })
+if ($drv) {
+    $drv | Select-Object DeviceName, DriverProviderName, DriverVersion, @{n='DriverDate';e={ if ($_.DriverDate) { ([datetime]$_.DriverDate).ToString('yyyy-MM-dd') } }}, IsSigned, InfName | Format-Table -AutoSize | Out-Report
+} else { Out-Report 'No signed driver entries matched.' }
+
+Out-Report ''
+Out-Report '-- Devices in an error state (USB / imaging / other / unknown) --'
+$bad = @($allPnp | Where-Object { $_.ConfigManagerErrorCode -ne 0 -and ($_.PNPClass -in @('USB','Image','Net','Ports','HIDClass') -or -not $_.PNPClass -or $_.PNPDeviceID -like 'USB*') })
+if ($bad) {
+    $bad | Select-Object Name, PNPClass, ConfigManagerErrorCode, PNPDeviceID | Format-Table -AutoSize -Wrap | Out-Report
+    Add-Finding 'WARN' "$($bad.Count) USB/imaging/unknown device(s) in an error state - see section 1."
+} else { Out-Report 'None.' }
+
+# Some scanners present as a USB network adapter (RNDIS/NDIS) - show any such adapters
+$netScan = @(Get-CimInstance Win32_NetworkAdapter -ErrorAction SilentlyContinue | Where-Object { "$($_.Name) $($_.Manufacturer)" -match "$Pattern|RNDIS" })
+if ($netScan) {
+    Out-Report ''
+    Out-Report '-- USB network-style adapters (some scanners connect this way) --'
+    $netScan | Select-Object Name, NetEnabled, NetConnectionStatus, MACAddress | Format-Table -AutoSize | Out-Report
+    foreach ($n in $netScan) { if ($n.NetEnabled -eq $false) { Add-Finding 'WARN' "Adapter '$($n.Name)' is disabled - scanners that use a USB network link need it enabled." } }
+    try {
+        $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.InterfaceAlias -in @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -match "$Pattern|RNDIS" } | Select-Object -ExpandProperty Name) }
+        if ($ips) { $ips | Select-Object InterfaceAlias, IPAddress, PrefixLength, PrefixOrigin | Format-Table -AutoSize | Out-Report }
+    } catch {}
+}
+
+# ------------------------------------------------------------------ 2. USB power
+Section '2. USB POWER MANAGEMENT'
+$ssGuidSub = '2a737441-1930-4402-8d77-b2bebba308a3'
+$ssGuid    = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226'
+$pc = (powercfg /query SCHEME_CURRENT $ssGuidSub $ssGuid 2>&1) -join "`n"
+$ac = if ($pc -match 'Current AC Power Setting Index:\s*0x([0-9a-f]+)') { [int]("0x$($Matches[1])") } else { $null }
+$dc = if ($pc -match 'Current DC Power Setting Index:\s*0x([0-9a-f]+)') { [int]("0x$($Matches[1])") } else { $null }
+$plan = (powercfg /getactivescheme 2>&1) -join ' '
+Out-Report "Active power plan: $plan"
+Out-Report ("USB selective suspend  AC: {0}   DC: {1}" -f $(if ($null -eq $ac) {'n/a (hidden/not set)'} elseif ($ac) {'ENABLED'} else {'disabled'}), $(if ($null -eq $dc) {'n/a'} elseif ($dc) {'ENABLED'} else {'disabled'}))
+if ($ac -eq 1) { Add-Finding 'WARN' 'USB selective suspend is ENABLED on AC power - can make the scanner drop out mid-scan.' }
+
+$psm = @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction SilentlyContinue)
+$scanIds = @($scanDev | ForEach-Object { $_.PNPDeviceID })
+$hubIds  = @($allPnp | Where-Object { $_.Name -match 'USB Root Hub|Generic USB Hub|USB Host Controller|eXtensible Host Controller' } | ForEach-Object { $_.PNPDeviceID })
+$pmRows = foreach ($p in $psm) {
+    $id = ($p.InstanceName -replace '_\d+$', '')
+    $kind = if ($scanIds -contains $id) { 'SCANNER' } elseif ($hubIds -contains $id) { 'USB hub/controller' } else { $null }
+    if ($kind) {
+        $name = ($allPnp | Where-Object { $_.PNPDeviceID -eq $id } | Select-Object -First 1).Name
+        [pscustomobject]@{ Kind = $kind; Device = $name; AllowTurnOff = $p.Enable; InstanceName = $p.InstanceName }
+    }
+}
+if ($pmRows) {
+    $pmRows | Sort-Object Kind | Format-Table Kind, Device, AllowTurnOff -AutoSize | Out-Report
+    $on = @($pmRows | Where-Object AllowTurnOff)
+    if ($on) { Add-Finding 'WARN' "'Allow the computer to turn off this device' is ON for $($on.Count) scanner/USB hub device(s)." }
+} else { Out-Report 'No per-device power settings exposed for the scanner / USB hubs (normal on some systems).' }
+
+# ------------------------------------------------------------------ 3. Software
+Section '3. INSTALLED SCANNER / DEPOSIT SOFTWARE'
+$uninst = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -and "$($_.DisplayName) $($_.Publisher)" -match $Pattern })
+if ($uninst) {
+    $uninst | Select-Object DisplayName, DisplayVersion, Publisher, InstallDate, InstallLocation | Sort-Object DisplayName | Format-Table -AutoSize -Wrap | Out-Report
+    $dupes = @($uninst | Group-Object { ($_.DisplayName -replace '[\d\.\s\(\)x-]+$', '').Trim() } | Where-Object Count -gt 1)
+    foreach ($g in $dupes) {
+        $vers = @($g.Group | ForEach-Object { $_.DisplayVersion } | Select-Object -Unique)
+        if ($vers.Count -gt 1) { Add-Finding 'WARN' "Different versions installed side by side: '$($g.Name)' ($($vers -join ', ')) - uninstall all, reboot, reinstall the current one." }
+        else { Add-Finding 'WARN' "'$($g.Name)' is registered $($g.Count) times (same version $($vers -join '')) - a duplicate/broken install record; uninstall all entries, reboot, reinstall once." }
+    }
+    $vendors = @($uninst | ForEach-Object { if ("$($_.DisplayName) $($_.Publisher)" -match 'Digital ?Check|Ranger|Ensenta|Epson|Canon|Silver ?Bullet') { 'other' } elseif ("$($_.DisplayName) $($_.Publisher)" -match 'Panini') { 'panini' } } | Select-Object -Unique)
+    if ($vendors -contains 'other' -and $vendors -contains 'panini') { Add-Finding 'WARN' 'Panini AND another scanner vendor / bank deposit stack are installed - they can fight over the device; close one before scanning in the other.' }
+} else {
+    Out-Report 'No scanner/deposit software found in Programs and Features.'
+    Add-Finding 'WARN' 'No scanner driver/helper software found in Programs and Features - the web app may not be able to reach the scanner.'
+}
+
+# ------------------------------------------------------------------ 4. Services / processes / ports
+Section '4. SERVICES, PROCESSES AND LOCAL PORTS'
+$svc = @(Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { "$($_.Name) $($_.DisplayName) $($_.PathName)" -match $Pattern })
+if ($svc) {
+    $svc | Select-Object Name, DisplayName, State, StartMode, StartName, ProcessId, PathName | Format-List | Out-Report
+    foreach ($s in $svc) {
+        if ($s.StartMode -ne 'Disabled' -and $s.State -ne 'Running') { Add-Finding 'FAIL' "Service '$($s.DisplayName)' is $($s.State) (start mode $($s.StartMode)) - start/restart it." }
+        if ($s.StartMode -eq 'Disabled') { Add-Finding 'WARN' "Service '$($s.DisplayName)' is DISABLED." }
+    }
+} else { Out-Report 'No scanner-related Windows services found.' }
+
+$procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match $Pattern -or $_.ProcessName -match $CompetingPattern -or ($_.Path -and $_.Path -match $Pattern) })
+Out-Report ''
+Out-Report '-- Scanner-related processes running now --'
+if ($procs) {
+    $procs | Select-Object ProcessName, Id, @{n='Responding';e={$_.Responding}}, @{n='CPU(s)';e={[math]::Round($_.CPU,1)}}, @{n='MemMB';e={[math]::Round($_.WorkingSet64/1MB)}}, StartTime, Path | Format-Table -AutoSize -Wrap | Out-Report
+    $hung = @($procs | Where-Object { $_.MainWindowHandle -ne 0 -and -not $_.Responding })
+    foreach ($h in $hung) { Add-Finding 'FAIL' "Process '$($h.ProcessName)' (PID $($h.Id)) is NOT RESPONDING right now." }
+    $fam = @($procs | ForEach-Object { if ($_.ProcessName -match 'Panini') {'Panini'} elseif ($_.ProcessName -match 'Ranger|DigitalCheck|TellerScan') {'DigitalCheck/Ranger'} elseif ($_.ProcessName -match 'Ensenta|RDC|Deposit') {'Bank RDC'} } | Select-Object -Unique)
+    if ($fam.Count -gt 1) { Add-Finding 'WARN' "Scanner apps from more than one stack are running at once ($($fam -join ', ')) - close all but the one in use." }
+} else { Out-Report 'None running.' }
+
+$pids = @($procs | ForEach-Object Id) + @($svc | Where-Object { $_.ProcessId } | ForEach-Object ProcessId) | Select-Object -Unique
+Out-Report ''
+Out-Report '-- Local listening ports owned by those processes (browser-to-helper connection) --'
+try {
+    $listen = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $pids -contains $_.OwningProcess })
+    if ($listen) {
+        $listen | Select-Object LocalAddress, LocalPort, OwningProcess, @{n='Process';e={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}} | Sort-Object LocalPort -Unique | Format-Table -AutoSize | Out-Report
+        foreach ($l in ($listen | Sort-Object LocalPort -Unique)) {
+            $ok = $false
+            try { $c = New-Object Net.Sockets.TcpClient; $iar = $c.BeginConnect('127.0.0.1', $l.LocalPort, $null, $null); $ok = $iar.AsyncWaitHandle.WaitOne(2000) -and $c.Connected; $c.Close() } catch {}
+            Out-Report ("  localhost:{0} connect test: {1}" -f $l.LocalPort, $(if ($ok) {'OK'} else {'FAILED'}))
+            if (-not $ok -and $l.LocalAddress -in @('0.0.0.0','127.0.0.1','::','::1')) { Add-Finding 'WARN' "Scanner helper port $($l.LocalPort) is listening but a localhost connection failed - firewall/EDR may be blocking it." }
+        }
+    } else {
+        Out-Report 'No listening ports owned by scanner processes/services.'
+        if ($svc -or $procs) { Add-Finding 'INFO' 'Scanner helper is not listening on any local port. If the scanning app runs in a browser it usually needs a local helper listening - restart/reinstall the helper.' }
+    }
+} catch { Out-Report "Could not read TCP listeners: $($_.Exception.Message)" }
+
+# ------------------------------------------------------------------ 5. Browsers
+Section '5. BROWSERS AND LOCAL-NETWORK POLICIES'
+$browsers = @(
+    @{ N = 'Google Chrome';  P = @("$env:ProgramFiles\Google\Chrome\Application\chrome.exe", "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe") },
+    @{ N = 'Microsoft Edge'; P = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") },
+    @{ N = 'Mozilla Firefox';P = @("$env:ProgramFiles\Mozilla Firefox\firefox.exe", "${env:ProgramFiles(x86)}\Mozilla Firefox\firefox.exe") }
+)
+foreach ($b in $browsers) {
+    $exe = $b.P | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    if ($exe) { Out-Report ("{0,-16} {1}" -f $b.N, (Get-Item $exe).VersionInfo.ProductVersion) }
+}
+$polRows = foreach ($root in 'HKLM:\SOFTWARE\Policies\Google\Chrome', 'HKCU:\SOFTWARE\Policies\Google\Chrome', 'HKLM:\SOFTWARE\Policies\Microsoft\Edge', 'HKCU:\SOFTWARE\Policies\Microsoft\Edge') {
+    foreach ($k in @(Get-Item $root -ErrorAction SilentlyContinue) + @(Get-ChildItem $root -ErrorAction SilentlyContinue)) {
+        if ($k.PSChildName -match 'PrivateNetwork|LocalNetwork|Loopback') {
+            foreach ($vn in $k.GetValueNames()) { [pscustomobject]@{ Key = $k.Name; Value = $vn; Data = $k.GetValue($vn) } }
+        }
+        foreach ($vn in $k.GetValueNames()) {
+            if ($vn -match 'PrivateNetwork|LocalNetwork|Loopback') { [pscustomobject]@{ Key = $k.Name; Value = $vn; Data = $k.GetValue($vn) } }
+        }
+    }
+}
+Out-Report ''
+Out-Report '-- Chrome / Edge local / private network access policies --'
+if ($polRows) { $polRows | Format-Table -AutoSize -Wrap | Out-Report } else { Out-Report 'None set (browser defaults).' }
+Out-Report 'Note: newer Chrome/Edge versions ask before a website may reach devices on the local network/localhost.'
+Out-Report '      If the scanning page hangs at "connecting to scanner", check the site permission (padlock icon) for local network access.'
+
+# ------------------------------------------------------------------ 6. Security software
+Section '6. ANTIVIRUS / EDR'
+try {
+    $av = @(Get-CimInstance -Namespace root\SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction Stop)
+    if ($av) { $av | Select-Object displayName, pathToSignedReportingExe | Format-Table -AutoSize -Wrap | Out-Report } else { Out-Report 'No products registered in Security Center.' }
+} catch { Out-Report 'Security Center not available (normal on servers).' }
+$edr = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'SentinelOne|Sentinel Agent|CrowdStrike|Falcon|Sophos|Bitdefender|Webroot|Malwarebytes|Huntress|Defender for Endpoint|Sense|ESET|Trend Micro|Cylance|Carbon Black' })
+if ($edr) { Out-Report ''; $edr | Select-Object DisplayName, Status | Format-Table -AutoSize | Out-Report; Add-Finding 'INFO' "Security agents present ($(($edr.DisplayName | Select-Object -Unique) -join ', ')) - if nothing else explains the hang, add exclusions for the scanner driver/helper folders and check the agent's block log." }
+
+# ------------------------------------------------------------------ 7. Event logs
+Section "7. EVENT LOGS (last $Days day(s))"
+$scanProcNames = @($procs | ForEach-Object { $_.ProcessName }) + @($svc | ForEach-Object { if ($_.PathName -match '([^\\"]+)\.exe') { $Matches[1] } }) | Where-Object { $_ } | Select-Object -Unique
+$appEv = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1000, 1002, 1026; StartTime = $since } -ErrorAction SilentlyContinue | Where-Object {
+    $m = $_.Message
+    ($m -match $Pattern) -or ($m -match '\b(chrome|msedge|firefox)\.exe') -or (@($scanProcNames | Where-Object { $_.Length -gt 2 -and $m -match [regex]::Escape("$_.exe") }).Count -gt 0)
+})
+Out-Report '-- Application crashes (1000) / hangs (1002) / .NET errors (1026) for scanner apps or browsers --'
+if ($appEv) {
+    $appEv | Select-Object -First 40 TimeCreated, Id, ProviderName, @{n='Message';e={ ($_.Message -split "`r?`n" | Select-Object -First 3) -join ' | ' }} | Format-Table -AutoSize -Wrap | Out-Report
+    $hangs = @($appEv | Where-Object Id -eq 1002)
+    if ($hangs) { Add-Finding 'WARN' "$($hangs.Count) application HANG event(s) (ID 1002) for scanner apps/browsers in the last $Days days." }
+    $crash = @($appEv | Where-Object Id -in 1000, 1026)
+    if ($crash) { Add-Finding 'WARN' "$($crash.Count) application CRASH event(s) for scanner apps/browsers in the last $Days days." }
+} else { Out-Report 'None.' }
+
+Out-Report ''
+Out-Report '-- Other Application/System errors & warnings mentioning the scanner software --'
+$other = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application', 'System'; Level = 1, 2, 3; StartTime = $since } -ErrorAction SilentlyContinue |
+           Where-Object { $_.Id -notin 1000, 1002, 1026 -and ("$($_.ProviderName) $($_.Message)" -match $Pattern) })
+if ($other) {
+    $other | Select-Object -First 40 TimeCreated, LogName, Id, ProviderName, @{n='Message';e={ ($_.Message -split "`r?`n" | Select-Object -First 2) -join ' | ' }} | Format-Table -AutoSize -Wrap | Out-Report
+    Add-Finding 'WARN' "$($other.Count) error/warning event(s) mention the scanner software - see section 7."
+} else { Out-Report 'None.' }
+
+Out-Report ''
+Out-Report '-- USB / Plug and Play device problems and disconnects --'
+$usbEv = @()
+$usbEv += @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1, 2, 3; StartTime = $since } -ErrorAction SilentlyContinue | Where-Object { $_.ProviderName -match 'Kernel-PnP|UserPnp|USBHUB|USBXHCI|usbhub|USB-' })
+$usbEv += @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Kernel-PnP/Configuration'; StartTime = $since } -ErrorAction SilentlyContinue | Where-Object {
+    $msg = $_.Message
+    ($_.Level -le 3) -or ($msg -match $Pattern) -or (@($scanIds | Where-Object { $_ -and $msg.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -gt 0)
+})
+$usbEv = @($usbEv | Sort-Object TimeCreated -Descending)
+if ($usbEv) {
+    $usbEv | Select-Object -First 40 TimeCreated, Id, ProviderName, @{n='Message';e={ ($_.Message -split "`r?`n" | Select-Object -First 2) -join ' | ' }} | Format-Table -AutoSize -Wrap | Out-Report
+    $scanUsb = @($usbEv | Where-Object { $msg = $_.Message; ($msg -match $Pattern) -or (@($scanIds | Where-Object { $_ -and $msg.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -gt 0) })
+    if ($scanUsb) { Add-Finding 'WARN' "$($scanUsb.Count) USB/PnP warning/error event(s) reference the scanner - suggests disconnects/resets (cable, port, hub, power)." }
+    elseif ($usbEv.Count -ge 10) { Add-Finding 'INFO' "$($usbEv.Count) general USB/PnP warnings in the last $Days days (not tied to the scanner by name)." }
+} else { Out-Report 'None.' }
+
+# ------------------------------------------------------------------ 8. Scanner log files
+Section '8. SCANNER / HELPER LOG FILES'
+$roots = @($env:ProgramData, $env:ProgramFiles, ${env:ProgramFiles(x86)}) + @(Get-ChildItem 'C:\Users' -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'AppData\Local'; Join-Path $_.FullName 'AppData\Roaming' }) | Where-Object { $_ -and (Test-Path $_) }
+$logDirs = foreach ($r in $roots) { Get-ChildItem -Path $r -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $Pattern } }
+$logs = @(foreach ($d in $logDirs) { Get-ChildItem -Path $d.FullName -Recurse -File -Include *.log, *.txt, *.trc -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $since -and $_.Length -lt 200MB } })
+if ($logs) {
+    $logs | Sort-Object LastWriteTime -Descending | Select-Object -First 30 LastWriteTime, @{n='KB';e={[math]::Round($_.Length/1KB)}}, FullName | Format-Table -AutoSize -Wrap | Out-Report
+    $i = 0
+    foreach ($l in ($logs | Sort-Object LastWriteTime -Descending | Select-Object -First 15)) {
+        $i++
+        $dest = Join-Path $logDir ("{0:D2}_{1}" -f $i, $l.Name)
+        try { Get-Content -LiteralPath $l.FullName -Tail 300 -ErrorAction Stop | Set-Content -Path $dest -Encoding UTF8 } catch {}
+        $errLines = @(Get-Content -LiteralPath $l.FullName -Tail 300 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'error|exception|timeout|timed out|fail|jam|not found|disconnect' })
+        if ($errLines) {
+            Out-Report ''
+            Out-Report "  Recent error lines in $($l.FullName):"
+            $errLines | Select-Object -Last 8 | ForEach-Object { Out-Report "    $_" }
+        }
+    }
+    Out-Report ''
+    Out-Report "Last 300 lines of the 15 newest logs copied to: $logDir"
+} else { Out-Report 'No recent log files found under scanner-named folders in ProgramData, Program Files or user AppData.' }
+
+# ------------------------------------------------------------------ 9. Fixes
+if ($ApplyFixes) {
+    Section '9. APPLYING FIXES'
+    try {
+        powercfg /setacvalueindex SCHEME_CURRENT $ssGuidSub $ssGuid 0 | Out-Null
+        powercfg /setdcvalueindex SCHEME_CURRENT $ssGuidSub $ssGuid 0 | Out-Null
+        powercfg /setactive SCHEME_CURRENT | Out-Null
+        Out-Report 'USB selective suspend disabled on the active power plan (AC + DC).'
+    } catch { Out-Report "Could not change USB selective suspend: $($_.Exception.Message)" }
+    foreach ($p in $psm) {
+        $id = ($p.InstanceName -replace '_\d+$', '')
+        if (($scanIds -contains $id -or $hubIds -contains $id) -and $p.Enable) {
+            try { Set-CimInstance -InputObject $p -Property @{ Enable = $false } -ErrorAction Stop; Out-Report "Power-off disabled: $id" }
+            catch { Out-Report "Could not change power setting for $id : $($_.Exception.Message)" }
+        }
+    }
+    foreach ($s in $svc | Where-Object { $_.StartMode -ne 'Disabled' }) {
+        try { Restart-Service -Name $s.Name -Force -ErrorAction Stop; Out-Report "Restarted service: $($s.DisplayName)" }
+        catch { try { Start-Service -Name $s.Name -ErrorAction Stop; Out-Report "Started service: $($s.DisplayName)" } catch { Out-Report "Could not restart $($s.DisplayName): $($_.Exception.Message)" } }
+    }
+    Out-Report 'Unplug the scanner, wait 10 seconds and plug it back in before testing.'
+}
+
+# ------------------------------------------------------------------ Summary
+Section 'SUMMARY'
+if ($Findings.Count -eq 0) { Add-Finding 'OK' 'No obvious problem found on the PC side.' }
+$order = @{ FAIL = 0; WARN = 1; INFO = 2; OK = 3 }
+foreach ($f in ($Findings | Sort-Object { $order[$_.Level] })) {
+    $color = switch ($f.Level) { 'FAIL' {'Red'} 'WARN' {'Yellow'} 'OK' {'Green'} default {'Gray'} }
+    $t = ("[{0,-4}] {1}" -f $f.Level, $f.Finding)
+    Add-Content -Path $Report -Value $t
+    Write-Host $t -ForegroundColor $color
+}
+Out-Report ''
+Out-Report 'Next steps if the scan still hangs:'
+Out-Report '  1. Close every browser window and every other scanner/deposit app, power-cycle the scanner, retry.'
+Out-Report '  2. Clean the feed path and sensors (compressed air); a dirty sensor can stall the feed with no error.'
+Out-Report '  3. Use a rear USB port directly on the PC (no hub/dock/monitor port), and a known-good cable.'
+Out-Report '  4. Reinstall: uninstall the scanner helper + driver, reboot, install the vendor-current driver FIRST, then the helper.'
+Out-Report '  5. Test in a second browser / InPrivate window with extensions off; allow local network access for the site.'
+Out-Report '  6. If the vendor test utility scans fine but the web app hangs, open a ticket with the software vendor with this report.'
+Out-Report ''
+Out-Report "Report: $Report"
+Write-Host "`nReport saved to $runDir" -ForegroundColor Green
+exit 0
 '@
 
 # ======================= Get-CrashDiagnostics.ps1 =======================
