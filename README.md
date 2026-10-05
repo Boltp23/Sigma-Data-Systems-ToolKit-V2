@@ -2,7 +2,7 @@
 
 *Prepared by [Sigma Data Systems Inc.](https://sigmadatainc.com/)*
 
-<!-- AUTO-VERSION -->**Current version: v2.0** | 124 options | updated 2026-10-03<!-- /AUTO-VERSION -->
+<!-- AUTO-VERSION -->**Current version: v2.0** | 129 options | updated 2026-10-05<!-- /AUTO-VERSION -->
 
 ```
   _____ _____ _____ __  __            _____       _______
@@ -14,14 +14,14 @@
 ```
 
 One PowerShell file you can copy to any Windows workstation or server and run.
-It opens a numbered menu of **124 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
+It opens a numbered menu of **129 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
 Each option either checks something and writes a report, or makes a fix after asking you to confirm.
 
-- **One file, nothing to install.** 34 longer scripts (plus 2 data files) are built into the file as plain, readable text.
+- **One file, nothing to install.** 35 longer scripts (plus 2 data files) are built into the file as plain, readable text.
 - **Nothing is tied to one client.** Hostnames, domains, VMs, IPs and users are detected automatically or asked for, with defaults you can accept by pressing ENTER.
 - **Changes always ask first.** Options marked `[!]` change the machine, and you must type `YES` before they do anything. Everything else only reads.
 - **All output goes to `C:\temp`**, in one subfolder per area.
-- **Third-party tools are downloaded when you need them** (Sysinternals, NirSoft, Ninite, Ookla Speedtest, Microsoft TSS / SetupDiag / Office Deployment Tool). Each download is checked that it's a real installer and, where the vendor signs it, that the signature is valid. Nothing third-party is bundled in the file.
+- **Third-party tools are downloaded when you need them** (Sysinternals, NirSoft, Ninite, Ookla Speedtest, Microsoft TSS / SetupDiag / Office Deployment Tool), and M365 security modules (Microsoft-Extractor-Suite, Hawk, ScubaGear, Maester) are installed from the PowerShell Gallery on first use. Each download is checked that it's a real installer and, where the vendor signs it, that the signature is valid. Nothing third-party is bundled in the file.
 - **Built-in self-test.** `-SelfTest` runs every read-only option unattended and writes a PASS / WARN / FAIL report.
 
 ---
@@ -92,7 +92,7 @@ The home screen shows the banner, a line about the machine (host, domain, OS, ad
 | Type | Does |
 |---|---|
 | A section letter (`A`, `C`, `D`...) | Open that section |
-| Any option number (`1`-`124`) | Run that option directly, from any screen |
+| Any option number (`1`-`129`) | Run that option directly, from any screen |
 | `ALL` | List every option |
 | `B` | Back to the section list |
 | `O` | Change the output folder |
@@ -110,7 +110,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 ## All options
 
 <!-- AUTO-OPTIONS:START -->
-<details><summary><b>Quick index of all 124 options</b> (auto-generated from the script, 2026-10-03)</summary>
+<details><summary><b>Quick index of all 129 options</b> (auto-generated from the script, 2026-10-05)</summary>
 
 **A. SYSTEM HEALTH**
 
@@ -274,6 +274,11 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 122. [!] M365: create app registration for unattended automation (cert auth)
 123. [!] THIS PC: force a Hybrid Entra ID join attempt
 124. [!] THIS PC: back up BitLocker recovery key to Entra ID
+125. M365: failed sign-in ALERT check - user + IP -> error codes -> verdict (Augmentt)
+126. M365 IR: Microsoft-Extractor-Suite (Invictus IR) - evidence triage, user or tenant
+127. M365 IR: Hawk - compromised user / tenant investigation
+128. M365 audit: CISA ScubaGear - SCuBA secure-baseline assessment (HTML)
+129. M365 audit: Maester - automated Entra / Exchange / CISA security tests (HTML)
 
 </details>
 <!-- AUTO-OPTIONS:END -->
@@ -458,6 +463,13 @@ Each option runs in its own PowerShell window and signs in only to the services 
 | 122 | **[!]** Create an app registration for unattended automation | Certificate auth, admin consent granted in code |
 | 123 | **[!]** THIS PC: force a Hybrid Entra ID join attempt | gpupdate + Automatic-Device-Join task, with troubleshooting hints |
 | 124 | **[!]** THIS PC: back up the BitLocker recovery key to Entra ID | |
+| 125 | Failed sign-in **alert check** (user + IP) | For Augmentt / Defender "failed logins from outside operating country" alerts. Translates every Entra error code and gives a verdict: password **not known** (50126 / 50053), password **known** and stopped at MFA (50074 / 50076 / 500121 / 53003...), or **compromised** (success). Also shows Security Defaults, Conditional Access and the user's MFA methods, and flags tenant-wide sprays and Azure-management / PowerShell targets. Graph sign-in logs (P1), automatic fallback to the Unified Audit Log for tenants without P1 |
+| 126 | Microsoft-Extractor-Suite (Invictus IR) | `Start-MESTriage` Quick / Standard / Comprehensive for one or more users or the whole tenant: sign-in and audit logs, UAL operations, MFA, mailbox rules, OAuth apps, risky users, devices. CSV output in `C:\temp\M365\ExtractorSuite` |
+| 127 | Hawk | User investigation (mailbox config, rules, forwarding, auth history, mailbox audit, message trace, mobile devices) or tenant investigation (admin / config changes, consent grants, transport rules). Output in `C:\temp\M365\Hawk` |
+| 128 | CISA ScubaGear | Tenant configuration vs. CISA SCuBA baselines (Entra, Defender, Exchange, SharePoint, Teams, optional Power Platform / Power BI). HTML report. Windows PowerShell 5.1; sign in with an account **in** the client tenant (Global Reader is enough), GDAP is not supported |
+| 129 | Maester | Hundreds of Entra / Exchange / CISA / EIDSCA Pester tests with an HTML pass/fail report and the fix for each. Test library kept in `C:\temp\Maester\tests` and updated on request |
+
+Options 125-129 install their PowerShell Gallery modules for the current user on first use (you're asked first), and offer an update when a newer version is published. Exchange Online is loaded before Microsoft Graph, using EXO 3.7.1 when it's installed (option 92), to avoid the "method not found" clash in Windows PowerShell 5.1.
 
 ---
 
@@ -545,6 +557,10 @@ Before a downloaded `.exe` / `.msi` is run:
 | Microsoft SetupDiag | https://go.microsoft.com/fwlink/?linkid=870142 |
 | Microsoft Update Catalog | https://www.catalog.update.microsoft.com/ |
 | Ookla Speedtest CLI | https://www.speedtest.net/apps/cli |
+| Microsoft-Extractor-Suite (PowerShell Gallery) | https://github.com/invictus-ir/Microsoft-Extractor-Suite |
+| Hawk (PowerShell Gallery) | https://github.com/T0pCyber/hawk |
+| CISA ScubaGear (PowerShell Gallery) | https://github.com/cisagov/ScubaGear |
+| Maester (PowerShell Gallery) | https://maester.dev |
 | Built-in speed test servers | https://speed.cloudflare.com/ |
 
 **Deliberately excluded:** NirSoft password-recovery tools and PsExec. EDR products flag these as hacking tools.
@@ -647,6 +663,7 @@ SigmaDataSystems-ToolKit-v2.ps1
 ## Changelog
 
 ### v2.0 (2026-10)
+- **M365 incident response / audit (options 125-129)**: failed sign-in alert check with error-code verdict (Graph, with Unified Audit Log fallback for tenants without P1), Microsoft-Extractor-Suite (Invictus IR) triage, Hawk user / tenant investigation, CISA ScubaGear baseline assessment, Maester security tests.
 - **Microsoft 365 section (options 91-124)**: compromised-account audit and containment, inbox rules with audit-log timestamps, forwarding, message trace, quarantine release, sender filtering diagnosis (BCL vs SCL), SPF / DKIM / DMARC, Direct Send connectors, mobile device wipe, audit log, sign-ins, MFA, stale accounts, admin roles, licenses, new users, app consent, expiring app secrets, Intune / BitLocker escrow, OneDrive sharing, retention exclusions, tenant hardening, posture audit and remediation plan, app registration, hybrid join and BitLocker-to-Entra on the PC. Works for client tenants via GDAP.
 - Section menu: section letters, direct option numbers, `ALL`, `B` back.
 - **Wi-Fi deep diagnostics and live monitor**: channel overlap and congestion scoring, channel utilization, DFS, sticky-client / wrong-band detection, driver and power-saving checks, disconnect history, roam/drop/lag monitoring.
@@ -682,6 +699,7 @@ SigmaDataSystems-ToolKit-v2.ps1
 - **Downloaded tools** keep their own licenses and are not redistributed here:
   - Sysinternals - Microsoft license terms: https://learn.microsoft.com/sysinternals/license-terms. Command-line tools run with `-accepteula` after you confirm.
   - NirSoft - freeware by Nir Sofer: https://www.nirsoft.net
+  - Microsoft-Extractor-Suite (Invictus IR, GPL-2.0), Hawk (MIT), CISA ScubaGear (CC0-1.0) and Maester (MIT) - installed from the PowerShell Gallery at run time, not redistributed here.
   - Ninite, Ookla Speedtest CLI (its license and privacy terms are accepted when you run it), Microsoft TSS / SetupDiag / Office Deployment Tool - their vendors' terms apply.
 
 ---

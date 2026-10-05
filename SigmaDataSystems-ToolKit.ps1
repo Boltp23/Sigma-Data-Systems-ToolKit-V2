@@ -38,7 +38,9 @@
     backup/VSS health, shares/open files, advanced network (MTU/tracert/proxy/Wi-Fi), server roles,
     quick fixes (spooler, network, Teams, Office, OneDrive), software deployment (Ninite, vendor
     MSIs, Microsoft 365 Apps via ODT, remove OEM Office), Sysinternals (Autoruns, Sigcheck, Handle,
-    ProcDump, GUI tools), NirSoft reports, Microsoft SetupDiag and TSS. Third-party tools are
+    ProcDump, GUI tools), NirSoft reports, Microsoft SetupDiag and TSS. M365 incident response / audit:
+    failed sign-in alert verdict, Microsoft-Extractor-Suite (Invictus IR), Hawk, CISA ScubaGear and Maester
+    (PowerShell Gallery modules, installed for the current user on first use). Third-party tools are
     downloaded at run time from their official sites into C:\temp\Tools and signature-checked;
     nothing third-party is bundled. Ideas also drawn from MIT-licensed GitHub toolkits
     (bcwilhite/PendingReboot, MahmoudNoureddine/SysAdmin-PS-Toolkit, steviecoaster/PSSysadminToolkit).
@@ -1839,6 +1841,10 @@ $Script:ToolLinks = [ordered]@{
     'Microsoft SaRA / Get Help'        = 'https://aka.ms/SaRA-FirstScreen'
     'WizTree (disk space, free personal use)' = 'https://diskanalyzer.com/download'
     'Ookla Speedtest CLI'              = 'https://www.speedtest.net/apps/cli'
+    'Microsoft-Extractor-Suite (Invictus IR)' = 'https://github.com/invictus-ir/Microsoft-Extractor-Suite'
+    'Hawk (M365 investigation)'        = 'https://github.com/T0pCyber/hawk'
+    'CISA ScubaGear'                   = 'https://github.com/cisagov/ScubaGear'
+    'Maester (M365 security tests)'    = 'https://maester.dev'
 }
 
 function Get-ToolsDir([string]$Sub) { Get-OutDir ("Tools\" + $Sub) }
@@ -2772,6 +2778,83 @@ function Invoke-M365Simple([string]$Title, [string]$Action, [switch]$AskUser, [s
     Invoke-M365 $Action $x
 }
 
+# ---------- M365 security / incident-response tools (Extractor Suite, Hawk, ScubaGear, Maester) ----------
+# All run the embedded 'M365-SecurityTools' script in its own process. Third-party modules are
+# installed from the PowerShell Gallery (current user) the first time, after asking.
+
+function Invoke-M365Sec {
+    param([string]$Action, [System.Collections.IDictionary]$Extra = @{})
+    Write-Host "  M365 target: $(Get-M365Label)" -ForegroundColor DarkGray
+    $p = [ordered]@{ Action = $Action }
+    foreach ($k in (Get-M365Params).Keys) { $p[$k] = (Get-M365Params)[$k] }
+    $p.OutputPath = (Get-OutDir 'M365')
+    foreach ($k in $Extra.Keys) { $p[$k] = $Extra[$k] }
+    return (Invoke-Tool 'M365-SecurityTools' $p)
+}
+
+function Invoke-M365SignInCheck {
+    Write-Title 'M365: failed sign-in alert check (user + IP -> error codes -> verdict)'
+    Write-Host '  For Augmentt / Defender "failed logins from outside operating country" alerts. Tells you whether the'
+    Write-Host '  attacker has the password (stopped at MFA), got in, or only guessed wrong. Also checks Security Defaults,'
+    Write-Host '  Conditional Access and the user''s MFA methods. Uses Graph sign-in logs (P1); falls back to the Unified Audit Log.'
+    $u  = Read-Default 'User UPN from the alert (blank = all users from the IP)' ''
+    $ip = Read-Default 'Logon IP from the alert (blank = all IPs for the user)' ''
+    if (-not $u -and -not $ip) { Write-Host '  Need a user, an IP, or both.' -ForegroundColor Red; return }
+    $d = Read-Int 'Days to look back (alert date must be inside this window)' 7
+    $x = [ordered]@{ UserPrincipalName = $u; IPAddress = $ip; Days = $d }
+    $code = Invoke-M365Sec 'SignInCheck' $x
+    if ($code -eq 3) {
+        if ($d -lt 30) { $d = Read-Int 'Unified Audit Log keeps up to 180 days. Days to look back' ([math]::Max($d, 14)) }
+        $x.Days = $d
+        Invoke-M365Sec 'SignInCheckUAL' $x | Out-Null
+    }
+}
+
+function Invoke-M365ExtractorSuite {
+    Write-Title 'M365: Microsoft-Extractor-Suite (Invictus IR) - incident-response evidence triage'
+    Write-Host '  Collects sign-in + audit logs, Unified Audit Log operations, MFA status, mailbox rules, OAuth apps,'
+    Write-Host '  risky users, devices and more into CSV files (Start-MESTriage). Read-only.'
+    Write-Host '  Templates:  Quick = fastest essentials   Standard = balanced (recommended)   Comprehensive = almost everything'
+    $u = Read-Default 'User UPN(s), comma-separated (blank = whole tenant, much slower)' ''
+    $t = Read-Default 'Template (Quick / Standard / Comprehensive)' 'Standard'
+    if ($t -notin 'Quick', 'Standard', 'Comprehensive') { $t = 'Standard' }
+    $d = Read-Int 'Days to look back (UAL keeps 180 days; Graph sign-ins 30 days with P1)' 30
+    Invoke-M365Sec 'Extractor' ([ordered]@{ UserPrincipalName = $u; Mode = $t; Days = $d }) | Out-Null
+}
+
+function Invoke-M365Hawk {
+    Write-Title 'M365: Hawk - compromised user / tenant investigation'
+    Write-Host '  User mode: mailbox config, inbox rules, forwarding, auth history, mailbox audit, message trace, mobile devices.'
+    Write-Host '  Tenant mode: tenant-wide config changes, admin role changes, consent grants, transport rules, eDiscovery.'
+    $m = Read-Default 'Investigate a (U)ser or the whole (T)enant?' 'U'
+    $x = [ordered]@{ Days = (Read-Int 'Days to look back (1-365)' 30) }
+    if ($m -match '^[Tt]') { $x.Mode = 'Tenant' }
+    else {
+        $u = Read-Default 'User UPN(s), comma-separated' ''
+        if (-not $u) { return }
+        $x.Mode = 'User'; $x.UserPrincipalName = $u
+    }
+    Invoke-M365Sec 'Hawk' $x | Out-Null
+}
+
+function Invoke-M365ScubaGear {
+    Write-Title 'M365: CISA ScubaGear - tenant configuration vs. CISA SCuBA secure baselines'
+    Write-Host '  Checks Entra ID (aad), Defender / security suite, Exchange Online, SharePoint/OneDrive, Teams (and optionally'
+    Write-Host '  Power Platform / Power BI) against CISA''s baselines and writes an HTML report. Read-only. Windows PowerShell 5.1.'
+    Write-Host '  Sign in with an admin account IN the client tenant (Global Reader is enough) - GDAP sign-in is not supported.' -ForegroundColor DarkYellow
+    $p = Read-Default 'Products (aad, securitysuite, exo, sharepoint, teams, powerplatform, powerbi, or * for all)' 'aad,securitysuite,exo,sharepoint,teams'
+    $dep = Read-YesNo 'Install / update ScubaGear dependencies (needed on first run or after a ScubaGear update)?' $false
+    Invoke-M365Sec 'Scuba' ([ordered]@{ Products = $p; UpdateDependencies = $dep }) | Out-Null
+}
+
+function Invoke-M365Maester {
+    Write-Title 'M365: Maester - automated Entra / Exchange / CISA / EIDSCA security tests'
+    Write-Host '  Runs the Maester test library (hundreds of Pester tests) against the tenant and writes an HTML report with'
+    Write-Host '  pass/fail and the fix for each test. Read-only. Test library is kept in <output>\Maester\tests.'
+    $exo = Read-YesNo 'Also connect to Exchange Online for the Exchange / CISA EXO tests?' $true
+    Invoke-M365Sec 'Maester' ([ordered]@{ IncludeExchange = $exo }) | Out-Null
+}
+
 # ---------- Entra / Intune on THIS device ------------------------------------------------
 
 function Invoke-ForceHybridJoin {
@@ -3381,6 +3464,11 @@ $Script:Menu = @(
     @{               Text = '[!] M365: create app registration for unattended automation (cert auth)';         Action = { Invoke-M365AppRegistration } }
     @{               Text = '[!] THIS PC: force a Hybrid Entra ID join attempt';                               Action = { Invoke-ForceHybridJoin } }
     @{               Text = '[!] THIS PC: back up BitLocker recovery key to Entra ID';                        Action = { Invoke-BitLockerToEntra } }
+    @{               Text = 'M365: failed sign-in ALERT check - user + IP -> error codes -> verdict (Augmentt)'; Action = { Invoke-M365SignInCheck } }
+    @{               Text = 'M365 IR: Microsoft-Extractor-Suite (Invictus IR) - evidence triage, user or tenant';  Action = { Invoke-M365ExtractorSuite } }
+    @{               Text = 'M365 IR: Hawk - compromised user / tenant investigation';                         Action = { Invoke-M365Hawk } }
+    @{               Text = 'M365 audit: CISA ScubaGear - SCuBA secure-baseline assessment (HTML)';             Action = { Invoke-M365ScubaGear } }
+    @{               Text = 'M365 audit: Maester - automated Entra / Exchange / CISA security tests (HTML)';    Action = { Invoke-M365Maester } }
 )
 
 # Number the menu items in order (adding/removing an item never needs renumbering)
@@ -15694,6 +15782,489 @@ default { Write-Host "Unknown action '$Action'." -ForegroundColor Red; exit 2 }
 try { if (Get-Command Disconnect-ExchangeOnline -ErrorAction SilentlyContinue) { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } } catch { }
 try { if (Get-Command Disconnect-MgGraph -ErrorAction SilentlyContinue) { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } } catch { }
 Write-Host "`nReports: $OutputPath" -ForegroundColor DarkGray
+'@
+
+# ======================= M365-SecurityTools.ps1 =======================
+$Script:Payloads['M365-SecurityTools'] = @'
+<#
+.SYNOPSIS
+    Sigma Data Systems INC ToolKit - Microsoft 365 security tools (sign-in alert check,
+    Microsoft-Extractor-Suite, Hawk, CISA ScubaGear, Maester).
+
+.DESCRIPTION
+    Prepared by Sigma Data Systems Inc. - https://sigmadatainc.com/
+
+    One action per run (-Action), each in its own PowerShell process so Exchange Online and
+    Microsoft Graph assemblies never clash with another tool's session.
+
+      SignInCheck     Failed-login alert triage (Augmentt, Defender, etc.): for a user and/or an IP,
+                      pulls Entra sign-ins via Graph, translates every error code and gives a verdict
+                      (password NOT known / password KNOWN / account COMPROMISED). Also checks Security
+                      Defaults and the user's registered MFA methods. Exits 3 when the tenant has no
+                      Entra ID P1 (Graph sign-in logs unavailable) so the caller can run SignInCheckUAL.
+      SignInCheckUAL  Same verdict from the Unified Audit Log (works without P1, needs auditing on).
+      Extractor       Invictus IR Microsoft-Extractor-Suite triage (Start-MESTriage) for one/more users or the
+                      whole tenant: sign-in + audit logs, UAL, MFA, rules, OAuth apps, risky users, devices.
+      Hawk            Hawk user or tenant investigation (inbox rules, forwarding, auth history, admin changes).
+      Scuba           CISA ScubaGear - tenant configuration vs. CISA SCuBA baselines (HTML report).
+      Maester         Maester - 300+ Entra / Exchange / CISA / EIDSCA security tests (HTML report).
+
+    Third-party modules are installed from the PowerShell Gallery for the current user the first
+    time they are needed (you're asked first). Nothing in the tenant is changed by any action.
+
+    Works for your own tenant or a client tenant:
+      -AdminUPN               admin account to sign in with (optional)
+      -DelegatedOrganization  client tenant for partner / GDAP access to Exchange
+      -TenantId               client tenant (domain or GUID) for Microsoft Graph
+
+.NOTES
+    Third-party tools (their own licenses apply, installed from the PowerShell Gallery):
+      Microsoft-Extractor-Suite - Invictus IR, GPL-2.0   https://github.com/invictus-ir/Microsoft-Extractor-Suite
+      Hawk                      - T0pCyber, MIT          https://github.com/T0pCyber/hawk
+      ScubaGear                 - CISA, CC0-1.0          https://github.com/cisagov/ScubaGear
+      Maester                   - maester365, MIT        https://maester.dev
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][ValidateSet('SignInCheck', 'SignInCheckUAL', 'Extractor', 'Hawk', 'Scuba', 'Maester')][string]$Action,
+    [string]$AdminUPN,
+    [string]$DelegatedOrganization,
+    [string]$TenantId,
+    [string]$OutputPath = 'C:\temp\M365',
+    [string]$UserPrincipalName,
+    [string]$IPAddress,
+    [int]$Days = 7,
+    [string]$Mode,
+    [string]$Products,
+    [bool]$IncludeExchange = $true,
+    [bool]$UpdateDependencies = $false
+)
+
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+function Write-H([string]$t) { Write-Host "`n--- $t ---" -ForegroundColor Yellow }
+function Ask([string]$Prompt, $Default) {
+    $shown = if ("$Default" -ne '') { " [$Default]" } else { '' }
+    $a = Read-Host "$Prompt$shown"
+    if ([string]::IsNullOrWhiteSpace($a)) { return $Default }
+    return $a.Trim().Trim('"')
+}
+function Ensure-Dir([string]$p) { if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }; return $p }
+function Get-Stamp { Get-Date -Format 'yyyyMMdd_HHmmss' }
+function Get-TenantTag {
+    $t = if ($DelegatedOrganization) { $DelegatedOrganization } elseif ($TenantId) { $TenantId } elseif ($AdminUPN) { ($AdminUPN -split '@')[-1] } else { 'OwnTenant' }
+    return ($t -replace '[^\w\.-]', '_')
+}
+
+# ------------------------------------------------------------------ modules
+function Install-GalleryModule([string]$Name, [string]$RequiredVersion, [switch]$SkipPublisherCheck) {
+    if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
+    }
+    $p = @{ Name = $Name; Scope = 'CurrentUser'; Force = $true; AllowClobber = $true; Repository = 'PSGallery'; ErrorAction = 'Stop' }
+    if ($RequiredVersion) { $p.RequiredVersion = $RequiredVersion }
+    if ($SkipPublisherCheck) { $p.SkipPublisherCheck = $true }
+    Write-Host "  Installing $Name $RequiredVersion from the PowerShell Gallery (current user)..." -ForegroundColor DarkGray
+    Install-Module @p
+    Write-Host "  Installed $Name $RequiredVersion" -ForegroundColor Green
+}
+
+# Returns $true when the module was freshly installed.
+function Ensure-Module([string]$Name, [string]$MinVersion, [switch]$SkipPublisherCheck, [switch]$OfferUpdate) {
+    $have = Get-Module -ListAvailable -Name $Name | Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $have -or ($MinVersion -and $have.Version -lt [version]$MinVersion)) {
+        Write-Host "  Module $Name $(if ($MinVersion) { ">= $MinVersion " })is not installed." -ForegroundColor Yellow
+        if ((Ask "  Install $Name from the PowerShell Gallery now? Y/N" 'Y') -notmatch '^[Yy]') { throw "$Name is required for this option." }
+        Install-GalleryModule $Name -SkipPublisherCheck:$SkipPublisherCheck
+        return $true
+    }
+    Write-Host "  $Name $($have.Version) found." -ForegroundColor DarkGray
+    if ($OfferUpdate) {
+        try {
+            $latest = Find-Module -Name $Name -Repository PSGallery -ErrorAction Stop
+            if ([version]$latest.Version -gt $have.Version) {
+                if ((Ask "  $Name $($latest.Version) is available (you have $($have.Version)). Update now? Y/N" 'Y') -match '^[Yy]') {
+                    Install-GalleryModule $Name -SkipPublisherCheck:$SkipPublisherCheck
+                    return $true
+                }
+            }
+        } catch { Write-Host "  (Could not check the gallery for a newer $Name - continuing with $($have.Version).)" -ForegroundColor DarkGray }
+    }
+    return $false
+}
+
+# Graph SDK sub-modules must match Microsoft.Graph.Authentication's version exactly.
+function Ensure-GraphSubModules([string[]]$Names) {
+    Ensure-Module 'Microsoft.Graph.Authentication' '2.0.0' | Out-Null
+    $auth = Get-Module -ListAvailable Microsoft.Graph.Authentication | Sort-Object Version -Descending | Select-Object -First 1
+    foreach ($n in $Names) {
+        $match = Get-Module -ListAvailable $n | Where-Object { $_.Version -eq $auth.Version }
+        if (-not $match) {
+            Write-Host "  $n $($auth.Version) (to match Microsoft.Graph.Authentication) is not installed." -ForegroundColor Yellow
+            if ((Ask "  Install it now? Y/N" 'Y') -notmatch '^[Yy]') { throw "$n is required." }
+            Install-GalleryModule $n "$($auth.Version)"
+        }
+    }
+    return "$($auth.Version)"
+}
+
+# EXO 3.7.1 avoids the MSAL "method not found" clash with Microsoft Graph in Windows PowerShell 5.1.
+# Exchange must be imported BEFORE anything Graph in the same session.
+function Import-ExchangeFirst {
+    Ensure-Module 'ExchangeOnlineManagement' '3.4.0' | Out-Null
+    $v371 = Get-Module -ListAvailable ExchangeOnlineManagement | Where-Object { $_.Version -eq [version]'3.7.1' }
+    if ($v371) { Import-Module ExchangeOnlineManagement -RequiredVersion 3.7.1 -ErrorAction Stop -WarningAction SilentlyContinue }
+    else {
+        Import-Module ExchangeOnlineManagement -ErrorAction Stop -WarningAction SilentlyContinue
+        $v = (Get-Module ExchangeOnlineManagement).Version
+        if ($PSVersionTable.PSEdition -eq 'Desktop' -and $v -gt [version]'3.7.1') {
+            Write-Host "  Note: ExchangeOnlineManagement $v + Microsoft Graph can clash in PowerShell 5.1 ('method not found')." -ForegroundColor DarkYellow
+            Write-Host "        If that happens, run 'M365: install / repair PowerShell modules' and install EXO 3.7.1 side by side." -ForegroundColor DarkYellow
+        }
+    }
+}
+
+function Connect-EXO {
+    $c = @{ ShowBanner = $false; ErrorAction = 'Stop' }
+    if ($AdminUPN) { $c.UserPrincipalName = $AdminUPN }
+    if ($DelegatedOrganization) { $c.DelegatedOrganization = $DelegatedOrganization }
+    Write-Host '  Connecting to Exchange Online...' -ForegroundColor DarkGray
+    Connect-ExchangeOnline @c
+    $org = Get-OrganizationConfig
+    Write-Host "  Exchange Online: $($org.DisplayName) ($($org.Name))" -ForegroundColor Green
+}
+
+function Connect-Graph([string[]]$Scopes) {
+    $c = @{ Scopes = $Scopes; NoWelcome = $true; ErrorAction = 'Stop' }
+    if ($TenantId) { $c.TenantId = $TenantId }
+    Write-Host "  Connecting to Microsoft Graph ($($Scopes.Count) read scopes)..." -ForegroundColor DarkGray
+    Connect-MgGraph @c
+    $ctx = Get-MgContext
+    Write-Host "  Microsoft Graph: $($ctx.Account) / tenant $($ctx.TenantId)" -ForegroundColor Green
+}
+
+function Invoke-Graph([string]$Uri, [switch]$NoPaging) {
+    $out = New-Object System.Collections.Generic.List[object]
+    $next = $Uri
+    do {
+        $r = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType PSObject -ErrorAction Stop
+        if ($null -ne $r.value) { foreach ($v in $r.value) { $out.Add($v) } } else { $out.Add($r) }
+        $next = if ($NoPaging) { $null } else { $r.'@odata.nextLink' }
+    } while ($next)
+    return $out
+}
+
+# ------------------------------------------------------------------ sign-in error codes
+# Codes where Entra had ALREADY accepted the password (failure came after the first factor)
+$Script:PwdKnown = @{
+    '50055'  = 'Password expired - the password entered was correct'
+    '50072'  = 'User must enroll for MFA - password correct (attacker could register THEIR MFA!)'
+    '50074'  = 'Strong authentication required - password correct, stopped at MFA'
+    '50076'  = 'MFA required (location/app) - password correct, stopped at MFA'
+    '50079'  = 'User must register MFA - password correct (attacker could register THEIR MFA!)'
+    '500121' = 'MFA failed / denied - password correct'
+    '50125'  = 'Sign-in interrupted by password reset or registration - password correct'
+    '50140'  = 'Keep-me-signed-in interrupt - password correct'
+    '50158'  = 'External security challenge not satisfied - password correct'
+    '53000'  = 'Device not compliant (Conditional Access) - password correct'
+    '53001'  = 'Device not domain joined (Conditional Access) - password correct'
+    '53002'  = 'App not approved (Conditional Access) - password correct'
+    '53003'  = 'Blocked by Conditional Access - password correct'
+    '53004'  = 'Must complete MFA registration (proof-up) - password correct'
+    '530032' = 'Blocked by security policy - password correct'
+    '50097'  = 'Device authentication required - password correct'
+}
+$Script:PwdNotKnown = @{
+    '50126'  = 'Invalid username or password (wrong password)'
+    '50053'  = 'Account locked by Smart Lockout or sign-in from a malicious IP'
+    '50034'  = 'User account does not exist in this tenant'
+    '50056'  = 'Invalid or null password'
+    '50057'  = 'User account is disabled'
+    '50064'  = 'Credential validation failed'
+    '50128'  = 'Invalid domain name'
+    '50059'  = 'Tenant not found from the request'
+    '50144'  = 'Active Directory password expired (on-prem) - wrong or expired password'
+    '50173'  = 'Fresh auth token needed (password changed / token revoked)'
+    '50133'  = 'Session invalid because the password was changed or expired'
+    '700016' = 'Application not found in the tenant'
+    '7000218'= 'Request body missing client_assertion/client_secret (script / tool)'
+    '90095'  = 'Admin consent required'
+}
+
+function Get-CodeVerdict([string]$Code) {
+    if ($Code -eq '0' -or $Code -eq '') { return [pscustomobject]@{ Class = 'SUCCESS'; Meaning = 'Successful sign-in' } }
+    if ($Script:PwdKnown.ContainsKey($Code))    { return [pscustomobject]@{ Class = 'PASSWORD-KNOWN'; Meaning = $Script:PwdKnown[$Code] } }
+    if ($Script:PwdNotKnown.ContainsKey($Code)) { return [pscustomobject]@{ Class = 'BLOCKED'; Meaning = $Script:PwdNotKnown[$Code] } }
+    return [pscustomobject]@{ Class = 'OTHER'; Meaning = "Error $Code - look up at https://login.microsoftonline.com/error?code=$Code" }
+}
+
+function Write-Verdict($rows, [string]$Label, [string]$OutBase) {
+    $rows = @($rows)
+    Write-H "Results for $Label"
+    if ($rows.Count -eq 0) {
+        Write-Host '  No matching sign-ins found in the time window.' -ForegroundColor Yellow
+        Write-Host '  Check the dates (alert time vs. log retention: 7 days free / 30 days P1 / UAL 180 days) and the UPN / IP.' -ForegroundColor DarkGray
+        return
+    }
+    $rows | Sort-Object Time | Select-Object Time, User, IP, Country, App, ErrorCode, Class, Meaning | Format-Table -AutoSize -Wrap
+    Write-Host '  Summary by result:' -ForegroundColor Cyan
+    $rows | Group-Object Class, ErrorCode | Sort-Object Count -Descending | Select-Object Count, @{n='Class / Code';e={$_.Name}} | Format-Table -AutoSize
+    $ips = @($rows | Group-Object IP | Sort-Object Count -Descending)
+    Write-Host ("  IPs: " + (($ips | Select-Object -First 10 | ForEach-Object { "$($_.Name) ($($_.Count))" }) -join ', ')) -ForegroundColor Cyan
+    $users = @($rows | Group-Object User)
+    if ($users.Count -gt 1) { Write-Host "  $($users.Count) different accounts were targeted - this is a tenant-wide PASSWORD SPRAY, fix it tenant-wide (Security Defaults / Conditional Access)." -ForegroundColor Yellow }
+    $apps = @($rows | Where-Object { $_.App -match 'Service Management|Azure PowerShell|Azure CLI|Graph Command Line|Graph Explorer' })
+    if ($apps) { Write-Host "  Targets Azure management / PowerShell / CLI endpoints - typical of automated spray tools, not a normal user." -ForegroundColor Yellow }
+
+    $success = @($rows | Where-Object Class -eq 'SUCCESS')
+    $known   = @($rows | Where-Object Class -eq 'PASSWORD-KNOWN')
+    Write-Host ''
+    if ($success) {
+        Write-Host '  VERDICT: COMPROMISED - at least one sign-in SUCCEEDED from the IP(s) in question.' -ForegroundColor Red
+        Write-Host '  Do now: "[!] M365: CONTAIN compromised account" (block, revoke sessions, reset password, rules, forwarding),' -ForegroundColor Red
+        Write-Host '          then run the Extractor Suite or Hawk option to scope what the attacker did.' -ForegroundColor Red
+    } elseif ($known) {
+        Write-Host '  VERDICT: PASSWORD IS KNOWN TO THE ATTACKER - Entra accepted the password and only MFA / policy stopped it.' -ForegroundColor Red
+        Write-Host '  Do now: reset the password, revoke sessions, review the user''s MFA methods for anything they didn''t add.' -ForegroundColor Red
+        if ($known | Where-Object { $_.ErrorCode -in '50072', '50079', '53004' }) {
+            Write-Host '  CRITICAL: the account had NO MFA registered - the attacker may be able to register their own. Contain immediately.' -ForegroundColor Red
+        }
+    } else {
+        Write-Host '  VERDICT: password NOT known - every attempt failed at the password step or was blocked (Smart Lockout).' -ForegroundColor Green
+        Write-Host '  No account action needed. If it keeps happening, harden the tenant (Security Defaults / CA country block).' -ForegroundColor Green
+    }
+    $csv = "$OutBase.csv"
+    $rows | Sort-Object Time | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $csv
+    Write-Host "`n  Saved: $csv" -ForegroundColor DarkGray
+}
+
+# ======================================================================== ACTIONS
+$OutRoot = Ensure-Dir $OutputPath
+$tag = Get-TenantTag
+$exit = 0
+
+switch ($Action) {
+
+'SignInCheck' {
+    if (-not $UserPrincipalName -and -not $IPAddress) { throw 'Give a user UPN, an IP address, or both.' }
+    $out = Ensure-Dir (Join-Path $OutRoot 'SignInCheck')
+    Ensure-Module 'Microsoft.Graph.Authentication' '2.0.0' | Out-Null
+    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
+    Connect-Graph @('AuditLog.Read.All', 'Directory.Read.All', 'Policy.Read.All', 'UserAuthenticationMethod.Read.All')
+
+    Write-H 'Tenant protection'
+    try {
+        $sd = Invoke-Graph 'v1.0/policies/identitySecurityDefaultsEnforcementPolicy' -NoPaging | Select-Object -First 1
+        Write-Host ("  Security Defaults: {0}" -f $(if ($sd.isEnabled) { 'ON (MFA required for everyone, legacy auth blocked)' } else { 'OFF' })) -ForegroundColor $(if ($sd.isEnabled) { 'Green' } else { 'Yellow' })
+    } catch { Write-Host "  Security Defaults: could not read ($($_.Exception.Message))" -ForegroundColor DarkGray }
+    try {
+        $ca = @(Invoke-Graph 'v1.0/identity/conditionalAccess/policies' | Where-Object state -eq 'enabled')
+        Write-Host "  Conditional Access policies enabled: $($ca.Count)" -ForegroundColor $(if ($ca.Count) { 'Green' } else { 'Yellow' })
+    } catch { Write-Host '  Conditional Access: not available (no Entra ID P1) or no permission.' -ForegroundColor DarkGray }
+    if ($sd -and -not $sd.isEnabled -and -not $ca) { Write-Host '  NOTHING enforces MFA tenant-wide. A guessed password = a compromised account. Turn on Security Defaults.' -ForegroundColor Red }
+
+    if ($UserPrincipalName) {
+        Write-H "MFA methods registered for $UserPrincipalName"
+        try {
+            $m = Invoke-Graph "v1.0/users/$UserPrincipalName/authentication/methods"
+            $kinds = @($m | ForEach-Object { ($_.'@odata.type' -replace '#microsoft.graph.', '') -replace 'AuthenticationMethod$', '' })
+            $strong = @($kinds | Where-Object { $_ -ne 'password' })
+            Write-Host ("  Methods: " + ($kinds -join ', '))
+            if (-not $strong) { Write-Host '  NO MFA method registered - this account is protected by its password only.' -ForegroundColor Red }
+            else { Write-Host '  Check these with the user - any method they did not add themselves is a red flag.' -ForegroundColor DarkGray }
+        } catch { Write-Host "  Could not read MFA methods ($($_.Exception.Message))" -ForegroundColor DarkGray }
+    }
+
+    $since = (Get-Date).AddDays(-[math]::Min([math]::Max($Days, 1), 30)).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $f = @("createdDateTime ge $since")
+    if ($UserPrincipalName) { $f += "userPrincipalName eq '$($UserPrincipalName -replace "'", "''")'" }
+    if ($IPAddress)         { $f += "ipAddress eq '$IPAddress'" }
+    $label = (@($UserPrincipalName, $IPAddress) | Where-Object { $_ }) -join ' from '
+    Write-H "Entra sign-in logs (Graph, last $([math]::Min($Days,30)) days)"
+    try {
+        $raw = Invoke-Graph ("v1.0/auditLogs/signIns?`$filter=" + ($f -join ' and ') + "&`$top=500")
+    } catch {
+        $msg = "$($_.Exception.Message) $($_.ErrorDetails.Message)"
+        if ($msg -match 'NonPremium|premium|license|Forbidden|403') {
+            Write-Host '  This tenant has no Entra ID P1, so Graph sign-in logs are not available.' -ForegroundColor Yellow
+            Write-Host '  Falling back to the Unified Audit Log (Exchange Online) next...' -ForegroundColor Yellow
+            Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+            exit 3
+        }
+        throw
+    }
+    $rows = foreach ($s in $raw) {
+        $code = "$($s.status.errorCode)"; $v = Get-CodeVerdict $code
+        [pscustomobject]@{
+            Time = ([datetime]$s.createdDateTime).ToLocalTime(); User = $s.userPrincipalName; IP = $s.ipAddress
+            Country = $s.location.countryOrRegion; City = $s.location.city; App = $s.appDisplayName; Resource = $s.resourceDisplayName
+            ClientApp = $s.clientAppUsed; ErrorCode = $code; Class = $v.Class; Meaning = $v.Meaning
+            FailureReason = $s.status.failureReason; CA = $s.conditionalAccessStatus; UserAgent = $s.userAgent
+        }
+    }
+    Write-Verdict $rows $label (Join-Path $out ("SignInCheck_{0}_{1}_{2}" -f $tag, (($label -replace '[^\w\.]', '_')), (Get-Stamp)))
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+}
+
+'SignInCheckUAL' {
+    if (-not $UserPrincipalName -and -not $IPAddress) { throw 'Give a user UPN, an IP address, or both.' }
+    $out = Ensure-Dir (Join-Path $OutRoot 'SignInCheck')
+    Import-ExchangeFirst
+    Connect-EXO
+    $d = [math]::Min([math]::Max($Days, 1), 180)
+    $label = (@($UserPrincipalName, $IPAddress) | Where-Object { $_ }) -join ' from '
+    Write-H "Unified Audit Log - Entra logons, last $d days (this can take a minute)"
+    $p = @{ StartDate = (Get-Date).AddDays(-$d); EndDate = (Get-Date).AddMinutes(5); RecordType = 'AzureActiveDirectoryStsLogon'; ResultSize = 5000; SessionCommand = 'ReturnLargeSet'; SessionId = [guid]::NewGuid().ToString(); ErrorAction = 'Stop' }
+    if ($UserPrincipalName) { $p.UserIds = $UserPrincipalName }
+    if ($IPAddress)         { $p.FreeText = $IPAddress }
+    $all = New-Object System.Collections.Generic.List[object]
+    do {
+        $batch = @(Search-UnifiedAuditLog @p)
+        foreach ($b in $batch) { $all.Add($b) }
+    } while ($batch.Count -gt 0 -and $all.Count -lt 50000 -and $all.Count -lt ($batch[0].ResultCount))
+    if ($all.Count -eq 0 -and -not (Get-AdminAuditLogConfig).UnifiedAuditLogIngestionEnabled) {
+        Write-Host '  Unified audit logging is OFF in this tenant - nothing to search. Turn it on (Set-AdminAuditLogConfig -UnifiedAuditLogIngestionEnabled $true).' -ForegroundColor Red
+    }
+    $rows = foreach ($r in ($all | Sort-Object Identity -Unique)) {
+        $a = $r.AuditData | ConvertFrom-Json
+        $ip = if ($a.ClientIP) { $a.ClientIP } else { $a.ActorIpAddress }
+        if ($IPAddress -and $ip -ne $IPAddress) { continue }
+        $code = if ($r.Operations -eq 'UserLoggedIn') { '0' } elseif ($a.ErrorNumber) { "$($a.ErrorNumber)" } else { '' }
+        $v = Get-CodeVerdict $code
+        if ($code -eq '' -and $r.Operations -eq 'UserLoginFailed') { $v = [pscustomobject]@{ Class = 'BLOCKED'; Meaning = "Login failed: $($a.LogonError)" } }
+        $ua = ($a.ExtendedProperties | Where-Object Name -eq 'UserAgent' | Select-Object -First 1).Value
+        $target = ($a.Target | Select-Object -First 1).ID
+        [pscustomobject]@{
+            Time = $r.CreationDate.ToLocalTime(); User = $r.UserIds; IP = $ip; Country = ''; City = ''
+            App = "$($a.ApplicationId)"; Resource = "$target"; ClientApp = ''; ErrorCode = $code; Class = $v.Class; Meaning = $v.Meaning
+            FailureReason = $a.LogonError; CA = ''; UserAgent = $ua
+        }
+    }
+    $rows = @($rows | ForEach-Object { if ($_.App -eq '1950a258-227b-4e31-a9cf-717495945fc2' -or $_.Resource -match '797f4846-ba00-4fd7-ba43-dac1f8f63013') { $_.App = "$($_.App) (Azure PowerShell / Service Management API)" }; $_ })
+    Write-Verdict $rows $label (Join-Path $out ("SignInCheckUAL_{0}_{1}_{2}" -f $tag, (($label -replace '[^\w\.]', '_')), (Get-Stamp)))
+    Write-Host '  (UAL has no geo-location - Country/City are blank. Look the IP up in the alert or at ipinfo.io.)' -ForegroundColor DarkGray
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+}
+
+'Extractor' {
+    # Invictus IR Microsoft-Extractor-Suite - Start-MESTriage
+    $out = Ensure-Dir (Join-Path $OutRoot 'ExtractorSuite')
+    Import-ExchangeFirst
+    Ensure-Module 'Microsoft-Extractor-Suite' '3.0.0' -OfferUpdate | Out-Null
+    $gv = Ensure-GraphSubModules @('Microsoft.Graph.Users', 'Microsoft.Graph.Groups', 'Microsoft.Graph.Applications', 'Microsoft.Graph.Identity.DirectoryManagement', 'Microsoft.Graph.Identity.SignIns', 'Microsoft.Graph.Security')
+    Import-Module Microsoft-Extractor-Suite -ErrorAction Stop -WarningAction SilentlyContinue
+    foreach ($m in 'Microsoft.Graph.Users', 'Microsoft.Graph.Groups', 'Microsoft.Graph.Applications', 'Microsoft.Graph.Identity.DirectoryManagement', 'Microsoft.Graph.Identity.SignIns', 'Microsoft.Graph.Security') {
+        Import-Module $m -RequiredVersion $gv -ErrorAction Stop -WarningAction SilentlyContinue
+    }
+    $mesVer = (Get-Module Microsoft-Extractor-Suite).Version
+    Write-Host "  Microsoft-Extractor-Suite $mesVer loaded." -ForegroundColor Green
+
+    $c = @{ ShowBanner = $false; ErrorAction = 'Stop' }
+    if ($AdminUPN) { $c.UserPrincipalName = $AdminUPN }
+    if ($DelegatedOrganization) { $c.DelegatedOrganization = $DelegatedOrganization }
+    Write-Host '  Connecting to Exchange Online (Connect-M365)...' -ForegroundColor DarkGray
+    Connect-M365 @c
+    Connect-Graph @('AuditLog.Read.All', 'Directory.Read.All', 'User.Read.All', 'Group.Read.All', 'Application.Read.All', 'Policy.Read.All',
+                    'UserAuthenticationMethod.Read.All', 'IdentityRiskEvent.Read.All', 'IdentityRiskyUser.Read.All', 'SecurityEvents.Read.All', 'Device.Read.All')
+
+    $template = if ($Mode) { $Mode } else { 'Standard' }
+    $name = "MES_{0}_{1}_{2}" -f $tag, $(if ($UserPrincipalName) { 'Users' } else { 'Tenant' }), (Get-Stamp)
+    $dir = Join-Path $out $name
+    $t = @{ Template = $template; TriageName = $name; OutputDir = $dir; Output = 'CSV'; MergeOutput = $true
+            StartDate = (Get-Date).AddDays(-[math]::Max($Days, 1)).ToString('yyyy-MM-dd'); EndDate = (Get-Date).AddDays(1).ToString('yyyy-MM-dd') }
+    if ($UserPrincipalName) { $t.UserIds = $UserPrincipalName }
+    Write-H "Start-MESTriage -Template $template ($(if ($UserPrincipalName) { $UserPrincipalName } else { 'ALL users' }), last $Days days)"
+    Write-Host '  Notes: sign-in / audit logs via Graph need Entra ID P1 (free tenants: those tasks are skipped / error, the rest still runs).' -ForegroundColor DarkGray
+    Write-Host '         Risky users / detections need Entra ID P2. Unified Audit Log collection can take a long time for busy tenants.' -ForegroundColor DarkGray
+    Start-MESTriage @t
+    Write-Host "`n  Output: $dir" -ForegroundColor Green
+    Write-Host '  Start with: sign-in logs (look for the alert IP), MFA, mailbox rules, OAuth permissions, then UAL operations.' -ForegroundColor DarkGray
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+}
+
+'Hawk' {
+    $out = Ensure-Dir (Join-Path $OutRoot 'Hawk')
+    Import-ExchangeFirst
+    Ensure-Module 'Hawk' '3.0.0' -OfferUpdate | Out-Null
+    Import-Module Hawk -ErrorAction Stop -WarningAction SilentlyContinue
+    Write-Host "  Hawk $((Get-Module Hawk).Version) loaded." -ForegroundColor Green
+    # Pre-connect so Hawk reuses OUR sessions (client tenant via GDAP) instead of prompting for the home tenant
+    Connect-EXO
+    Connect-Graph @('AuditLog.Read.All', 'Directory.Read.All', 'User.Read.All', 'Application.Read.All', 'Policy.Read.All',
+                    'UserAuthenticationMethod.Read.All', 'IdentityRiskEvent.Read.All', 'IdentityRiskyUser.Read.All', 'Organization.Read.All')
+    $d = [math]::Min([math]::Max($Days, 1), 365)
+    Write-Host '  Hawk may ask for a free ipstack.com API key the first time (used to geo-locate sign-in IPs). Press ENTER to skip.' -ForegroundColor DarkGray
+    if ($Mode -eq 'Tenant') {
+        Write-H "Start-HawkTenantInvestigation (last $d days)"
+        Start-HawkTenantInvestigation -DaysToLookBack $d -FilePath $out -SkipUpdate
+    } else {
+        if (-not $UserPrincipalName) { throw 'A user UPN is required for a Hawk user investigation.' }
+        $users = @($UserPrincipalName -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        Write-H "Start-HawkUserInvestigation $($users -join ', ') (last $d days)"
+        Start-HawkUserInvestigation -UserPrincipalName $users -DaysToLookBack $d -FilePath $out -SkipUpdate
+    }
+    Write-Host "`n  Output: $out (one Hawk_<tenant>_<date> folder per run). Open the _Investigate files first - Hawk flags suspicious items there." -ForegroundColor Green
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+}
+
+'Scuba' {
+    if ($PSVersionTable.PSEdition -ne 'Desktop') { throw 'ScubaGear needs Windows PowerShell 5.1.' }
+    $out = Ensure-Dir (Join-Path $OutRoot 'ScubaGear')
+    $fresh = Ensure-Module 'ScubaGear' '1.5.0' -OfferUpdate
+    Import-Module ScubaGear -ErrorAction Stop -WarningAction SilentlyContinue
+    Write-Host "  ScubaGear $((Get-Module ScubaGear).Version) loaded." -ForegroundColor Green
+    $depCmd = if (Get-Command Install-ScubaDependencies -ErrorAction SilentlyContinue) { 'Install-ScubaDependencies' } elseif (Get-Command Initialize-SCuBA -ErrorAction SilentlyContinue) { 'Initialize-SCuBA' } else { $null }
+    if ($depCmd -and ($fresh -or $UpdateDependencies)) {
+        Write-H "$depCmd (installs ScubaGear's PowerShell dependencies and the OPA policy engine - first run takes a few minutes)"
+        & $depCmd
+    }
+    $prod = if ($Products) { @($Products -split '[,; ]' | Where-Object { $_ }) } else { @('aad', 'securitysuite', 'exo', 'sharepoint', 'teams') }
+    if ($prod -contains '*' -or $prod -contains 'all') { $prod = @('*') }
+    Write-H "Invoke-SCuBA -ProductNames $($prod -join ', ')"
+    Write-Host '  ScubaGear signs in interactively AS the account you pick - use an admin account that lives IN the client tenant' -ForegroundColor DarkGray
+    Write-Host '  (Global Reader is enough for most checks). Partner / GDAP sign-in is not supported by ScubaGear''s interactive mode.' -ForegroundColor DarkGray
+    Write-Host '  You may be asked to pick the account once per product.' -ForegroundColor DarkGray
+    $s = @{ ProductNames = $prod; OutPath = $out; OutFolderName = "ScubaResults_$tag"; DisconnectOnExit = $true }
+    Invoke-SCuBA @s
+    $latest = Get-ChildItem $out -Directory -Filter "ScubaResults_$tag*" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($latest) { Write-Host "`n  Report: $(Join-Path $latest.FullName 'BaselineReports.html')" -ForegroundColor Green }
+    Write-Host '  Failing "Shall" items are the CISA must-fix list - SMTP AUTH, legacy auth, MFA and audit logging are in the Entra (aad) / EXO sections.' -ForegroundColor DarkGray
+}
+
+'Maester' {
+    $out = Ensure-Dir (Join-Path $OutRoot 'Maester')
+    $tests = Ensure-Dir (Join-Path (Split-Path $OutRoot -Parent) 'Maester\tests')
+    if ($IncludeExchange) { Import-ExchangeFirst }
+    Ensure-Module 'Pester' '5.0.0' -SkipPublisherCheck | Out-Null
+    Ensure-Module 'Maester' '1.0.0' -OfferUpdate | Out-Null
+    Import-Module Pester -MinimumVersion 5.0.0 -ErrorAction Stop
+    Import-Module Maester -ErrorAction Stop -WarningAction SilentlyContinue
+    Write-Host "  Maester $((Get-Module Maester).Version) loaded." -ForegroundColor Green
+    if (-not (Get-ChildItem $tests -Recurse -Filter '*.Tests.ps1' -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        Write-H "Installing the Maester test library to $tests"
+        Install-MaesterTests -Path $tests
+    } else {
+        Write-Host "  Test library: $tests" -ForegroundColor DarkGray
+        if ((Ask '  Update the Maester test library to the latest tests first? Y/N' 'Y') -match '^[Yy]') { Update-MaesterTests -Path $tests }
+    }
+    Connect-Graph @(Get-MtGraphScope)
+    if ($IncludeExchange) {
+        try { Connect-EXO } catch { Write-Host "  Exchange Online connection failed - Exchange tests will be skipped. ($($_.Exception.Message))" -ForegroundColor Yellow }
+    }
+    $file = Join-Path $out ("Maester_{0}_{1}.html" -f $tag, (Get-Stamp))
+    Write-H 'Invoke-Maester (several minutes for a full run)'
+    Invoke-Maester -Path $tests -OutputHtmlFile $file -SkipGraphConnect
+    Write-Host "`n  Report: $file" -ForegroundColor Green
+    Write-Host '  Tip: filter the report to "Failed" - CISA / EIDSCA / MT tests each link to the exact fix.' -ForegroundColor DarkGray
+    if ($IncludeExchange) { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null }
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+}
+
+}
+exit $exit
 '@
 
 # ======================= New-RemediationPlan.ps1 =======================
