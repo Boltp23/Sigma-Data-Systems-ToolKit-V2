@@ -16987,48 +16987,94 @@ function Invoke-SpoofHunt {
     $own = @($all | Where-Object { $sd = Get-DomainOf $_.SenderAddress; $doms -contains $sd -or @($doms | Where-Object { $sd.EndsWith('.' + $_) }).Count })
     $rows = foreach ($m in $own) {
         $ip = "$($m.FromIP)"
-        if (-not $ip) { continue }
+        if (-not $ip -or $ip -eq '255.255.255.255' -or "$($m.SenderAddress)" -like 'MicrosoftExchange*') { continue }
         if (@($trusted | Where-Object { Test-InCidr $ip $_ }).Count) { continue }
         if (@($ms | Where-Object { Test-InCidr $ip $_ }).Count) { continue }
         $rd = Get-DomainOf $m.RecipientAddress
         [pscustomobject]@{ Received = ([datetime]$m.Received).ToLocalTime(); Sender = $m.SenderAddress; Recipient = $m.RecipientAddress
-                           ToOwnDomain = [bool]($doms -contains $rd); FromIP = $ip; Subject = $m.Subject; Status = $m.Status; MessageTraceId = $m.MessageTraceId }
+                           ToOwnDomain = [bool]($doms -contains $rd -or @($doms | Where-Object { $rd.EndsWith('.' + $_) }).Count); FromIP = $ip; Subject = $m.Subject; Status = $m.Status; MessageTraceId = $m.MessageTraceId }
     }
     $rows = @($rows)
+    # Direct Send spoof signature per IP: only ever mails INTERNAL recipients, often "user to themselves", from an IPv4
+    # address. Real users/apps sending from the office or home also mail outside recipients, so they drop out here.
+    $spoofIps = @{}
+    foreach ($g in ($rows | Group-Object FromIP)) {
+        $ext = @($g.Group | Where-Object { -not $_.ToOwnDomain }).Count
+        $self = @($g.Group | Where-Object { $_.Sender -eq $_.Recipient }).Count
+        if ($ext -eq 0 -and $self -ge 1 -and ($self / $g.Count) -ge 0.3 -and $g.Name -notmatch ':') { $spoofIps[$g.Name] = $true }
+    }
+    $spoofRows = @($rows | Where-Object { $spoofIps.ContainsKey($_.FromIP) })
     Write-Host "  $($all.Count) messages traced; $($own.Count) claim to be from your domains; $($rows.Count) of those came from an OUTSIDE IP." -ForegroundColor Cyan
 
     if ($rows.Count) {
         Write-H 'Outside IPs sending as your domains'
+        $groups = @($rows | Group-Object FromIP | Sort-Object @{ e = { if ($spoofIps.ContainsKey($_.Name)) { 0 } else { 1 } } }, @{ e = 'Count'; Descending = $true })
+        Write-Host "  $($groups.Count) distinct outside IP(s). Looking up host names (PTR) for the top $([math]::Min($groups.Count, 60)) in parallel..." -ForegroundColor DarkGray
+        if ($groups.Count -gt 150) { Write-Host '  Many IPs - this usually means user/app mail from home and office ISPs is included. Hosting/VPS IPs are the ones to look at.' -ForegroundColor DarkGray }
         $ptr = @{}
-        $byIp = foreach ($g in ($rows | Group-Object FromIP | Sort-Object Count -Descending)) {
-            if (-not $ptr.ContainsKey($g.Name)) { try { $ptr[$g.Name] = (Resolve-DnsName -Name $g.Name -Type PTR -DnsOnly -QuickTimeout -ErrorAction Stop | Select-Object -First 1).NameHost } catch { $ptr[$g.Name] = '' } }
-            $h = $ptr[$g.Name]
-            $kind = if ($h -match 'colocrossing|vps|vultr|digitalocean|linode|ovh|hetzner|contabo|amazonaws|googleusercontent|azure|hostwinds|m247|datacamp|choopa|leaseweb|server|host') { 'HOSTING / VPS - likely spoof' } elseif ($h -match 'comcast|verizon|fios|spectrum|charter|cox|att|xfinity|optonline|rr\.com|frontier|windstream|myvzw|tmobile') { 'ISP / home or office - check if a user, scanner or app' } else { 'unknown - review' }
-            [pscustomobject]@{ FromIP = $g.Name; PTR = $h; Type = $kind; Messages = $g.Count; ToInternal = @($g.Group | Where-Object ToOwnDomain).Count
-                               First = ($g.Group | Sort-Object Received | Select-Object -First 1).Received; Last = ($g.Group | Sort-Object Received | Select-Object -Last 1).Received
-                               Statuses = (($g.Group | Group-Object Status | ForEach-Object { "$($_.Name):$($_.Count)" }) -join ' ')
-                               SampleSubject = ($g.Group | Select-Object -First 1).Subject }
+        $top = @($groups | Select-Object -First 60 | ForEach-Object { $_.Name })
+        if ($top.Count) {
+            $pool = [runspacefactory]::CreateRunspacePool(1, 20); $pool.Open()
+            $psb = { param($ip) try { (Resolve-DnsName -Name $ip -Type PTR -DnsOnly -QuickTimeout -ErrorAction Stop | Select-Object -First 1).NameHost } catch { try { [System.Net.Dns]::GetHostEntry($ip).HostName } catch { '' } } }
+            $jobs = foreach ($ip in $top) { $ps = [powershell]::Create().AddScript($psb).AddArgument($ip); $ps.RunspacePool = $pool; [pscustomobject]@{ IP = $ip; PS = $ps; H = $ps.BeginInvoke() } }
+            $deadline = (Get-Date).AddSeconds(45)
+            foreach ($j in $jobs) {
+                $left = [int][math]::Max(0, ($deadline - (Get-Date)).TotalMilliseconds)
+                if ($j.H.AsyncWaitHandle.WaitOne($left)) { try { $ptr[$j.IP] = "$(@($j.PS.EndInvoke($j.H)) | Select-Object -First 1)" } catch { $ptr[$j.IP] = '' } } else { $ptr[$j.IP] = '' }
+                $j.PS.Dispose()
+            }
+            $pool.Close(); $pool.Dispose()
         }
-        $byIp | Format-Table FromIP, Type, Messages, ToInternal, Last, Statuses, SampleSubject -AutoSize -Wrap
+        $byIp = foreach ($g in $groups) {
+            $h = if ($ptr.ContainsKey($g.Name)) { $ptr[$g.Name] } else { '' }
+            $kind = if (-not $ptr.ContainsKey($g.Name)) { 'not looked up (low volume)' } elseif ($h -match 'colocrossing|vps|vultr|digitalocean|linode|ovh|hetzner|contabo|amazonaws|googleusercontent|azure|hostwinds|m247|datacamp|choopa|leaseweb|server|host') { 'HOSTING / VPS - likely spoof' } elseif ($h -match 'comcast|verizon|fios|spectrum|charter|cox|att|xfinity|optonline|rr\.com|frontier|windstream|myvzw|tmobile') { 'ISP / home or office - check if a user, scanner or app' } else { 'unknown - review' }
+            $sorted = @($g.Group | Sort-Object Received)
+            [pscustomobject]@{ FromIP = $g.Name; Verdict = $(if ($spoofIps.ContainsKey($g.Name)) { 'LIKELY SPOOF (Direct Send pattern)' } else { 'user / app traffic' }); PTR = $h; Type = $kind; Messages = $g.Count; ToInternal = @($g.Group | Where-Object ToOwnDomain).Count
+                               First = $sorted[0].Received; Last = $sorted[-1].Received
+                               Statuses = (($g.Group | Group-Object Status | ForEach-Object { "$($_.Name):$($_.Count)" }) -join ' ')
+                               SampleSubject = $sorted[0].Subject }
+        }
+        $byIp = @($byIp)
+        $vps = @($byIp | Where-Object { $_.Type -like 'HOSTING*' })
+        if ($vps) { Out-Finding 'HIGH' "$($vps.Count) hosting/VPS IP(s) sent mail as your domains: $(($vps | Select-Object -First 10 | ForEach-Object { $_.FromIP }) -join ', ')" }
+        Write-Host "  Top 40 by volume (all IPs are in the CSV):"
+        $byIp = $byIp | Select-Object *
+        $byIp | Select-Object -First 40 | Format-Table FromIP, Verdict, Type, Messages, Last, Statuses, SampleSubject -AutoSize -Wrap
+        Write-H 'Spoof summary (IPs with the Direct Send pattern)'
+        if ($spoofRows.Count) {
+            $sd = @($spoofRows | Where-Object { $_.Status -match 'Delivered' }); $sq = @($spoofRows | Where-Object { $_.Status -match 'Quarantin|Spam' })
+            $lastAny = ($spoofRows | Sort-Object Received | Select-Object -Last 1).Received
+            $lastDel = if ($sd) { ($sd | Sort-Object Received | Select-Object -Last 1).Received } else { $null }
+            Write-Host ("  {0} spoof IPs, {1} messages: {2} DELIVERED, {3} quarantined/junked, {4} other" -f $spoofIps.Count, $spoofRows.Count, $sd.Count, $sq.Count, ($spoofRows.Count - $sd.Count - $sq.Count))
+            Write-Host ("  Last attempt:   {0}" -f $lastAny) -ForegroundColor $(if (((Get-Date) - $lastAny).TotalDays -le 2) { 'Yellow' } else { 'Gray' })
+            Write-Host ("  Last DELIVERED: {0}" -f $(if ($lastDel) { $lastDel } else { 'never' })) -ForegroundColor $(if ($lastDel -and ((Get-Date) - $lastDel).TotalDays -le 3) { 'Red' } else { 'Green' })
+            if (((Get-Date) - $lastAny).TotalDays -le 2) {
+                if ($org.RejectDirectSend) { Out-Finding 'MED' 'Spoofs still appear in the trace although RejectDirectSend is on - check for a partner/inbound connector that lets them in.' }
+                else { Out-Finding 'HIGH' 'Spoofs are STILL ARRIVING (accepted, then filtered). RejectDirectSend is OFF - turn it on to refuse them at the door.' }
+            }
+            Write-Host '  Most-targeted mailboxes (delivered spoofs):'
+            $sd | Group-Object Recipient | Sort-Object Count -Descending | Select-Object -First 15 Count, Name | Format-Table -AutoSize
+        } else { Out-Finding 'OK' 'No IP matched the Direct Send spoof pattern.' }
 
         if ($FixDate) {
             $fd = [datetime]$FixDate
-            $before = @($rows | Where-Object { $_.Received -lt $fd }); $after = @($rows | Where-Object { $_.Received -ge $fd })
+            $before = @($spoofRows | Where-Object { $_.Received -lt $fd }); $after = @($spoofRows | Where-Object { $_.Received -ge $fd })
             $afterDelivered = @($after | Where-Object { $_.Status -match 'Delivered' })
             Write-H "Before vs after the fix ($($fd.ToString('yyyy-MM-dd HH:mm')))"
-            Write-Host ("  Before: {0} message(s) from outside IPs ({1} delivered)" -f $before.Count, @($before | Where-Object { $_.Status -match 'Delivered' }).Count)
-            Write-Host ("  After:  {0} message(s) from outside IPs ({1} delivered)" -f $after.Count, $afterDelivered.Count) -ForegroundColor $(if ($afterDelivered) { 'Red' } else { 'Green' })
+            Write-Host ("  Before: {0} spoof-pattern message(s) ({1} delivered)" -f $before.Count, @($before | Where-Object { $_.Status -match 'Delivered' }).Count)
+            Write-Host ("  After:  {0} spoof-pattern message(s) ({1} delivered)" -f $after.Count, $afterDelivered.Count) -ForegroundColor $(if ($afterDelivered) { 'Red' } else { 'Green' })
             if ($afterDelivered) {
                 Out-Finding 'HIGH' "$($afterDelivered.Count) message(s) claiming your domain from outside IPs were still DELIVERED after the fix. Review the IPs below - a real scanner/app needs a connector; anything else is still getting through."
                 $afterDelivered | Sort-Object Received -Descending | Select-Object -First 30 Received, FromIP, Sender, Recipient, Subject, Status | Format-Table -AutoSize -Wrap
             } else { Out-Finding 'OK' 'No spoofed own-domain mail from outside IPs has been delivered since the fix.' }
         }
-        Write-H 'Per day'
-        $rows | Group-Object { $_.Received.ToString('yyyy-MM-dd') } | Sort-Object Name | ForEach-Object {
+        Write-H 'Per day - spoof-pattern messages only'
+        $spoofRows | Group-Object { $_.Received.ToString('yyyy-MM-dd') } | Sort-Object Name | ForEach-Object {
             $dl = @($_.Group | Where-Object { $_.Status -match 'Delivered' }).Count
             Write-Host ("  {0}  {1,4} total  {2,4} delivered  {3}" -f $_.Name, $_.Count, $dl, ('#' * [math]::Min($_.Count, 60)))
         }
         $f = Join-Path $OutDir ("SpoofHunt_Messages_{0}.csv" -f (Get-Stamp)); $rows | Sort-Object Received | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f
+        $f4 = Join-Path $OutDir ("SpoofHunt_SpoofOnly_{0}.csv" -f (Get-Stamp)); $spoofRows | Sort-Object Received | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f4; Write-Host "  Saved: $f4" -ForegroundColor DarkGray
         $f2 = Join-Path $OutDir ("SpoofHunt_IPs_{0}.csv" -f (Get-Stamp)); $byIp | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f2
         Write-Host "  Saved: $f" -ForegroundColor DarkGray; Write-Host "  Saved: $f2" -ForegroundColor DarkGray
     } else { Out-Finding 'OK' "No mail claiming your domains arrived from an outside IP in the last $d days." }
