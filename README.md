@@ -469,7 +469,7 @@ Each option runs in its own PowerShell window and signs in only to the services 
 | 128 | CISA ScubaGear | Tenant configuration vs. CISA SCuBA baselines (Entra, Defender, Exchange, SharePoint, Teams, optional Power Platform / Power BI). HTML report. Windows PowerShell 5.1; sign in with an account **in** the client tenant (Global Reader is enough), GDAP is not supported |
 | 129 | Maester | Hundreds of Entra / Exchange / CISA / EIDSCA Pester tests with an HTML pass/fail report and the fix for each. Test library kept in `C:\temp\Maester\tests` and updated on request |
 
-Options 125-129 install their PowerShell Gallery modules for the current user on first use (you're asked first), and offer an update when a newer version is published. Exchange Online is loaded before Microsoft Graph, using EXO 3.7.1 when it's installed (option 92), to avoid the "method not found" clash in Windows PowerShell 5.1.
+Options 125-129 install their PowerShell Gallery modules for the current user on first use (you're asked first), and offer an update when a newer version is published. Options 126, 127 and 129 load Microsoft Graph and Exchange Online in the same session, which can clash in Windows PowerShell 5.1 ("GetTokenAsync ... does not have an implementation" / "method not found"). They therefore run in **PowerShell 7** (`pwsh.exe`) when it's installed, and offer to install it (Microsoft-signed MSI from GitHub, silent) when it isn't. If you decline, they run in 5.1 with Graph loaded before Exchange. ScubaGear (128) always runs in Windows PowerShell 5.1, as it requires.
 
 ---
 

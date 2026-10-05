@@ -199,7 +199,9 @@ function Invoke-Tool {
     param(
         [Parameter(Mandatory)][string]$Name,
         [System.Collections.IDictionary]$Params = @{},
-        [string]$Wrapper
+        [string]$Wrapper,
+        # Optional: run in another PowerShell (e.g. pwsh.exe 7) instead of Windows PowerShell
+        [string]$Exe
     )
     $path = Save-Payload $Name $Script:WorkDir
     $argText = ''
@@ -219,10 +221,11 @@ function Invoke-Tool {
 
     $shown = ($argText -replace "(-\w*(Passphrase|Password|Secret)\w*) '[^']*'", '$1 ********')
     Write-Host ''
-    Write-Host ">> Running $Name$shown" -ForegroundColor DarkCyan
+    Write-Host ">> Running $Name$shown$(if ($Exe) { "  [$([IO.Path]::GetFileName($Exe))]" })" -ForegroundColor DarkCyan
     Write-Host ('-' * 78) -ForegroundColor DarkGray
     # Start-Process -NoNewWindow keeps the child attached to THIS console (prompts and colors work, nothing is captured)
-    $proc = Start-Process -FilePath $Script:PSExe -ArgumentList "-NoProfile -NoLogo -ExecutionPolicy Bypass -File `"$launcher`"" -NoNewWindow -Wait -PassThru
+    $exePath = if ($Exe -and (Test-Path -LiteralPath $Exe)) { $Exe } else { $Script:PSExe }
+    $proc = Start-Process -FilePath $exePath -ArgumentList "-NoProfile -NoLogo -ExecutionPolicy Bypass -File `"$launcher`"" -NoNewWindow -Wait -PassThru
     $code = $proc.ExitCode
     $Script:LastToolExit = $code
     Write-Host ('-' * 78) -ForegroundColor DarkGray
@@ -2782,14 +2785,63 @@ function Invoke-M365Simple([string]$Title, [string]$Action, [switch]$AskUser, [s
 # All run the embedded 'M365-SecurityTools' script in its own process. Third-party modules are
 # installed from the PowerShell Gallery (current user) the first time, after asking.
 
+# PowerShell 7 (pwsh.exe) keeps each module's DLLs separate, which avoids the Microsoft Graph vs. Exchange Online
+# "GetTokenAsync ... does not have an implementation" / "method not found" clashes of Windows PowerShell 5.1.
+function Get-Pwsh7 {
+    $cands = @()
+    if ($env:ProgramFiles) { $cands += (Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe') }
+    $cmd = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { $cands += $cmd.Source }
+    foreach ($c in $cands) { if ($c -and (Test-Path $c)) { return $c } }
+    return $null
+}
+
+function Install-Pwsh7 {
+    Write-Host '  Looking up the latest PowerShell 7 release on GitHub...' -ForegroundColor DarkGray
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/PowerShell/PowerShell/releases/latest' -UseBasicParsing -ErrorAction Stop
+        $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+        $asset = $rel.assets | Where-Object { $_.name -match "win-$arch\.msi$" } | Select-Object -First 1
+        if (-not $asset) { throw 'No MSI found in the latest release.' }
+    } catch {
+        Write-Host "  Could not find the PowerShell 7 installer ($($_.Exception.Message))." -ForegroundColor Red
+        Write-Host '  Manual download: https://aka.ms/powershell-release?tag=stable' -ForegroundColor DarkGray
+        return $null
+    }
+    $msi = Join-Path (Get-ToolsDir 'PowerShell7') $asset.name
+    if (-not (Test-Path $msi) -and -not (Get-WebFile $asset.browser_download_url $msi)) { return $null }
+    if (-not (Test-DownloadedBinary $msi 'Microsoft')) { return $null }
+    Write-Host "  Installing $($asset.name) (silent)..." -ForegroundColor DarkGray
+    $pr = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart ADD_PATH=1 /l*v `"$msi.log`"" -Wait -PassThru
+    if ($pr.ExitCode -notin 0, 3010) { Write-Host "  Installer exit code $($pr.ExitCode) - see $msi.log" -ForegroundColor Red; return $null }
+    $p = Get-Pwsh7
+    if ($p) { Write-Host "  PowerShell 7 installed: $p" -ForegroundColor Green }
+    return $p
+}
+
+# Returns the PowerShell to run Graph + Exchange tools in: pwsh 7 if present (or installed now), else Windows PowerShell.
+function Select-M365Shell {
+    $p = Get-Pwsh7
+    if ($p) { return $p }
+    Write-Host '  PowerShell 7 is not installed. In Windows PowerShell 5.1, Microsoft Graph and Exchange Online modules can' -ForegroundColor Yellow
+    Write-Host '  clash in one session ("GetTokenAsync ... does not have an implementation" / "method not found").' -ForegroundColor Yellow
+    if (Confirm-Change 'Download PowerShell 7 (Microsoft-signed MSI from github.com/PowerShell) and install it silently') {
+        $p = Install-Pwsh7
+        if ($p) { return $p }
+    }
+    Write-Host '  Continuing in Windows PowerShell 5.1 (Graph is loaded before Exchange to reduce clashes).' -ForegroundColor DarkGray
+    return $null
+}
+
 function Invoke-M365Sec {
-    param([string]$Action, [System.Collections.IDictionary]$Extra = @{})
+    param([string]$Action, [System.Collections.IDictionary]$Extra = @{}, [string]$Exe)
     Write-Host "  M365 target: $(Get-M365Label)" -ForegroundColor DarkGray
     $p = [ordered]@{ Action = $Action }
     foreach ($k in (Get-M365Params).Keys) { $p[$k] = (Get-M365Params)[$k] }
     $p.OutputPath = (Get-OutDir 'M365')
     foreach ($k in $Extra.Keys) { $p[$k] = $Extra[$k] }
-    return (Invoke-Tool 'M365-SecurityTools' $p)
+    return (Invoke-Tool 'M365-SecurityTools' $p -Exe $Exe)
 }
 
 function Invoke-M365SignInCheck {
@@ -2819,7 +2871,7 @@ function Invoke-M365ExtractorSuite {
     $t = Read-Default 'Template (Quick / Standard / Comprehensive)' 'Standard'
     if ($t -notin 'Quick', 'Standard', 'Comprehensive') { $t = 'Standard' }
     $d = Read-Int 'Days to look back (UAL keeps 180 days; Graph sign-ins 30 days with P1)' 30
-    Invoke-M365Sec 'Extractor' ([ordered]@{ UserPrincipalName = $u; Mode = $t; Days = $d }) | Out-Null
+    Invoke-M365Sec 'Extractor' ([ordered]@{ UserPrincipalName = $u; Mode = $t; Days = $d }) -Exe (Select-M365Shell) | Out-Null
 }
 
 function Invoke-M365Hawk {
@@ -2834,7 +2886,7 @@ function Invoke-M365Hawk {
         if (-not $u) { return }
         $x.Mode = 'User'; $x.UserPrincipalName = $u
     }
-    Invoke-M365Sec 'Hawk' $x | Out-Null
+    Invoke-M365Sec 'Hawk' $x -Exe (Select-M365Shell) | Out-Null
 }
 
 function Invoke-M365ScubaGear {
@@ -2852,7 +2904,7 @@ function Invoke-M365Maester {
     Write-Host '  Runs the Maester test library (hundreds of Pester tests) against the tenant and writes an HTML report with'
     Write-Host '  pass/fail and the fix for each test. Read-only. Test library is kept in <output>\Maester\tests.'
     $exo = Read-YesNo 'Also connect to Exchange Online for the Exchange / CISA EXO tests?' $true
-    Invoke-M365Sec 'Maester' ([ordered]@{ IncludeExchange = $exo }) | Out-Null
+    Invoke-M365Sec 'Maester' ([ordered]@{ IncludeExchange = $exo }) -Exe (Select-M365Shell) | Out-Null
 }
 
 # ---------- Entra / Intune on THIS device ------------------------------------------------
@@ -15859,7 +15911,7 @@ function Get-TenantTag {
 
 # ------------------------------------------------------------------ modules
 function Install-GalleryModule([string]$Name, [string]$RequiredVersion, [switch]$SkipPublisherCheck) {
-    if (-not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
+    if ($PSVersionTable.PSEdition -eq 'Desktop' -and -not (Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge [version]'2.8.5.201' })) {
         Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null
     }
     $p = @{ Name = $Name; Scope = 'CurrentUser'; Force = $true; AllowClobber = $true; Repository = 'PSGallery'; ErrorAction = 'Stop' }
@@ -15909,18 +15961,36 @@ function Ensure-GraphSubModules([string[]]$Names) {
     return "$($auth.Version)"
 }
 
-# EXO 3.7.1 avoids the MSAL "method not found" clash with Microsoft Graph in Windows PowerShell 5.1.
-# Exchange must be imported BEFORE anything Graph in the same session.
-function Import-ExchangeFirst {
-    Ensure-Module 'ExchangeOnlineManagement' '3.4.0' | Out-Null
-    $v371 = Get-Module -ListAvailable ExchangeOnlineManagement | Where-Object { $_.Version -eq [version]'3.7.1' }
-    if ($v371) { Import-Module ExchangeOnlineManagement -RequiredVersion 3.7.1 -ErrorAction Stop -WarningAction SilentlyContinue }
-    else {
-        Import-Module ExchangeOnlineManagement -ErrorAction Stop -WarningAction SilentlyContinue
-        $v = (Get-Module ExchangeOnlineManagement).Version
-        if ($PSVersionTable.PSEdition -eq 'Desktop' -and $v -gt [version]'3.7.1') {
-            Write-Host "  Note: ExchangeOnlineManagement $v + Microsoft Graph can clash in PowerShell 5.1 ('method not found')." -ForegroundColor DarkYellow
-            Write-Host "        If that happens, run 'M365: install / repair PowerShell modules' and install EXO 3.7.1 side by side." -ForegroundColor DarkYellow
+# Module load order (Windows PowerShell 5.1 has ONE assembly context per process):
+#   Microsoft.Graph 2.3x ships a newer Azure.Core than ExchangeOnlineManagement 3.8+. If EXO loads first,
+#   Graph fails with "Method 'GetTokenAsync' ... does not have an implementation". So Graph is imported
+#   FIRST, then Exchange. PowerShell 7 isolates each module's assemblies, so the ToolKit prefers pwsh.exe
+#   for these tools when it's installed.
+function Import-GraphFirst([string[]]$SubModules = @()) {
+    $gv = Ensure-GraphSubModules $SubModules
+    try {
+        Import-Module Microsoft.Graph.Authentication -RequiredVersion $gv -ErrorAction Stop -WarningAction SilentlyContinue
+        foreach ($m in $SubModules) { Import-Module $m -RequiredVersion $gv -ErrorAction Stop -WarningAction SilentlyContinue }
+    } catch { Show-ConflictHelp $_; throw }
+    return $gv
+}
+
+function Import-ExchangeModule {
+    try { Import-Module ExchangeOnlineManagement -ErrorAction Stop -WarningAction SilentlyContinue }
+    catch { Show-ConflictHelp $_; throw }
+    Write-Host "  ExchangeOnlineManagement $((Get-Module ExchangeOnlineManagement).Version) loaded." -ForegroundColor DarkGray
+}
+
+function Show-ConflictHelp($Err) {
+    if ("$Err" -match 'GetTokenAsync|does not have an implementation|Method not found|Could not load file or assembly|TypeLoadException') {
+        Write-Host ''
+        Write-Host '  Module DLL conflict between Microsoft Graph and Exchange Online in this PowerShell session.' -ForegroundColor Red
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            Write-Host '  Fix: install PowerShell 7 - the ToolKit offers to install it and then runs this option in pwsh.exe,' -ForegroundColor Yellow
+            Write-Host '       where each module keeps its own DLLs. (Or close all PowerShell windows and try again.)' -ForegroundColor Yellow
+        } else {
+            Write-Host '  Fix: update both modules (Install-Module Microsoft.Graph.Authentication, ExchangeOnlineManagement -Force),' -ForegroundColor Yellow
+            Write-Host '       close all PowerShell windows and try again.' -ForegroundColor Yellow
         }
     }
 }
@@ -16041,6 +16111,7 @@ function Write-Verdict($rows, [string]$Label, [string]$OutBase) {
 
 # ======================================================================== ACTIONS
 $OutRoot = Ensure-Dir $OutputPath
+Write-Host "  PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))" -ForegroundColor DarkGray
 $tag = Get-TenantTag
 $exit = 0
 
@@ -16110,7 +16181,8 @@ switch ($Action) {
 'SignInCheckUAL' {
     if (-not $UserPrincipalName -and -not $IPAddress) { throw 'Give a user UPN, an IP address, or both.' }
     $out = Ensure-Dir (Join-Path $OutRoot 'SignInCheck')
-    Import-ExchangeFirst
+    Ensure-Module 'ExchangeOnlineManagement' '3.4.0' | Out-Null
+    Import-ExchangeModule
     Connect-EXO
     $d = [math]::Min([math]::Max($Days, 1), 180)
     $label = (@($UserPrincipalName, $IPAddress) | Where-Object { $_ }) -join ' from '
@@ -16150,13 +16222,11 @@ switch ($Action) {
 'Extractor' {
     # Invictus IR Microsoft-Extractor-Suite - Start-MESTriage
     $out = Ensure-Dir (Join-Path $OutRoot 'ExtractorSuite')
-    Import-ExchangeFirst
+    Ensure-Module 'ExchangeOnlineManagement' '3.4.0' | Out-Null
     Ensure-Module 'Microsoft-Extractor-Suite' '3.0.0' -OfferUpdate | Out-Null
-    $gv = Ensure-GraphSubModules @('Microsoft.Graph.Users', 'Microsoft.Graph.Groups', 'Microsoft.Graph.Applications', 'Microsoft.Graph.Identity.DirectoryManagement', 'Microsoft.Graph.Identity.SignIns', 'Microsoft.Graph.Security')
+    Import-GraphFirst @('Microsoft.Graph.Users', 'Microsoft.Graph.Groups', 'Microsoft.Graph.Applications', 'Microsoft.Graph.Identity.DirectoryManagement', 'Microsoft.Graph.Identity.SignIns', 'Microsoft.Graph.Security') | Out-Null
+    Import-ExchangeModule
     Import-Module Microsoft-Extractor-Suite -ErrorAction Stop -WarningAction SilentlyContinue
-    foreach ($m in 'Microsoft.Graph.Users', 'Microsoft.Graph.Groups', 'Microsoft.Graph.Applications', 'Microsoft.Graph.Identity.DirectoryManagement', 'Microsoft.Graph.Identity.SignIns', 'Microsoft.Graph.Security') {
-        Import-Module $m -RequiredVersion $gv -ErrorAction Stop -WarningAction SilentlyContinue
-    }
     $mesVer = (Get-Module Microsoft-Extractor-Suite).Version
     Write-Host "  Microsoft-Extractor-Suite $mesVer loaded." -ForegroundColor Green
 
@@ -16186,8 +16256,11 @@ switch ($Action) {
 
 'Hawk' {
     $out = Ensure-Dir (Join-Path $OutRoot 'Hawk')
-    Import-ExchangeFirst
+    Ensure-Module 'ExchangeOnlineManagement' '3.4.0' | Out-Null
     Ensure-Module 'Hawk' '3.0.0' -OfferUpdate | Out-Null
+    # Load Hawk's Graph dependencies (matching versions) BEFORE Exchange, then Hawk itself
+    Import-GraphFirst @('Microsoft.Graph.Users', 'Microsoft.Graph.Applications', 'Microsoft.Graph.Identity.DirectoryManagement', 'Microsoft.Graph.Identity.SignIns', 'Microsoft.Graph.Reports') | Out-Null
+    Import-ExchangeModule
     Import-Module Hawk -ErrorAction Stop -WarningAction SilentlyContinue
     Write-Host "  Hawk $((Get-Module Hawk).Version) loaded." -ForegroundColor Green
     # Pre-connect so Hawk reuses OUR sessions (client tenant via GDAP) instead of prompting for the home tenant
@@ -16237,9 +16310,11 @@ switch ($Action) {
 'Maester' {
     $out = Ensure-Dir (Join-Path $OutRoot 'Maester')
     $tests = Ensure-Dir (Join-Path (Split-Path $OutRoot -Parent) 'Maester\tests')
-    if ($IncludeExchange) { Import-ExchangeFirst }
+    if ($IncludeExchange) { Ensure-Module 'ExchangeOnlineManagement' '3.4.0' | Out-Null }
     Ensure-Module 'Pester' '5.0.0' -SkipPublisherCheck | Out-Null
     Ensure-Module 'Maester' '1.0.0' -OfferUpdate | Out-Null
+    Import-GraphFirst | Out-Null
+    if ($IncludeExchange) { Import-ExchangeModule }
     Import-Module Pester -MinimumVersion 5.0.0 -ErrorAction Stop
     Import-Module Maester -ErrorAction Stop -WarningAction SilentlyContinue
     Write-Host "  Maester $((Get-Module Maester).Version) loaded." -ForegroundColor Green
