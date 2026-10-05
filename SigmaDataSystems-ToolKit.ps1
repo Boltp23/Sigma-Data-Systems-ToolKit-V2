@@ -2992,7 +2992,8 @@ function Invoke-WifiDiagnostics {
         $rx = [double]("0$($conn.'Receive rate (Mbps)')" -replace '[^\d\.]', '')
         if ($rx -gt 0 -and $rx -lt 50) { $findings.Add("Low link rate: $rx Mbps receive. Usually caused by weak signal, interference, or a 2.4 GHz / old 802.11n connection.") }
         if ($conn.BandName -like '2.4*') { $findings.Add('Connected on 2.4 GHz - slower and far more crowded than 5 GHz. Check below whether 5 GHz from the same network is available.') }
-        if ($conn.Authentication -match 'Open|WEP' -or $conn.Cipher -match 'WEP|TKIP') { $findings.Add("Weak/legacy security on this network ($($conn.Authentication) / $($conn.Cipher)). TKIP also caps speed at 54 Mbps.") }
+        if ($conn.Authentication -match 'Open') { $findings.Add("This network is open (no password / no encryption). Fine for a guest network if client isolation is on; traffic is not encrypted over the air. Consider OWE / 'Enhanced Open' if all clients support it.") }
+        elseif ($conn.Authentication -match 'WEP' -or $conn.Cipher -match 'WEP|TKIP') { $findings.Add("Weak/legacy security on this network ($($conn.Authentication) / $($conn.Cipher)). TKIP/WEP also cap speed at 54 Mbps - switch the AP to WPA2-AES (CCMP) or WPA3.") }
     } else { Write-Host '  Not connected to Wi-Fi right now - showing the environment only.' -ForegroundColor Yellow }
 
     # ---- 2. adapter, driver, power ----------------------------------------------------
@@ -3060,8 +3061,12 @@ function Invoke-WifiDiagnostics {
         }
         foreach ($m in ($mine | Where-Object Band -like '5*')) {
             if ($m.Channel -ge 52 -and $m.Channel -le 144) { $findings.Add("Your AP $($m.BSSID) is on DFS channel $($m.Channel). If radar is detected the AP must leave the channel for a while - clients drop for 1+ minute. If drops happen at random, try a non-DFS channel (36-48 or 149-161).") }
-            $co = @($aps | Where-Object { $_.SSID -ne $ownSsid -and $_.Band -like '5*' -and $_.Channel -eq $m.Channel -and $_.SignalPct -ge 40 })
-            if ($co.Count -ge 2) { $findings.Add("$($co.Count) other strong networks share your 5 GHz channel $($m.Channel). Least congested non-DFS block here: $($best5.Channel).") }
+            $blk = { param($c) if ($c -ge 149) { 149 } else { 36 + 16 * [math]::Floor(($c - 36) / 16) } }
+            $myBlk = & $blk ([int]$m.Channel)
+            $co = @($aps | Where-Object { $_.SSID -ne $ownSsid -and $_.Band -like '5*' -and (& $blk ([int]$_.Channel)) -eq $myBlk -and $_.SignalPct -ge 40 })
+            if ($co.Count -ge 2) { $findings.Add("$($co.Count) other strong networks sit in your 5 GHz 80 MHz block ($myBlk-$($myBlk + 12)) - they overlap if your AP uses 40/80 MHz width. Least congested non-DFS block here: $($best5.Channel). Strongest: " + (($co | Sort-Object SignalPct -Descending | Select-Object -First 3 | ForEach-Object { "$($_.SSID) ch$($_.Channel) $($_.SignalPct)%" }) -join ', ')) }
+            $loud = @($co | Where-Object SignalPct -ge 85)
+            if ($loud) { $findings.Add("Very strong foreign AP(s) in the same room on your 5 GHz block: " + (($loud | ForEach-Object { "$($_.SSID) [$($_.BSSID)] ch$($_.Channel)" }) -join ', ') + ". Often the ISP router's own Wi-Fi - turn it off / bridge mode, or move one of them to another block.") }
         }
         foreach ($m in ($mine | Where-Object { $null -ne $_.UtilizationPct -and $_.UtilizationPct -ge 50 })) { $findings.Add("AP $($m.BSSID) (ch $($m.Channel)) reports $($m.UtilizationPct)% channel utilization - the airtime is congested. Above ~50% everyone on that AP slows down.") }
         foreach ($m in ($mine | Where-Object { $null -ne $_.Stations -and $_.Stations -ge 30 })) { $findings.Add("AP $($m.BSSID) has $($m.Stations) clients connected - consider another AP / load balancing.") }
@@ -3087,17 +3092,26 @@ function Invoke-WifiDiagnostics {
             $reason = (($_.Message -split "`r?`n") | Where-Object { $_ -match '^\s*(Reason|Failure Reason|Reason Code)\s*:' } | Select-Object -First 1) -replace '^\s*[^:]+:\s*', ''
             $reason = [string]($reason -join ' '); if (-not $reason.Trim()) { $reason = '-' }
             $ssidLine = (($_.Message -split "`r?`n") | Where-Object { $_ -match '^\s*SSID\s*:' } | Select-Object -First 1) -replace '^\s*SSID\s*:\s*', ''
+            $ssidLine = [string]($ssidLine -join ' '); if (-not $ssidLine.Trim()) { $ssidLine = '-' }
             [pscustomobject]@{ Time = $_.TimeCreated; Id = $_.Id; Event = @{ 8001 = 'Connected'; 8002 = 'Connect FAILED'; 8003 = 'Disconnected'; 11004 = 'Security stopped'; 11005 = 'Security OK'; 11006 = 'Security FAILED'; 11010 = 'Security start'; 12011 = '802.1X start'; 12012 = '802.1X OK'; 12013 = '802.1X FAILED' }[$_.Id]; SSID = $ssidLine; Reason = $reason }
         }
         $rows | Export-Csv (Join-Path $dir 'WlanEvents.csv') -NoTypeInformation
         $disc = @($rows | Where-Object Id -eq 8003); $fail = @($rows | Where-Object { $_.Id -in 8002, 11006, 12013 })
         Write-Host ("  {0} disconnects, {1} failed connections in 7 days." -f $disc.Count, $fail.Count) -ForegroundColor $(if ($disc.Count -gt 10 -or $fail) { 'Yellow' } else { 'Green' })
         if ($disc) { Write-Host '  Top disconnect reasons:'; $disc | Group-Object Reason | Sort-Object Count -Descending | Select-Object -First 6 Count, Name | Format-Table -AutoSize }
-        if ($fail) { Write-Host '  Failures:'; $fail | Select-Object -Last 8 Time, Event, SSID, Reason | Format-Table -AutoSize -Wrap }
-        $rows | Where-Object { $_.Id -in 8001, 8003 } | Select-Object -Last 12 Time, Event, SSID, Reason | Format-Table -AutoSize -Wrap
+        if ($fail) { Write-Host '  Failures (most recent):'; $fail | Select-Object -First 8 Time, Event, SSID, Reason | Format-Table -AutoSize -Wrap }
+        Write-Host '  Recent connects / disconnects:'
+        $rows | Where-Object { $_.Id -in 8001, 8003 } | Select-Object -First 12 Time, Event, SSID, Reason | Format-Table -AutoSize -Wrap
         $perDay = $disc.Count / 7
         if ($perDay -ge 3) { $findings.Add(("{0:N0} Wi-Fi disconnects per day on average. Top reason: {1}" -f $perDay, (($disc | Group-Object Reason | Sort-Object Count -Descending | Select-Object -First 1).Name))) }
-        if ($fail | Where-Object { $_.Reason -match 'key|password|4-way|handshake|authentication' }) { $findings.Add('Authentication/handshake failures logged - wrong saved password, WPA2/WPA3 mismatch, or a flaky AP. Forget and re-join the network.') }
+        $authFail = @($fail | Where-Object { $_.Reason -match 'key|password|4-way|handshake|authentication' } | Sort-Object Time -Descending)
+        if ($authFail) { $findings.Add(("Authentication/handshake failures logged (last: {0:g}{1}) - wrong saved password, WPA2/WPA3 mismatch, or a flaky AP. Forget and re-join that network." -f $authFail[0].Time, $(if ($authFail[0].SSID -ne '-') { " on '$($authFail[0].SSID)'" } else { '' }))) }
+        # Windows hopping between saved networks (same venue, two SSIDs both set to auto-connect)
+        $hops = @($disc | Where-Object { $_.Reason -match 'establish a new connection' -and $_.Time -gt (Get-Date).AddDays(-1) })
+        if ($hops.Count -ge 3) {
+            $pair = (@($rows | Where-Object { $_.Id -in 8001, 8003 -and $_.Time -gt (Get-Date).AddDays(-1) -and $_.SSID -ne '-' } | Select-Object -ExpandProperty SSID -Unique) | Select-Object -First 4) -join "', '"
+            $findings.Add("NETWORK HOPPING: Windows switched networks $($hops.Count) times in 24h between saved networks ('$pair'). Each switch drops the connection. Keep one: forget the others or untick 'Connect automatically' on them (Settings > Network > Wi-Fi > Manage known networks).")
+        }
     } else { Write-Host '  No WLAN events (log disabled or nothing happened).' -ForegroundColor DarkGray }
 
     # ---- 5. latency check (gateway, or internet host if the gateway ignores ping) ---------
@@ -3137,7 +3151,7 @@ function Invoke-WifiDiagnostics {
     Write-Sub 'FINDINGS'
     if ($findings.Count) { $i = 0; foreach ($f in $findings) { $i++; Write-Host "  $i. $f" -ForegroundColor Yellow } }
     else { Write-Host '  No Wi-Fi problems detected right now. For intermittent issues run the Wi-Fi live monitor while the problem happens.' -ForegroundColor Green }
-    $findings | Out-File (Join-Path $dir 'Findings.txt')
+    $findings | Out-File (Join-Path $dir 'Findings.txt') -Encoding UTF8
     Write-Host "  Saved: $dir  (NearbyAPs.csv, ChannelAnalysis.csv, WlanEvents.csv, wlan-report.html, Findings.txt)" -ForegroundColor Green
 
     # ---- fixes ---------------------------------------------------------------------------
