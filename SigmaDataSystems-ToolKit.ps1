@@ -36,7 +36,7 @@
     v2.0 - adds: section menu, self-test, security posture, hardware/SMART, reliability, perf,
     boot performance, pending-reboot detail, Windows Update list/install, SFC/DISM, AD/DC health,
     backup/VSS health, shares/open files, advanced network (MTU/tracert/proxy/Wi-Fi), server roles,
-    quick fixes (spooler, network, Teams, Office, OneDrive), software deployment (Ninite, vendor
+    quick fixes (spooler, network, Teams, Office, OneDrive + OneDrive won't-start diagnostics), software deployment (Ninite, vendor
     MSIs, Microsoft 365 Apps via ODT, remove OEM Office), Sysinternals (Autoruns, Sigcheck, Handle,
     ProcDump, GUI tools), NirSoft reports, Microsoft SetupDiag and TSS. M365 incident response / audit:
     failed sign-in alert verdict, Microsoft-Extractor-Suite (Invictus IR), Hawk, CISA ScubaGear and Maester
@@ -1812,11 +1812,369 @@ function Invoke-OfficeRepair {
     }
 }
 
+function Get-OneDriveUserHives {
+    # Loaded user registry hives (= users signed in right now) with account name and profile path.
+    # Lets the checks cover the signed-in user even when the ToolKit runs as an admin / RMM account.
+    $list = @()
+    Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-(5-21|12-1)-[\d-]+$' } | ForEach-Object {
+        $sid  = $_.PSChildName
+        $name = $sid
+        try { $name = (New-Object Security.Principal.SecurityIdentifier $sid).Translate([Security.Principal.NTAccount]).Value } catch { }
+        $prof = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid" -ErrorAction SilentlyContinue).ProfileImagePath
+        $list += [pscustomobject]@{ SID = $sid; User = $name; Profile = $prof; Root = "Registry::HKEY_USERS\$sid" }
+    }
+    $list
+}
+
+function Get-OneDrivePolicyValues([string]$Key, [string]$Scope) {
+    $out = @()
+    if (-not (Test-Path $Key)) { return $out }
+    $keys = @(Get-Item $Key -ErrorAction SilentlyContinue) + @(Get-ChildItem $Key -Recurse -ErrorAction SilentlyContinue)
+    foreach ($k in $keys) {
+        if (-not $k) { continue }
+        foreach ($vn in $k.GetValueNames()) {
+            $out += [pscustomobject]@{ Scope = $Scope; Key = ($k.Name -replace '^HKEY_USERS\\[^\\]+', 'HKU\<user>'); Name = $vn; Value = $k.GetValue($vn) }
+        }
+    }
+    $out
+}
+
+function Test-TcpPort([string]$HostName, [int]$Port = 443, [int]$TimeoutMs = 3000) {
+    $c = New-Object Net.Sockets.TcpClient
+    try { $ar = $c.BeginConnect($HostName, $Port, $null, $null); return ($ar.AsyncWaitHandle.WaitOne($TimeoutMs) -and $c.Connected) }
+    catch { return $false }
+    finally { $c.Close() }
+}
+
+function Invoke-OneDriveDiag {
+    Write-Title 'OneDrive will not start / sync - diagnostics (policy block, installs, startup, accounts, logs)'
+    $outDir   = Ensure-Dir (Join-Path (Get-OutDir 'OneDrive') "OneDriveDiag_${env:COMPUTERNAME}_$(Get-Stamp)")
+    $rpt      = New-Object System.Collections.Generic.List[string]
+    $findings = New-Object System.Collections.Generic.List[object]
+    function Add-Line([string]$t, [string]$c = 'Gray') { Write-Host $t -ForegroundColor $c; $rpt.Add($t) }
+    function Add-Sub([string]$t) { Write-Sub $t; $rpt.Add(''); $rpt.Add("--- $t ---") }
+    function Add-Table($obj) {
+        if ($obj) { $s = ($obj | Format-Table -AutoSize -Wrap | Out-String -Width 220).TrimEnd(); Write-Host $s; $rpt.Add($s) }
+        else { Add-Line '  (none)' 'DarkGray' }
+    }
+    function Add-Finding([string]$Sev, [string]$Issue, [string]$Fix) { $findings.Add([pscustomobject]@{ Severity = $Sev; Issue = $Issue; Fix = $Fix }) }
+
+    # ---------------------------------------------------------------- context
+    Add-Sub 'Context'
+    $os    = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $cv    = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $build = 0; [void][int]::TryParse("$($os.BuildNumber)", [ref]$build)
+    Add-Line ("  Computer: {0}   OS: {1}  build {2}.{3}  {4}" -f $env:COMPUTERNAME, $os.Caption, $build, $cv.UBR, $cv.DisplayVersion)
+    $me = "$env:USERDOMAIN\$env:USERNAME"
+    Add-Line ("  ToolKit running as: {0}   Admin: {1}" -f $me, (Test-IsAdmin))
+    $console = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+    Add-Line "  Signed-in console user: $(if ($console) { $console } else { '(none / RDP only)' })"
+    $hives = @(Get-OneDriveUserHives)
+    Add-Line "  Signed-in users checked: $(if ($hives) { ($hives.User -join ', ') } else { '(none loaded)' })"
+    if ($console -and $console -ne $me) {
+        Add-Line '  NOTE: the ToolKit is not running as the signed-in user. Per-user checks below read every signed-in user, but a OneDrive reset or launch must be done AS that user.' 'Yellow'
+    }
+    if (-not (Test-IsAdmin)) { Add-Line '  NOTE: not elevated - other users and some machine settings may be unreadable.' 'Yellow' }
+    if ($os.Caption -match 'Windows 10' -and $build -gt 0 -and $build -lt 19045) {
+        Add-Finding 'HIGH' "Windows 10 build $build (21H2 or older). OneDrive sync ended support for these versions on 15 Aug 2026." 'Upgrade to Windows 10 22H2 or Windows 11.'
+    }
+
+    # ---------------------------------------------------------------- policies
+    Add-Sub 'OneDrive policies (machine + signed-in users)'
+    $pol = @()
+    $pol += Get-OneDrivePolicyValues 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'Machine'
+    $pol += Get-OneDrivePolicyValues 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive' 'Machine'
+    $pol += Get-OneDrivePolicyValues 'HKLM:\SOFTWARE\WOW6432Node\Policies\Microsoft\Windows\OneDrive' 'Machine (32-bit)'
+    foreach ($h in $hives) {
+        $pol += Get-OneDrivePolicyValues "$($h.Root)\SOFTWARE\Policies\Microsoft\Windows\OneDrive" $h.User
+        $pol += Get-OneDrivePolicyValues "$($h.Root)\SOFTWARE\Policies\Microsoft\OneDrive" $h.User
+    }
+    Add-Table ($pol | Select-Object Scope, Key, Name, Value)
+
+    $block = @($pol | Where-Object { $_.Name -in 'DisableFileSyncNGSC', 'DisableFileSync' -and "$($_.Value)" -eq '1' })
+    $fromGpo = @()
+    if ($block) {
+        Add-Finding 'HIGH' ("Policy 'Prevent the usage of OneDrive for file storage' is ON ({0} = 1, scope: {1}). OneDrive starts and exits silently - nothing is written to the event logs and a reset does not help." -f (($block.Name | Sort-Object -Unique) -join '/'), (($block.Scope | Sort-Object -Unique) -join ', ')) 'Set that policy to Not Configured in the GPO named below (or remove the value if no GPO sets it), gpupdate /force, then start OneDrive as the user.'
+
+        Add-Sub 'Where is the block coming from? (gpresult)'
+        $xmlPath = Join-Path $outDir 'gpresult_computer.xml'
+        if (Test-IsAdmin) {
+            gpresult /scope computer /x "$xmlPath" /f 2>&1 | Out-Null
+            if (Test-Path $xmlPath) {
+                try {
+                    [xml]$gx = Get-Content $xmlPath -Raw
+                    $gpoName = @{}
+                    foreach ($g in $gx.SelectNodes("//*[local-name()='ComputerResults']/*[local-name()='GPO']")) {
+                        $id = $g.SelectSingleNode("*[local-name()='Path']/*[local-name()='Identifier']")
+                        $nm = $g.SelectSingleNode("*[local-name()='Name']")
+                        if ($id -and $nm) { $gpoName[$id.InnerText] = $nm.InnerText }
+                    }
+                    $hits = $gx.SelectNodes("//*[local-name()='Policy'][*[local-name()='Name' and contains(., 'OneDrive')]] | //*[local-name()='RegistrySetting'][contains(., 'DisableFileSync')] | //*[local-name()='Registry'][contains(@name, 'DisableFileSync') or .//*[contains(@name, 'DisableFileSync')]]")
+                    foreach ($hit in $hits) {
+                        $n = $hit; $gid = $null
+                        while ($n -and -not $gid -and $n.LocalName -notin 'Extension', 'ExtensionData', 'ComputerResults', '#document') {
+                            $g = $n.SelectSingleNode("*[local-name()='GPO']/*[local-name()='Identifier']")
+                            if ($g) { $gid = $g.InnerText }
+                            $n = $n.ParentNode
+                        }
+                        $setting = $hit.SelectSingleNode("*[local-name()='Name']"); $state = $hit.SelectSingleNode("*[local-name()='State']")
+                        $gname = if ($gid -and $gpoName.ContainsKey($gid)) { $gpoName[$gid] } elseif ($gid) { $gid } else { '(unknown - see gpresult_computer.xml)' }
+                        $fromGpo += [pscustomobject]@{
+                            GPO     = $gname
+                            Setting = $(if ($setting) { $setting.InnerText } elseif ($hit.GetAttribute('name')) { "GPP registry item: $($hit.GetAttribute('name'))" } else { 'DisableFileSync*' })
+                            State   = $(if ($state) { $state.InnerText } else { '' })
+                        }
+                    }
+                } catch { Add-Line "  Could not read gpresult XML: $($_.Exception.Message)" 'Yellow' }
+            } else { Add-Line '  gpresult did not produce a report.' 'Yellow' }
+        } else { Add-Line '  Skipped - gpresult /scope computer needs an elevated ToolKit.' 'Yellow' }
+
+        $localPol = "$env:windir\System32\GroupPolicy\Machine\Registry.pol"
+        $inLocal = $false
+        if (Test-Path $localPol) { try { $inLocal = [Text.Encoding]::Unicode.GetString([IO.File]::ReadAllBytes($localPol)) -match 'DisableFileSync' } catch { } }
+
+        if ($fromGpo) {
+            Add-Table ($fromGpo | Sort-Object GPO, Setting -Unique)
+            $blockGpo = @($fromGpo | Where-Object { $_.Setting -match 'Prevent the usage of OneDrive|DisableFileSync' -and $_.State -ne 'Disabled' })
+            if ($blockGpo) {
+                Add-Line ("  Block is applied by Group Policy: {0}" -f (($blockGpo.GPO | Sort-Object -Unique) -join ', ')) 'Red'
+                Add-Line '  Fix: in that GPO set Computer Config > Admin Templates > Windows Components > OneDrive >' 'Yellow'
+                Add-Line '       "Prevent the usage of OneDrive for file storage" = Not Configured (or exclude this PC from it), then gpupdate /force.' 'Yellow'
+            }
+        }
+        if ($inLocal) { Add-Line '  The Local Group Policy on this PC also contains DisableFileSync* (gpedit.msc, same path).' 'Yellow' }
+        if (-not $fromGpo -and -not $inLocal) {
+            Add-Line '  No Group Policy sets it - the value was written straight to the registry (script, RMM, image, or a GPO removed without cleanup).' 'Yellow'
+        }
+    }
+    if ($pol | Where-Object { $_.Name -eq 'DisablePersonalSync' -and "$($_.Value)" -eq '1' }) {
+        Add-Finding 'INFO' 'Personal Microsoft accounts are blocked from syncing (DisablePersonalSync = 1).' 'Expected for work PCs. Only a problem if the user is trying to sign in with a personal account.'
+    }
+
+    # ---------------------------------------------------------------- installs
+    Add-Sub 'OneDrive installs'
+    $inst = @()
+    $machineBases = @("$env:ProgramFiles\Microsoft OneDrive")
+    if (${env:ProgramFiles(x86)}) { $machineBases += "${env:ProgramFiles(x86)}\Microsoft OneDrive" }
+    foreach ($b in $machineBases) {
+        $e = Join-Path $b 'OneDrive.exe'
+        if (Test-Path $e) { $inst += [pscustomobject]@{ Type = 'Per-machine'; Owner = 'All users'; Path = $e; Base = $b } }
+    }
+    $profiles = @(Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue | Where-Object { -not $_.Special -and $_.LocalPath -and (Test-Path $_.LocalPath) })
+    foreach ($p in $profiles) {
+        $b = Join-Path $p.LocalPath 'AppData\Local\Microsoft\OneDrive'
+        $e = Join-Path $b 'OneDrive.exe'
+        if (Test-Path $e) { $inst += [pscustomobject]@{ Type = 'Per-user'; Owner = (Split-Path $p.LocalPath -Leaf); Path = $e; Base = $b } }
+    }
+    $instRows = foreach ($i in $inst) {
+        $fi  = Get-Item $i.Path
+        $sig = (Get-AuthenticodeSignature $i.Path -ErrorAction SilentlyContinue).Status
+        $verDirs = @(Get-ChildItem $i.Base -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+' })
+        $dupes   = @($verDirs | Where-Object { $_.Name -match '_\d+$' })
+        if ($dupes) { Add-Finding 'MEDIUM' ("{0} install has duplicate version folder(s): {1} - an install/update collided with a locked folder." -f $i.Type, ($dupes.Name -join ', ')) 'Uninstall OneDrive, delete the leftover version folders, reinstall (option: Install apps silently from the vendor > OneDrive per-machine).' }
+        if ("$sig" -ne 'Valid') { Add-Finding 'MEDIUM' "OneDrive.exe signature is '$sig' ($($i.Path))." 'Reinstall OneDrive from Microsoft; check EDR quarantine.' }
+        [pscustomobject]@{ Type = $i.Type; Owner = $i.Owner; Version = $fi.VersionInfo.FileVersion; Modified = $fi.LastWriteTime; Signature = $sig; VersionFolders = ($verDirs.Name -join ', '); Path = $i.Path }
+    }
+    Add-Table $instRows
+    $hasMachine = [bool]($inst | Where-Object Type -eq 'Per-machine')
+    if (-not $inst) {
+        Add-Finding 'HIGH' 'OneDrive.exe is not installed anywhere on this PC.' 'Install it (option: Install apps silently from the vendor > Microsoft OneDrive per-machine).'
+    } elseif ($hasMachine -and ($inst | Where-Object Type -eq 'Per-user')) {
+        Add-Finding 'MEDIUM' ("Both a per-machine and per-user OneDrive exist (per-user for: {0}). They can fight over startup and updates." -f ((@($inst | Where-Object Type -eq 'Per-user').Owner) -join ', ')) 'Keep the per-machine copy: uninstall the per-user copy for those users (or reinstall with OneDriveSetup.exe /allusers, which migrates them).'
+    }
+
+    # ---------------------------------------------------------------- startup entries
+    Add-Sub 'Startup (Run) entries for OneDrive'
+    $runKeys = @(
+        @{ S = 'Machine';          K = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run';             A = $null }
+        @{ S = 'Machine (32-bit)'; K = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; A = $null }
+    )
+    foreach ($h in $hives) { $runKeys += @{ S = $h.User; K = "$($h.Root)\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"; A = "$($h.Root)\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" } }
+    $runRows = @()
+    foreach ($rk in $runKeys) {
+        $k = Get-Item $rk.K -ErrorAction SilentlyContinue
+        if (-not $k) { continue }
+        $approved = if ($rk.A) { Get-Item $rk.A -ErrorAction SilentlyContinue } else { $null }
+        foreach ($vn in $k.GetValueNames()) {
+            $cmd = "$($k.GetValue($vn))"
+            if ("$vn $cmd" -notmatch 'OneDrive') { continue }
+            $m = [regex]::Match($cmd, '^\s*"?([^"]+?\.exe)')
+            $exe = if ($m.Success) { [Environment]::ExpandEnvironmentVariables($m.Groups[1].Value) } else { '' }
+            $enabled = 'Yes'
+            if ($approved -and ($approved.GetValueNames() -contains $vn)) { $bytes = $approved.GetValue($vn); if ($bytes -and $bytes.Length -gt 0 -and ($bytes[0] % 2) -eq 1) { $enabled = 'NO (disabled in Task Manager > Startup)' } }
+            $runRows += [pscustomobject]@{ Scope = $rk.S; Name = $vn; Enabled = $enabled; TargetExists = $(if ($exe) { Test-Path $exe } else { '?' }); Command = $cmd }
+        }
+    }
+    Add-Table $runRows
+    foreach ($r in $runRows) {
+        if ($r.TargetExists -eq $false) { Add-Finding 'MEDIUM' "Startup entry '$($r.Name)' ($($r.Scope)) points to a file that does not exist: $($r.Command)" 'Remove the stale entry; reinstall/repair OneDrive so it recreates a correct one.' }
+        if ($r.Enabled -like 'NO*' -and $r.Name -eq 'OneDrive') { Add-Finding 'HIGH' "OneDrive startup is DISABLED for $($r.Scope) (Task Manager > Startup)." 'Have the user enable OneDrive in Task Manager > Startup apps, or start it manually.' }
+        if ($hasMachine -and $r.Command -match 'OneDriveSetup\.exe.*/thfirstsetup' -and $r.Scope -notmatch '^Machine') { Add-Finding 'LOW' "Legacy first-run entry 'OneDriveSetup.exe /thfirstsetup' still present for $($r.Scope) next to the per-machine install - it can try to install a second per-user copy." "Delete that '$($r.Name)' value from the user's Run key." }
+    }
+    foreach ($h in $hives) {
+        if ($inst -and -not ($runRows | Where-Object { $_.Scope -eq $h.User -and $_.Command -match 'OneDrive\.exe' }) -and -not ($runRows | Where-Object { $_.Scope -like 'Machine*' -and $_.Command -match 'OneDrive\.exe' })) {
+            Add-Finding 'MEDIUM' "No OneDrive.exe startup entry for $($h.User) - it will not start at sign-in." 'Start OneDrive once as the user (it re-adds the entry) or reinstall per-machine.'
+        }
+    }
+
+    # ---------------------------------------------------------------- processes / services / tasks
+    Add-Sub 'Running OneDrive processes'
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='OneDrive.exe' OR Name='FileCoAuth.exe' OR Name='OneDrive.Sync.Service.exe' OR Name='FileSyncHelper.exe' OR Name='OneDriveStandaloneUpdater.exe'" -ErrorAction SilentlyContinue)
+    $procRows = foreach ($p in $procs) {
+        $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
+        $owner = if ($o -and $o.User) { "$($o.Domain)\$($o.User)" } else { '' }
+        [pscustomobject]@{ Name = $p.Name; PID = $p.ProcessId; Owner = $owner; Started = $p.CreationDate; Path = $p.ExecutablePath }
+    }
+    Add-Table $procRows
+    foreach ($h in $hives) {
+        if (-not ($procRows | Where-Object { $_.Name -eq 'OneDrive.exe' -and $_.Owner -eq $h.User })) { Add-Line "  OneDrive.exe is NOT running for $($h.User)." 'Yellow' }
+    }
+
+    Add-Sub 'OneDrive services and scheduled tasks'
+    Add-Table (Get-Service -Name 'OneDrive Updater Service', 'FileSyncHelper' -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType)
+    $tasks = @(Get-ScheduledTask -TaskName 'OneDrive*' -ErrorAction SilentlyContinue)
+    $taskRows = foreach ($t in $tasks) {
+        $ti = Get-ScheduledTaskInfo -InputObject $t -ErrorAction SilentlyContinue
+        [pscustomobject]@{ Task = $t.TaskName; State = $t.State; LastRun = $(if ($ti) { $ti.LastRunTime } else { '' }); LastResult = $(if ($ti) { '0x{0:X}' -f $ti.LastTaskResult } else { '' }) }
+    }
+    Add-Table $taskRows
+    foreach ($t in @($taskRows | Where-Object { $_.Task -like 'OneDrive Standalone Update*' -and "$($_.State)" -eq 'Disabled' })) {
+        Add-Finding 'LOW' "Scheduled task '$($t.Task)' is disabled - OneDrive will not update itself." 'Enable the task, or update OneDrive another way.'
+    }
+
+    # ---------------------------------------------------------------- accounts / known folders
+    Add-Sub 'OneDrive accounts and redirected folders (signed-in users)'
+    $acc = @()
+    foreach ($h in $hives) {
+        $found = $false
+        Get-ChildItem "$($h.Root)\SOFTWARE\Microsoft\OneDrive\Accounts" -ErrorAction SilentlyContinue | ForEach-Object {
+            $a = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+            if ($a -and ($a.PSObject.Properties.Name -contains 'UserFolder') -and $a.UserFolder) {
+                $found = $true
+                $acc += [pscustomobject]@{
+                    User = $h.User; Slot = $_.PSChildName
+                    Email    = $(if ($a.PSObject.Properties.Name -contains 'UserEmail') { $a.UserEmail } else { '' })
+                    TenantId = $(if ($a.PSObject.Properties.Name -contains 'ConfiguredTenantId') { $a.ConfiguredTenantId } else { '' })
+                    Folder   = $a.UserFolder
+                    FolderExists = (Test-Path -LiteralPath $a.UserFolder)
+                }
+            }
+        }
+        if (-not $found) { Add-Finding 'INFO' "No OneDrive account is configured for $($h.User) (never signed in, unlinked, or reset)." 'Once OneDrive starts, sign the user in (silent sign-in needs SilentAccountConfig + hybrid/Entra join).' }
+    }
+    Add-Table ($acc | Select-Object User, Slot, Email, TenantId, FolderExists, Folder)
+    foreach ($a in @($acc | Where-Object { -not $_.FolderExists })) { Add-Finding 'MEDIUM' "Sync folder for $($a.User) ($($a.Slot)) does not exist: $($a.Folder)" 'Unlink and relink the account (OneDrive settings), or reset OneDrive as the user.' }
+
+    $allow = @($pol | Where-Object { $_.Key -match 'AllowTenantList$' } | ForEach-Object { "$($_.Name) $($_.Value)" })
+    $deny  = @($pol | Where-Object { $_.Key -match 'BlockTenantList$' } | ForEach-Object { "$($_.Name) $($_.Value)" })
+    foreach ($a in @($acc | Where-Object { $_.TenantId })) {
+        if ($allow -and -not ($allow | Where-Object { $_ -match [regex]::Escape($a.TenantId) })) { Add-Finding 'HIGH' "Tenant $($a.TenantId) used by $($a.User) is NOT in the AllowTenantList policy - sync is refused." 'Add the tenant ID to "Allow syncing OneDrive accounts for only specific organizations".' }
+        if ($deny | Where-Object { $_ -match [regex]::Escape($a.TenantId) }) { Add-Finding 'HIGH' "Tenant $($a.TenantId) used by $($a.User) is in the BlockTenantList policy." 'Remove it from "Block syncing OneDrive accounts for specific organizations".' }
+    }
+
+    $kfRows = @()
+    foreach ($h in $hives) {
+        $k = Get-Item "$($h.Root)\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders" -ErrorAction SilentlyContinue
+        if (-not $k) { continue }
+        foreach ($vn in 'Desktop', 'Personal', 'My Pictures') {
+            $raw = $k.GetValue($vn, $null, 'DoNotExpandEnvironmentNames')
+            if (-not $raw) { continue }
+            $path = if ($h.Profile) { $raw -replace '%USERPROFILE%', $h.Profile } else { $raw }
+            $path = [Environment]::ExpandEnvironmentVariables($path)
+            $label = switch ($vn) { 'Personal' { 'Documents' } 'My Pictures' { 'Pictures' } default { $vn } }
+            $kfRows += [pscustomobject]@{ User = $h.User; Folder = $label; InOneDrive = ($path -match 'OneDrive'); Exists = (Test-Path -LiteralPath $path); Path = $path }
+        }
+    }
+    Add-Table $kfRows
+    foreach ($r in @($kfRows | Where-Object { $_.InOneDrive -and -not $_.Exists })) { Add-Finding 'HIGH' "$($r.User)'s $($r.Folder) is redirected into OneDrive at a path that does not exist: $($r.Path)" 'Fix OneDrive first (it recreates the folder), or point the folder back to the local profile.' }
+
+    # ---------------------------------------------------------------- events
+    Add-Sub 'OneDrive crashes / hangs (Application log, last 30 days)'
+    $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1000, 1001, 1002; StartTime = (Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue |
+        Where-Object { $_.Message -match 'OneDrive|FileCoAuth|FileSync' } | Select-Object -First 15)
+    if ($ev) {
+        Add-Table ($ev | Select-Object TimeCreated, Id, @{ n = 'Message'; e = { (($_.Message -split "`r?`n") | Where-Object { $_ } | Select-Object -First 3) -join ' | ' } })
+        Add-Finding 'MEDIUM' "$($ev.Count) OneDrive crash/hang event(s) in the last 30 days." 'Reset OneDrive as the user; if it keeps crashing, uninstall + reinstall the latest version.'
+    } else {
+        Add-Line '  None. If OneDrive "won''t start" it is exiting cleanly (policy block, tenant restriction, sign-in) or never being launched (startup entry) - see findings.' 'DarkGray'
+    }
+
+    # ---------------------------------------------------------------- connectivity
+    Add-Sub 'Connectivity to Microsoft sign-in / OneDrive endpoints (TCP 443)'
+    $net = foreach ($ep in 'login.microsoftonline.com', 'oneclient.sfx.ms', 'g.live.com', 'skyapi.live.net') { [pscustomobject]@{ Endpoint = $ep; Port443 = $(if (Test-TcpPort $ep 443) { 'OK' } else { 'FAILED' }) } }
+    Add-Table $net
+    foreach ($n in @($net | Where-Object Port443 -eq 'FAILED')) { Add-Finding 'MEDIUM' "Cannot reach $($n.Endpoint) on port 443." 'Check firewall / web filter / proxy for Microsoft 365 endpoints.' }
+
+    # ---------------------------------------------------------------- logs
+    Add-Sub "OneDrive's own logs (not in Event Viewer)"
+    if (Read-YesNo 'Copy OneDrive logs from each user profile (last 3 days) into the report folder?' $true) {
+        $i = 0
+        foreach ($p in $profiles) {
+            $i++
+            $copied = 0
+            foreach ($sub in 'logs', 'setup\logs') {
+                $src = Join-Path $p.LocalPath "AppData\Local\Microsoft\OneDrive\$sub"
+                if (-not (Test-Path $src)) { continue }
+                $dst = Join-Path $outDir ("Logs\Profile$i\" + ($sub -replace '\\', '_'))
+                Get-ChildItem $src -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddDays(-3) -and $_.Length -lt 50MB } | ForEach-Object {
+                    $d = Join-Path $dst $_.FullName.Substring($src.Length).TrimStart('\')
+                    Ensure-Dir (Split-Path $d) | Out-Null
+                    Copy-Item -LiteralPath $_.FullName -Destination $d -ErrorAction SilentlyContinue
+                    if ($?) { $copied++ }
+                }
+            }
+            if ($copied) { Add-Line ("  Profile{0} = {1}: {2} file(s)" -f $i, $p.LocalPath, $copied) }
+        }
+        if (-not (Test-Path (Join-Path $outDir 'Logs'))) { Add-Line '  No recent OneDrive logs found in any profile.' 'DarkGray' }
+        else { Add-Line '  Read SyncDiagnostics.log first (plain text); .odl files are binary and are what Microsoft support asks for.' 'DarkGray' }
+    }
+
+    # ---------------------------------------------------------------- findings
+    Add-Sub 'FINDINGS'
+    $order = @{ HIGH = 0; MEDIUM = 1; LOW = 2; INFO = 3 }
+    $color = @{ HIGH = 'Red'; MEDIUM = 'Yellow'; LOW = 'Cyan'; INFO = 'DarkGray' }
+    if (-not $findings.Count) {
+        Add-Line '  No blocking problem found. Have the user start OneDrive and check its tray icon / SyncDiagnostics.log.' 'Green'
+    } else {
+        foreach ($f in ($findings | Sort-Object { $order[$_.Severity] })) {
+            Add-Line ("  [{0}] {1}" -f $f.Severity, $f.Issue) $color[$f.Severity]
+            Add-Line ("         Fix: {0}" -f $f.Fix) 'DarkGray'
+        }
+    }
+    $txt = Join-Path $outDir 'OneDrive_Diagnostics.txt'
+    $rpt | Set-Content -Path $txt -Encoding UTF8
+    if ($findings.Count) { $findings | Export-Csv (Join-Path $outDir 'Findings.csv') -NoTypeInformation }
+    $zip = "$outDir.zip"
+    try { Compress-Archive -Path (Join-Path $outDir '*') -DestinationPath $zip -Force -ErrorAction Stop; Write-Host "  Zipped: $zip" -ForegroundColor Green } catch { }
+    Write-Host "  Report: $txt" -ForegroundColor Green
+
+    # ---------------------------------------------------------------- optional fix
+    $machineBlock = @($block | Where-Object { $_.Scope -like 'Machine*' })
+    $gpoBlock = @($fromGpo | Where-Object { $_.Setting -match 'Prevent the usage of OneDrive|DisableFileSync' -and $_.State -ne 'Disabled' })
+    if ($machineBlock -and -not $gpoBlock -and -not $inLocal) {
+        if (Confirm-Change 'Delete the DisableFileSyncNGSC / DisableFileSync policy value(s) from HKLM (no Group Policy sets them, so they will not come back on their own).') {
+            foreach ($k in 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive', 'HKLM:\SOFTWARE\WOW6432Node\Policies\Microsoft\Windows\OneDrive') {
+                foreach ($v in 'DisableFileSyncNGSC', 'DisableFileSync') { Remove-ItemProperty -Path $k -Name $v -ErrorAction SilentlyContinue }
+            }
+            $exe = @($inst | Select-Object -First 1).Path
+            Write-Host '  Removed. Now start OneDrive AS THE USER (not as admin):' -ForegroundColor Green
+            if ($exe) { Write-Host "    `"$exe`"" -ForegroundColor Green }
+        }
+    } elseif ($machineBlock) {
+        Write-Host '  The block comes from Group Policy - change the GPO shown above; deleting the registry value would only last until the next refresh.' -ForegroundColor Yellow
+    }
+}
+
 function Invoke-OneDriveReset {
     Write-Title '[!] OneDrive reset (current user)'
     $exe = @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe", "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe", "${env:ProgramFiles(x86)}\Microsoft OneDrive\OneDrive.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $exe) { Write-Host '  OneDrive.exe not found.' -ForegroundColor Red; return }
     Write-Host "  $exe  (version $((Get-Item $exe).VersionInfo.FileVersion))"
+    $blk = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive', 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' -ErrorAction SilentlyContinue |
+        Where-Object { ($_.PSObject.Properties.Name -contains 'DisableFileSyncNGSC' -and $_.DisableFileSyncNGSC -eq 1) -or ($_.PSObject.Properties.Name -contains 'DisableFileSync' -and $_.DisableFileSync -eq 1) }
+    if ($blk) { Write-Host '  WARNING: policy "Prevent the usage of OneDrive for file storage" (DisableFileSyncNGSC) is ON - OneDrive exits right after a reset. Run the OneDrive diagnostics option first.' -ForegroundColor Red }
+    $console = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+    if ($console -and $console -ne "$env:USERDOMAIN\$env:USERNAME") { Write-Host "  WARNING: you are running as $env:USERDOMAIN\$env:USERNAME but $console is signed in - this resets YOUR OneDrive, not theirs. Run the ToolKit as that user." -ForegroundColor Yellow }
     Get-ChildItem 'HKCU:\Software\Microsoft\OneDrive\Accounts' -ErrorAction SilentlyContinue | ForEach-Object { $p = Get-ItemProperty $_.PSPath; if ($p.UserEmail) { Write-Host "  Account: $($p.UserEmail)  Folder: $($p.UserFolder)" } }
     if (Confirm-Change 'Reset OneDrive for this user (re-syncs everything; files are NOT deleted).') {
         Start-Process $exe -ArgumentList '/reset' -Wait
@@ -3502,6 +3860,7 @@ $Script:Menu = @(
     @{               Text = '[!] Print spooler reset (clear stuck jobs)';                                    Action = { Invoke-SpoolerReset } }
     @{               Text = '[!] Microsoft Teams cache clear (classic + new)';                               Action = { Invoke-TeamsCacheClear } }
     @{               Text = '[!] Office quick / online repair';                                              Action = { Invoke-OfficeRepair } }
+    @{ Test='safe'; Text = 'OneDrive will not start / sync - diagnostics (policy block, installs, startup, logs)'; Action = { Invoke-OneDriveDiag } }
     @{               Text = '[!] OneDrive reset';                                                            Action = { Invoke-OneDriveReset } }
     @{               Text = '[!] Repair .zip association / reset default browser (per user)';               Action = { Invoke-ZipBrowserRepair } }
     @{               Text = '[!] Remove bloatware (OEM + consumer Store apps)';                              Action = { Invoke-RemoveBloatware } }
