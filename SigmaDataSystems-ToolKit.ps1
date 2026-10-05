@@ -1848,6 +1848,10 @@ $Script:ToolLinks = [ordered]@{
     'Hawk (M365 investigation)'        = 'https://github.com/T0pCyber/hawk'
     'CISA ScubaGear'                   = 'https://github.com/cisagov/ScubaGear'
     'Maester (M365 security tests)'    = 'https://maester.dev'
+    'dnstwist (look-alike domains)'    = 'https://github.com/elceef/dnstwist'
+    'openSquat (new look-alike domains)' = 'https://github.com/atenreiro/opensquat'
+    'Microsoft Message Header Analyzer' = 'https://github.com/microsoft/MHA'
+    'parsedmarc (DMARC reports)'       = 'https://github.com/domainaware/parsedmarc'
 }
 
 function Get-ToolsDir([string]$Sub) { Get-OutDir ("Tools\" + $Sub) }
@@ -2907,6 +2911,38 @@ function Invoke-M365Maester {
     Invoke-M365Sec 'Maester' ([ordered]@{ IncludeExchange = $exo }) -Exe (Select-M365Shell) | Out-Null
 }
 
+function Invoke-ImpersonationCheck {
+    Write-Title 'M365: domain impersonation / spoofing investigation'
+    Write-Host '  1. Analyse a suspicious message''s headers (who really sent it, Direct Send, Reply-To, look-alike sender)'
+    Write-Host '  2. How spoofable is a domain? (SPF + lookup count, DMARC, DKIM, MX gateway, MTA-STS)'
+    Write-Host '  3. Look-alike domain scan (typo / homoglyph / keyword / TLD variants that are registered, with MX and age)'
+    Write-Host '  4. Tenant check (Exchange Online): Direct Send, anti-phish impersonation, spoof intelligence, trace look-alike mail'
+    Write-Host '  5. Tenant-wide SPOOF HUNT - is it still happening? Own-domain mail from outside IPs (before vs after a fix date),'
+    Write-Host '     look-alike sender sweep of ALL traced mail, spoof intelligence, and a Defender advanced-hunting query'
+    $c = Read-Default 'Pick 1-5' '1'
+    $p = [ordered]@{ OutputPath = (Get-OutDir 'M365') }
+    switch ("$c") {
+        '1' { $p.Action = 'Headers'
+              $p.Domain = Read-Default 'Your own domain (blank = use the recipient''s domain from the headers)' ''
+              $p.ProtectedNames = Read-Default 'Names to protect from display-name impersonation, comma-separated (e.g. executives; blank = skip)' '' }
+        '2' { $p.Action = 'DomainAuth'; $p.Domain = Read-Default 'Domain to check' ''; if (-not $p.Domain) { return } }
+        '3' { $p.Action = 'Lookalikes'; $p.Domain = Read-Default 'Your real domain' ''; if (-not $p.Domain) { return }
+              $p.CheckRegistration = Read-YesNo 'Look up registration dates (RDAP, needs internet)?' $true }
+        '4' { $p.Action = 'Tenant'; $p.Days = Read-Int 'Days of message trace for look-alike senders (max 90)' 30
+              Write-Host "  M365 target: $(Get-M365Label)" -ForegroundColor DarkGray
+              foreach ($k in (Get-M365Params).Keys) { if ($k -ne 'TenantId') { $p[$k] = (Get-M365Params)[$k] } } }
+        '5' { $p.Action = 'SpoofHunt'
+              $p.Domain = Read-Default 'Domains to hunt, comma-separated (blank = all accepted domains)' ''
+              $p.Days = Read-Int 'Days of message trace (max 90; large tenants take longer)' 30
+              $p.FixDate = Read-Default 'Date/time the fix went in, to compare before vs after (e.g. 2026-10-01 14:00; blank = skip)' ''
+              $p.TrustedIPs = Read-Default 'Extra trusted sender IPs/CIDRs besides inbound connectors (scanners, apps; blank = none)' ''
+              Write-Host "  M365 target: $(Get-M365Label)" -ForegroundColor DarkGray
+              foreach ($k in (Get-M365Params).Keys) { if ($k -ne 'TenantId') { $p[$k] = (Get-M365Params)[$k] } } }
+        default { return }
+    }
+    Invoke-Tool 'Invoke-DomainImpersonationCheck' $p | Out-Null
+}
+
 # ---------- Entra / Intune on THIS device ------------------------------------------------
 
 function Invoke-ForceHybridJoin {
@@ -3521,6 +3557,7 @@ $Script:Menu = @(
     @{               Text = 'M365 IR: Hawk - compromised user / tenant investigation';                         Action = { Invoke-M365Hawk } }
     @{               Text = 'M365 audit: CISA ScubaGear - SCuBA secure-baseline assessment (HTML)';             Action = { Invoke-M365ScubaGear } }
     @{               Text = 'M365 audit: Maester - automated Entra / Exchange / CISA security tests (HTML)';    Action = { Invoke-M365Maester } }
+    @{               Text = 'M365: domain impersonation / spoofing - headers, SPF/DMARC, look-alike domains, Direct Send'; Action = { Invoke-ImpersonationCheck } }
 )
 
 # Number the menu items in order (adding/removing an item never needs renumbering)
@@ -16340,6 +16377,716 @@ switch ($Action) {
 
 }
 exit $exit
+'@
+
+# ======================= Invoke-DomainImpersonationCheck.ps1 =======================
+$Script:Payloads['Invoke-DomainImpersonationCheck'] = @'
+<#
+.SYNOPSIS
+    Sigma Data Systems INC ToolKit - domain impersonation / spoofing investigation.
+
+.DESCRIPTION
+    Prepared by Sigma Data Systems Inc. - https://sigmadatainc.com/
+
+    -Action Headers     Analyse the headers of a suspicious message (.txt or .eml, or paste into Notepad):
+                        real sender, sending IP/country, SPF/DKIM/DMARC/CompAuth, Microsoft verdict (CAT),
+                        Direct Send (anonymous "internal" mail), Reply-To / Return-Path mismatches,
+                        look-alike sender domains and free-mail display-name impersonation. Plain-English verdict.
+    -Action DomainAuth  How spoofable is a domain? SPF (with DNS-lookup count), DMARC policy, DKIM selectors,
+                        MX / mail gateway, MTA-STS and TLS-RPT.
+    -Action Lookalikes  dnstwist-style scan: generates typo, homoglyph, hyphen, keyword and TLD variants of a
+                        domain, finds which are registered, which have mail servers (MX) and when they were
+                        registered (RDAP). Pure PowerShell - nothing to install.
+    -Action Tenant      Exchange Online: Direct Send status, anti-phishing impersonation settings, spoof
+                        intelligence (who is sending as your domains), inbound connectors, and a message
+                        trace for mail from registered look-alike domains found by the last Lookalikes run.
+    -Action SpoofHunt   "Is it still happening?" - message trace of every message that claims to come from
+                        one of your own domains but entered from an outside IP that is not a connector,
+                        a trusted IP you list, or Microsoft 365. Groups them by IP (with PTR / hosting
+                        flag), counts them per day and compares before vs after a fix date (e.g. the day
+                        RejectDirectSend was turned on). Also lists spoof-intelligence entries for your domains.
+
+    Read-only: nothing in DNS or the tenant is changed. Nothing client-specific is stored in this
+    script; all domains and names are asked for at run time. Output file names are generic.
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory)][ValidateSet('Headers', 'DomainAuth', 'Lookalikes', 'Tenant', 'SpoofHunt')][string]$Action,
+    [string]$Domain,
+    [string]$HeaderFile,
+    [string]$ProtectedNames,
+    [string]$AdminUPN,
+    [string]$DelegatedOrganization,
+    [string]$TenantId,
+    [string]$OutputPath = 'C:\temp\M365',
+    [int]$Days = 30,
+    [int]$Threads = 40,
+    [bool]$CheckRegistration = $true,
+    [string]$FixDate,
+    [string]$TrustedIPs
+)
+
+$ErrorActionPreference = 'Stop'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+
+function Write-H([string]$t) { Write-Host "`n--- $t ---" -ForegroundColor Yellow }
+function Ensure-Dir([string]$p) { if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }; return $p }
+function Get-Stamp { Get-Date -Format 'yyyyMMdd_HHmmss' }
+function Ask([string]$Prompt, $Default) {
+    $shown = if ("$Default" -ne '') { " [$Default]" } else { '' }
+    $a = Read-Host "$Prompt$shown"
+    if ([string]::IsNullOrWhiteSpace($a)) { return $Default }
+    return $a.Trim().Trim('"')
+}
+function Out-Finding([string]$Level, [string]$Text) {
+    $c = switch ($Level) { 'HIGH' { 'Red' } 'MED' { 'Yellow' } 'OK' { 'Green' } default { 'Gray' } }
+    Write-Host ("  [{0,-4}] {1}" -f $Level, $Text) -ForegroundColor $c
+    $Script:Findings.Add([pscustomobject]@{ Level = $Level; Finding = $Text })
+}
+$Script:Findings = New-Object System.Collections.Generic.List[object]
+$OutDir = Ensure-Dir (Join-Path $OutputPath 'Impersonation')
+
+$Script:FreeMail = 'gmail.com','googlemail.com','outlook.com','hotmail.com','live.com','msn.com','yahoo.com','ymail.com','aol.com','icloud.com','me.com','mac.com','proton.me','protonmail.com','pm.me','gmx.com','gmx.net','mail.com','zoho.com','yandex.com','yandex.ru','comcast.net','verizon.net','att.net','sbcglobal.net'
+
+# ------------------------------------------------------------------ helpers: domains
+function Get-DomainOf([string]$addr) {
+    if (-not $addr) { return '' }
+    $m = [regex]::Match($addr, '@([A-Za-z0-9\.\-]+)')
+    if ($m.Success) { return $m.Groups[1].Value.ToLower().TrimEnd('.') }
+    return $addr.ToLower().Trim().TrimEnd('.')
+}
+function Split-Domain([string]$d) {
+    $parts = $d.ToLower().Split('.')
+    if ($parts.Count -ge 3 -and $parts[-1].Length -eq 2 -and @('co','com','org','net','ac','gov','edu') -contains $parts[-2]) {
+        return [pscustomobject]@{ Label = $parts[-3]; Tld = ($parts[-2] + '.' + $parts[-1]); Prefix = (($parts[0..($parts.Count - 4)]) -join '.') }
+    }
+    if ($parts.Count -lt 2) { return [pscustomobject]@{ Label = $d; Tld = ''; Prefix = '' } }
+    return [pscustomobject]@{ Label = $parts[-2]; Tld = $parts[-1]; Prefix = $(if ($parts.Count -gt 2) { ($parts[0..($parts.Count - 3)]) -join '.' } else { '' }) }
+}
+function Get-Levenshtein([string]$a, [string]$b) {
+    # Two-row version (no multi-dimensional arrays - Windows PowerShell 5.1 safe)
+    $n = $a.Length; $m = $b.Length
+    if ($n -eq 0) { return $m }; if ($m -eq 0) { return $n }
+    $prev = New-Object int[] ($m + 1); $cur = New-Object int[] ($m + 1)
+    for ($j = 0; $j -le $m; $j++) { $prev[$j] = $j }
+    for ($i = 1; $i -le $n; $i++) {
+        $cur[0] = $i
+        for ($j = 1; $j -le $m; $j++) {
+            $cost = 1; if ($a[$i - 1] -eq $b[$j - 1]) { $cost = 0 }
+            $del = $prev[$j] + 1; $ins = $cur[$j - 1] + 1; $sub = $prev[$j - 1] + $cost
+            $v = $del; if ($ins -lt $v) { $v = $ins }; if ($sub -lt $v) { $v = $sub }
+            $cur[$j] = $v
+        }
+        $tmp = $prev; $prev = $cur; $cur = $tmp
+    }
+    return $prev[$m]
+}
+function Get-Skeleton([string]$s) {
+    $s = $s.ToLower() -replace '-', '' -replace 'rn', 'm' -replace 'vv', 'w' -replace 'cl', 'd'
+    $s = $s -replace '0', 'o' -replace '[1il|]', 'l' -replace '5', 's' -replace '3', 'e' -replace '4', 'a' -replace '8', 'b' -replace '6', 'g'
+    return $s
+}
+# $true when $cand looks like $real but is not the same domain
+function Test-LookAlike([string]$cand, [string]$real) {
+    if (-not $cand -or -not $real -or $cand -eq $real) { return $false }
+    if ($cand.EndsWith('.' + $real)) { return $false }   # a real subdomain
+    $c = Split-Domain $cand; $r = Split-Domain $real
+    if ($c.Label -eq $r.Label -and $c.Tld -ne $r.Tld) { return $true }                      # same name, other TLD
+    if ((Get-Skeleton $c.Label) -eq (Get-Skeleton $r.Label)) { return $true }               # homoglyph / hyphen
+    if ($r.Label.Length -ge 4 -and (Get-Levenshtein $c.Label $r.Label) -le 2) { return $true } # typo
+    if ($r.Label.Length -ge 4 -and $c.Label.Contains($r.Label)) { return $true }              # brand + keyword
+    return $false
+}
+
+# ------------------------------------------------------------------ helpers: DNS
+function Get-Txt([string]$name) {
+    try { @(Resolve-DnsName -Name $name -Type TXT -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'TXT' } | ForEach-Object { ($_.Strings -join '') }) } catch { @() }
+}
+function Get-Mx([string]$name) {
+    try { @(Resolve-DnsName -Name $name -Type MX -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'MX' } | Sort-Object Preference | ForEach-Object { $_.NameExchange }) } catch { @() }
+}
+$Script:SpfSeen = @{}
+function Get-SpfLookups([string]$dom, [int]$depth = 0) {
+    if ($depth -gt 10 -or $Script:SpfSeen.ContainsKey($dom)) { return 0 }
+    $Script:SpfSeen[$dom] = $true
+    $rec = Get-Txt $dom | Where-Object { $_ -match '^v=spf1' } | Select-Object -First 1
+    if (-not $rec) { return 0 }
+    $count = 0
+    foreach ($t in ($rec -split '\s+')) {
+        $t2 = $t.TrimStart('+', '-', '~', '?').ToLower()
+        if ($t2 -match '^include:(.+)$')  { $count++; $count += Get-SpfLookups $Matches[1] ($depth + 1) }
+        elseif ($t2 -match '^redirect=(.+)$') { $count++; $count += Get-SpfLookups $Matches[1] ($depth + 1) }
+        elseif ($t2 -match '^(a|mx|ptr)(:|/|$)' -or $t2 -match '^exists:') { $count++ }
+    }
+    return $count
+}
+
+# ======================================================================== HEADERS
+function Get-HeaderText {
+    $path = $HeaderFile
+    if (-not $path) {
+        Write-Host '  Get the headers: Outlook > open the message > File > Properties > "Internet headers" (copy all),'
+        Write-Host '  or OWA > ... > View > View message details. A saved .eml file also works.'
+        $path = Ask '  Path to a .txt / .eml file (blank = open Notepad to paste them)' ''
+    }
+    if (-not $path) {
+        $path = Join-Path $OutDir ("Headers_{0}.txt" -f (Get-Stamp))
+        Set-Content -Path $path -Value '' -Encoding UTF8
+        Write-Host "  Paste the headers into Notepad, SAVE, then close Notepad to continue..." -ForegroundColor Cyan
+        Start-Process notepad.exe -ArgumentList "`"$path`"" -Wait
+    }
+    if (-not (Test-Path -LiteralPath $path)) { throw "File not found: $path" }
+    if ($path -match '\.msg$') { throw '.msg files can''t be read directly - copy the Internet headers from Outlook into a .txt file instead.' }
+    $raw = [IO.File]::ReadAllText($path)
+    $raw = $raw -replace "`r`n", "`n"
+    $i = $raw.IndexOf("`n`n")
+    if ($path -match '\.eml$' -and $i -gt 0) { $raw = $raw.Substring(0, $i) }   # headers only
+    return $raw
+}
+function ConvertFrom-RawHeaders([string]$raw) {
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($line in ($raw -split "`n")) {
+        if ($line -match '^[ \t]' -and $list.Count) { $list[$list.Count - 1].Value += ' ' + $line.Trim(); continue }
+        if ($line -match '^([!-9;-~]+):\s?(.*)$') { $list.Add([pscustomobject]@{ Name = $Matches[1]; Value = $Matches[2].Trim() }) }
+    }
+    return $list
+}
+
+$Script:CatMap = @{
+    'SPOOF' = 'Spoofing (failed sender authentication)'; 'UIMP' = 'User impersonation'; 'DIMP' = 'Domain impersonation'
+    'GIMP'  = 'Mailbox-intelligence impersonation'; 'BIMP' = 'Brand impersonation'; 'PHSH' = 'Phishing'; 'HPHSH' = 'High-confidence phishing'
+    'HPHISH' = 'High-confidence phishing'; 'SPM' = 'Spam'; 'HSPM' = 'High-confidence spam'; 'BULK' = 'Bulk'; 'MALW' = 'Malware'
+    'AMP' = 'Anti-malware'; 'INTOS' = 'Intra-org phishing'; 'OSPM' = 'Outbound spam'; 'NONE' = 'No threat detected'
+}
+
+function Invoke-Headers {
+    $h = ConvertFrom-RawHeaders (Get-HeaderText)
+    if ($h.Count -lt 3) { throw 'No headers found in that input.' }
+    $get = { param($n) ($h | Where-Object { $_.Name -eq $n } | Select-Object -First 1).Value }
+    $all = { param($n) @($h | Where-Object { $_.Name -eq $n } | ForEach-Object { $_.Value }) }
+
+    $from = & $get 'From'; $to = & $get 'To'; $rp = & $get 'Return-Path'; $reply = & $get 'Reply-To'
+    $subj = & $get 'Subject'; $date = & $get 'Date'; $msgid = & $get 'Message-ID'
+    $fromDom = Get-DomainOf $from; $rpDom = Get-DomainOf $rp; $replyDom = Get-DomainOf $reply; $toDom = Get-DomainOf $to
+    $display = ''
+    if ($from -match '^\s*"?([^"<]*)"?\s*<') { $display = $Matches[1].Trim() }
+
+    $ar = ((& $all 'Authentication-Results') + (& $all 'ARC-Authentication-Results')) -join ' ; '
+    $rx = { param($p) $m = [regex]::Match($ar, $p, 'IgnoreCase'); if ($m.Success) { $m.Groups[1].Value } else { '' } }
+    $spf = & $rx 'spf=(\w+)'; $dkim = & $rx 'dkim=(\w+)'; $dmarc = & $rx 'dmarc=(\w+)'; $dmarcAct = & $rx 'dmarc=\w+\s+action=(\w+)'
+    $comp = & $rx 'compauth=(\w+)'; $reason = & $rx 'compauth=\w+\s+reason=(\d+)'; $mailfrom = & $rx 'smtp\.mailfrom=([^\s;]+)'
+    $dkimD = & $rx 'header\.d=([^\s;]+)'; $senderIp = & $rx 'sender IP is ([0-9a-fA-F\.:]+)'
+
+    $fs = @{}
+    foreach ($kv in ((& $get 'X-Forefront-Antispam-Report') -split ';')) { if ($kv -match '^\s*([A-Z]+):(.*)$') { $fs[$Matches[1]] = $Matches[2] } }
+    if (-not $senderIp -and $fs['CIP']) { $senderIp = $fs['CIP'] }
+    $authAs = & $get 'X-MS-Exchange-Organization-AuthAs'; $authSrc = & $get 'X-MS-Exchange-Organization-AuthSource'
+    $dir = & $get 'X-MS-Exchange-Organization-MessageDirectionality'
+    $bcl = [regex]::Match((& $get 'X-Microsoft-Antispam'), 'BCL:(\d+)').Groups[1].Value
+    $scl = & $get 'X-MS-Exchange-Organization-SCL'; if (-not $scl) { $scl = $fs['SCL'] }
+
+    Write-H 'Message'
+    "  From:        $from", "  Reply-To:    $reply", "  Return-Path: $rp", "  To:          $to", "  Subject:     $subj", "  Date:        $date", "  Message-ID:  $msgid" | ForEach-Object { Write-Host $_ }
+    Write-H 'Delivery path (first hop at the top)'
+    $rec = & $all 'Received'; [array]::Reverse($rec)
+    $n = 0
+    foreach ($r in $rec) {
+        $n++
+        $fromHost = [regex]::Match($r, 'from\s+(\S+)').Groups[1].Value
+        $ip = [regex]::Match($r, '\[([0-9a-fA-F\.:]+)\]').Groups[1].Value
+        $by = [regex]::Match($r, 'by\s+(\S+)').Groups[1].Value
+        Write-Host ("  {0,2}. {1} [{2}] -> {3}" -f $n, $fromHost, $ip, $by)
+    }
+    Write-H 'Authentication and Microsoft verdict'
+    Write-Host ("  Sending IP: {0}   Country: {1}   PTR: {2}" -f $senderIp, $fs['CTRY'], $fs['PTR'])
+    Write-Host ("  SPF: {0} (envelope sender {1})   DKIM: {2} (d={3})   DMARC: {4} action={5}" -f $spf, $mailfrom, $dkim, $dkimD, $dmarc, $dmarcAct)
+    Write-Host ("  CompAuth: {0} reason {1}   AuthAs: {2}   AuthSource: {3}   Direction: {4}" -f $comp, $reason, $authAs, $authSrc, $dir)
+    $cat = $fs['CAT']
+    Write-Host ("  Microsoft category (CAT): {0} - {1}   SCL: {2}   BCL: {3}   SFV: {4}" -f $cat, $Script:CatMap[$cat], $scl, $bcl, $fs['SFV'])
+
+    Write-H 'Findings'
+    $own = if ($Domain) { $Domain.ToLower() } else { $toDom }
+    # Direct Send / unauthenticated internal spoof
+    if ($authAs -eq 'Anonymous' -and $fromDom -and $own -and ($fromDom -eq $own -or $fromDom.EndsWith('.' + $own))) {
+        Out-Finding 'HIGH' "Mail claims to be FROM your own domain ($fromDom) but arrived unauthenticated (AuthAs: Anonymous). This is the Direct Send / exact-domain spoof pattern."
+        Out-Finding 'INFO' 'Fix: Set-OrganizationConfig -RejectDirectSend $true (after an inbound connector covers scanners/apps), and DMARC p=reject.'
+    } elseif ($authAs -eq 'Internal') {
+        Out-Finding 'INFO' 'Message was authenticated as INTERNAL - sent from a mailbox in the tenant. If unexpected, that account may be compromised.'
+    }
+    if ($dmarc -match 'fail') { Out-Finding 'HIGH' "DMARC failed for $fromDom (action=$dmarcAct) - the From address is not authorized by its domain." }
+    elseif ($dmarc -match 'none|temperror|permerror' -or (-not $dmarc -and $fromDom)) { Out-Finding 'MED' "No usable DMARC result for $fromDom - the From domain can't be verified." }
+    elseif ($dmarc -eq 'pass') { Out-Finding 'OK' "DMARC passed - the mail really came from servers authorized by $fromDom (beware: a look-alike domain can pass its OWN DMARC)." }
+    if ($comp -and $comp -ne 'pass') {
+        $rc = "$reason"
+        $why = switch -regex ($rc) { '^0' { 'explicit/implicit authentication failure' } '^2' { 'soft pass' } '^3' { 'not checked' } '^4|^9' { 'filtering bypassed (allow list, transport rule or connector)' } '^6' { '- INTRA-ORG SPOOF: failed authentication while claiming one of your own domains' } '^1|^7' { 'passed' } default { '' } }
+        Out-Finding $(if ($comp -eq 'fail') { 'HIGH' } else { 'MED' }) "Composite authentication: $comp (reason $rc $why)."
+    }
+    if ($dmarc -match 'fail' -and $comp -eq 'pass' -and $reason -match '^7') {
+        Out-Finding 'HIGH' "Microsoft OVERRODE the DMARC failure (compauth=pass reason ${reason}: 'tenant receives legitimate mail from this infrastructure') and delivered the spoof. Check spoof intelligence / Tenant Allow/Block List for $senderIp and move DMARC to p=reject."
+    }
+    $mfrom = [regex]::Match($from, '[\w\.\-+]+@[\w\.\-]+').Value.ToLower(); $mto = [regex]::Match($to, '[\w\.\-+]+@[\w\.\-]+').Value.ToLower()
+    if ($mfrom -and $mfrom -eq $mto) { Out-Finding 'MED' "From and To are the same address ($mfrom) - typical of spoofed notification lures (voicemail, fax, shared document)." }
+    $dest = [regex]::Match((& $get 'X-Microsoft-Antispam-Mailbox-Delivery'), 'dest:(\w)').Groups[1].Value
+    if ($dest) { $where = switch ($dest) { 'I' { 'INBOX' } 'J' { 'Junk folder' } 'C' { 'a custom folder (inbox rule)' } default { "folder code $dest" } }; Out-Finding $(if ($dest -eq 'I' -and ($Script:Findings | Where-Object Level -eq 'HIGH')) { 'HIGH' } else { 'INFO' }) "Delivered to the $where." }
+    if ($reason -match '^(4|9)') { Out-Finding 'MED' 'Microsoft filtering was BYPASSED for this message - check transport rules, allow lists and connectors that let it through.' }
+    if ($rpDom -and $fromDom -and $rpDom -ne $fromDom -and -not $rpDom.EndsWith('.' + $fromDom) -and -not $fromDom.EndsWith('.' + $rpDom)) {
+        Out-Finding 'MED' "Return-Path domain ($rpDom) differs from the From domain ($fromDom). Common with bulk senders; suspicious together with other findings."
+    }
+    if ($replyDom -and $fromDom -and $replyDom -ne $fromDom) { Out-Finding 'HIGH' "Reply-To goes to a DIFFERENT domain ($replyDom) - replies would go to the attacker. Classic BEC." }
+    if ($display -match '@([A-Za-z0-9\.\-]+)' -and ($Matches[1].ToLower() -ne $fromDom)) { Out-Finding 'HIGH' "Display name contains an email address ($display) that is not the real sender." }
+    if ($Script:FreeMail -contains $fromDom) { Out-Finding 'MED' "Sent from free-mail ($fromDom) with display name '$display' - check it against the real person." }
+    if ($own -and (Test-LookAlike $fromDom $own)) { Out-Finding 'HIGH' "Sender domain $fromDom is a LOOK-ALIKE of $own. Run the Lookalikes scan and block the domain in the Tenant Allow/Block List." }
+    if ($ProtectedNames -and $display) {
+        foreach ($p in ($ProtectedNames -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            if ($display -like "*$p*" -and $fromDom -ne $own) { Out-Finding 'HIGH' "Display name impersonates '$p' but the sender domain is $fromDom." }
+        }
+    }
+    if ($cat -and $cat -ne 'NONE') { Out-Finding $(if ($cat -match 'PH|IMP|SPOOF|MALW') { 'HIGH' } else { 'MED' }) "Microsoft classified it as $cat ($($Script:CatMap[$cat]))." }
+    if (-not ($Script:Findings | Where-Object { $_.Level -in 'HIGH', 'MED' })) { Out-Finding 'OK' 'No impersonation indicators found in these headers.' }
+
+    Write-H 'Verdict'
+    $hi = @($Script:Findings | Where-Object Level -eq 'HIGH')
+    if ($hi) { Write-Host "  LIKELY IMPERSONATION / SPOOF - $($hi.Count) high-risk indicator(s) above." -ForegroundColor Red }
+    else { Write-Host '  No strong impersonation indicators.' -ForegroundColor Green }
+    $f = Join-Path $OutDir ("HeaderAnalysis_{0}.csv" -f (Get-Stamp))
+    $Script:Findings | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f
+    Write-Host "  Saved: $f" -ForegroundColor DarkGray
+}
+
+# ======================================================================== DOMAIN AUTH
+function Invoke-DomainAuth {
+    $d = $Domain; if (-not $d) { $d = Ask '  Domain to check' '' }
+    if (-not $d) { throw 'A domain is required.' }
+    $d = $d.ToLower().Trim()
+    Write-H "Email authentication for $d"
+    $mx = Get-Mx $d
+    Write-Host "  MX: $(if ($mx) { $mx -join ', ' } else { '(none)' })"
+    $gw = switch -regex ($mx -join ' ') { 'protection\.outlook\.com' { 'Microsoft 365 (direct)' } 'barracuda' { 'Barracuda' } 'mimecast' { 'Mimecast' } 'pphosted|ppe-hosted' { 'Proofpoint' } 'google|googlemail' { 'Google Workspace' } 'messagelabs|symantec' { 'Symantec/Broadcom' } 'trendmicro|tmes' { 'Trend Micro' } default { 'other / unknown' } }
+    Write-Host "  Mail gateway: $gw"
+    if ($gw -notmatch 'Microsoft 365|Google|unknown') { Out-Finding 'INFO' "Third-party gateway in front of M365 - make sure Enhanced Filtering for Connectors is on, or M365 sees the gateway's IP instead of the real sender." }
+
+    $spf = Get-Txt $d | Where-Object { $_ -match '^v=spf1' }
+    if (@($spf).Count -gt 1) { Out-Finding 'HIGH' 'More than one SPF record - SPF permerror (fails for everyone).' }
+    $spf = @($spf) | Select-Object -First 1
+    if (-not $spf) { Out-Finding 'HIGH' 'No SPF record.' }
+    else {
+        Write-Host "  SPF:   $spf"
+        $Script:SpfSeen = @{}; $lk = Get-SpfLookups $d
+        Out-Finding $(if ($lk -gt 10) { 'HIGH' } elseif ($lk -ge 8) { 'MED' } else { 'OK' }) "SPF DNS lookups: $lk of 10 allowed$(if ($lk -gt 10) { ' - PERMERROR, SPF fails' })."
+        if ($spf -match '\+all') { Out-Finding 'HIGH' 'SPF ends in +all - anyone may send as this domain.' }
+        elseif ($spf -match '\?all') { Out-Finding 'MED' 'SPF ends in ?all (neutral) - gives no protection.' }
+        elseif ($spf -match '~all') { Out-Finding 'INFO' 'SPF soft-fails (~all). Fine with DMARC p=reject; move to -all once all senders are listed.' }
+        elseif ($spf -match '-all') { Out-Finding 'OK' 'SPF hard-fails unauthorized senders (-all).' }
+    }
+
+    $dm = Get-Txt "_dmarc.$d" | Where-Object { $_ -match '^v=DMARC1' } | Select-Object -First 1
+    if (-not $dm) { Out-Finding 'HIGH' 'No DMARC record - receivers will accept spoofed mail From this domain.'; $p = '' }
+    else {
+        Write-Host "  DMARC: $dm"
+        $tag = { param($t) $m = [regex]::Match($dm, "(?:^|;)\s*$t=([^;]+)", 'IgnoreCase'); if ($m.Success) { $m.Groups[1].Value.Trim() } else { '' } }
+        $p = (& $tag 'p').ToLower(); $sp = & $tag 'sp'; $pct = & $tag 'pct'; $rua = & $tag 'rua'
+        switch ($p) {
+            'reject'     { Out-Finding 'OK'   'DMARC p=reject - spoofed mail is rejected.' }
+            'quarantine' { Out-Finding 'MED'  'DMARC p=quarantine - spoofs go to junk; move to reject when reports are clean.' }
+            default      { Out-Finding 'HIGH' "DMARC p=$p - monitoring only, spoofed mail is still delivered." }
+        }
+        if ($pct -and $pct -ne '100') { Out-Finding 'MED' "DMARC pct=$pct - policy applies to only $pct% of failing mail." }
+        if ($sp -and $sp -eq 'none') { Out-Finding 'MED' 'DMARC sp=none - subdomains can be spoofed.' }
+        if (-not $rua) { Out-Finding 'MED' 'No rua= reporting address - you cannot see who sends as this domain. Add one (parsedmarc or a DMARC service can read the reports).' }
+    }
+
+    $found = @()
+    foreach ($s in 'selector1','selector2','google','k1','k2','k3','s1','s2','default','dkim','mail','smtp','sig1','mxvault','everlytickey1','zmail','mandrill','pm','sendgrid','em','m1','mte1') {
+        $t = Get-Txt "$s._domainkey.$d" | Where-Object { $_ -match 'p=' }
+        if ($t) { $found += $s }
+    }
+    if ($found) { Out-Finding 'OK' "DKIM selectors found: $($found -join ', ')" }
+    else { Out-Finding 'MED' 'No DKIM key found on common selectors (M365 uses selector1/selector2 - enable DKIM in Defender).' }
+    if (-not ($found -contains 'selector1' -or $found -contains 'selector2') -and $gw -match 'Microsoft') { Out-Finding 'MED' 'Microsoft 365 DKIM (selector1/selector2) not published.' }
+
+    if (Get-Txt "_mta-sts.$d") { Out-Finding 'OK' 'MTA-STS published.' } else { Out-Finding 'INFO' 'No MTA-STS (optional - enforces TLS for inbound mail).' }
+    if (Get-Txt "_smtp._tls.$d") { Out-Finding 'OK' 'TLS-RPT published.' }
+
+    Write-H 'Verdict'
+    if ($p -eq 'reject') { Write-Host "  $d is well protected against exact-domain spoofing on the internet." -ForegroundColor Green }
+    elseif ($p -eq 'quarantine') { Write-Host "  $d is partly protected - spoofs land in junk." -ForegroundColor Yellow }
+    else { Write-Host "  $d CAN BE SPOOFED - receivers have no instruction to reject fake mail from it." -ForegroundColor Red }
+    Write-Host '  Note: even with p=reject, mail INTO your own Microsoft 365 tenant can still be spoofed through Direct Send unless RejectDirectSend is on (use -Action Tenant).' -ForegroundColor DarkGray
+    $f = Join-Path $OutDir ("DomainAuth_{0}.csv" -f (Get-Stamp))
+    $Script:Findings | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f
+    Write-Host "  Saved: $f" -ForegroundColor DarkGray
+}
+
+# ======================================================================== LOOKALIKES
+function New-Permutations([string]$domain) {
+    $sd = Split-Domain $domain; $label = $sd.Label; $tld = $sd.Tld
+    $set = New-Object 'System.Collections.Generic.HashSet[string]'
+    $add = { param($l, $t, $kind) if ($l -match '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$' -and "$l.$t" -ne $domain) { if ($set.Add("$l.$t")) { $Script:Kinds["$l.$t"] = $kind } } }
+    $kb = @{ q='wa'; w='qeas'; e='wrsd'; r='etdf'; t='ryfg'; y='tugh'; u='yihj'; i='uojk'; o='ipkl'; p='ol'; a='qwsz'; s='awedxz'; d='serfcx'; f='drtgvc'; g='ftyhbv'; h='gyujnb'; j='huikmn'; k='jiolm'; l='kop'; z='asx'; x='zsdc'; c='xdfv'; v='cfgb'; b='vghn'; n='bhjm'; m='njk'; '1'='2q'; '2'='13w'; '3'='24e'; '4'='35r'; '5'='46t'; '6'='57y'; '7'='68u'; '8'='79i'; '9'='80o'; '0'='9p' }
+    $glyph = @{ a='4'; b='8d'; c='e'; d='b'; e='3c'; g='9q'; i='1l'; l='1i'; m='n'; n='m'; o='0'; q='g'; s='5z'; t='7'; u='v'; v='u'; w='v'; z='s2'; '0'='o'; '1'='li' }
+    for ($i = 0; $i -lt $label.Length; $i++) {
+        $c = [string]$label[$i]
+        & $add ($label.Remove($i, 1)) $tld 'omission'
+        & $add ($label.Insert($i, $c)) $tld 'repetition'
+        if ($i -lt $label.Length - 1) { $a = $label.ToCharArray(); $tmp = $a[$i]; $a[$i] = $a[$i + 1]; $a[$i + 1] = $tmp; & $add (-join $a) $tld 'transposition' }
+        if ($kb.ContainsKey($c)) { foreach ($k in $kb[$c].ToCharArray()) { & $add ($label.Remove($i, 1).Insert($i, [string]$k)) $tld 'replacement'; & $add ($label.Insert($i + 1, [string]$k)) $tld 'insertion' } }
+        if ($glyph.ContainsKey($c)) { foreach ($g in $glyph[$c].ToCharArray()) { if ([int][char]$g -lt 128) { & $add ($label.Remove($i, 1).Insert($i, [string]$g)) $tld 'homoglyph' } } }
+        if ($i -gt 0 -and $c -ne '-' -and $label[$i - 1] -ne '-') { & $add ($label.Insert($i, '-')) $tld 'hyphenation' }
+        if ('aeiou'.Contains($c)) { foreach ($v in 'aeiou'.ToCharArray()) { if ([string]$v -ne $c) { & $add ($label.Remove($i, 1).Insert($i, [string]$v)) $tld 'vowel-swap' } } }
+    }
+    & $add ($label -replace '-', '') $tld 'hyphen-removed'
+    & $add ($label -replace 'm', 'rn') $tld 'homoglyph'
+    & $add ($label -replace 'rn', 'm') $tld 'homoglyph'
+    & $add ($label -replace 'w', 'vv') $tld 'homoglyph'
+    & $add ($label -replace 'd', 'cl') $tld 'homoglyph'
+    foreach ($ch in 'abcdefghijklmnopqrstuvwxyz0123456789'.ToCharArray()) { & $add ($label + $ch) $tld 'addition' }
+    foreach ($w in 'mail','email','secure','login','portal','support','invoice','invoices','billing','payment','payments','pay','hr','office','office365','inc','llc','corp','co','group','online','us','usa','team','it','admin','docs','sharepoint','onedrive','helpdesk','account','accounts','verify') {
+        & $add "$label-$w" $tld 'keyword'; & $add "$w-$label" $tld 'keyword'; & $add "$label$w" $tld 'keyword'
+    }
+    foreach ($t in 'com','net','org','co','us','info','biz','io','cc','xyz','online','site','email','app','dev','top','live','pro','store','company','services','solutions','group','llc','inc','mobi','me','ca','uk','co.uk','tech','shop','cloud','work','support') {
+        if ($t -ne $tld) { & $add $label $t 'tld-swap' }
+    }
+    return @($set)
+}
+
+function Invoke-Lookalikes {
+    $d = $Domain; if (-not $d) { $d = Ask '  Your real domain to protect' '' }
+    if (-not $d) { throw 'A domain is required.' }
+    $d = $d.ToLower().Trim()
+    $Script:Kinds = @{}
+    $cands = New-Permutations $d
+    # Some TLDs answer for every name (wildcard DNS) - test each TLD with a random name and drop those
+    $wild = @()
+    foreach ($t in @($cands | ForEach-Object { (Split-Domain $_).Tld } | Select-Object -Unique)) {
+        $probe = 'sdsi' + ([guid]::NewGuid().ToString('N').Substring(0, 12)) + '.' + $t
+        try { if (Resolve-DnsName -Name $probe -Type NS -DnsOnly -QuickTimeout -ErrorAction Stop) { $wild += $t } } catch { }
+    }
+    if ($wild) { Write-Host "  Skipping wildcard TLD(s) that resolve every name: $($wild -join ', ')" -ForegroundColor DarkGray; $cands = @($cands | Where-Object { $wild -notcontains (Split-Domain $_).Tld }) }
+    Write-H "Look-alike scan for $d - $($cands.Count) variants, $Threads parallel DNS lookups"
+
+    $sb = {
+        param($name)
+        $o = [ordered]@{ Domain = $name; Registered = $false; NS = ''; A = ''; MX = ''; Parked = $false }
+        try {
+            $ns = @(Resolve-DnsName -Name $name -Type NS -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'NS' } | ForEach-Object { $_.NameHost })
+            if ($ns) { $o.Registered = $true; $o.NS = ($ns -join ' ') }
+        } catch {
+            if ($_.Exception.Message -notmatch 'does not exist|DNS name does not exist|9003') { try { $soa = Resolve-DnsName -Name $name -Type SOA -DnsOnly -QuickTimeout -ErrorAction Stop; if ($soa) { $o.Registered = $true } } catch { } }
+        }
+        if ($o.Registered) {
+            try { $o.A = (@(Resolve-DnsName -Name $name -Type A -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'A' } | ForEach-Object { $_.IPAddress }) -join ' ') } catch { }
+            try { $o.MX = (@(Resolve-DnsName -Name $name -Type MX -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.Type -eq 'MX' } | ForEach-Object { $_.NameExchange }) -join ' ') } catch { }
+            if ($o.NS -match 'parking|sedoparking|bodis|parkingcrew|afternic|dan\.com|above\.com|namebrightdns|uniregistrymarket|hugedomains|undeveloped') { $o.Parked = $true }
+        }
+        [pscustomobject]$o
+    }
+    $pool = [runspacefactory]::CreateRunspacePool(1, [math]::Max(4, $Threads)); $pool.Open()
+    $jobs = foreach ($c in $cands) { $ps = [powershell]::Create().AddScript($sb).AddArgument($c); $ps.RunspacePool = $pool; [pscustomobject]@{ PS = $ps; H = $ps.BeginInvoke() } }
+    $res = New-Object System.Collections.Generic.List[object]; $done = 0
+    foreach ($j in $jobs) {
+        try { foreach ($r in $j.PS.EndInvoke($j.H)) { $res.Add($r) } } catch { }
+        $j.PS.Dispose(); $done++
+        if ($done % 50 -eq 0) { Write-Progress -Activity 'Resolving look-alike domains' -Status "$done of $($cands.Count)" -PercentComplete ($done * 100 / $cands.Count) }
+    }
+    Write-Progress -Activity 'Resolving look-alike domains' -Completed
+    $pool.Close(); $pool.Dispose()
+
+    $reg = @($res | Where-Object Registered)
+    foreach ($r in $reg) { $r | Add-Member NoteProperty Kind $Script:Kinds[$r.Domain]; $r | Add-Member NoteProperty Created ''; $r | Add-Member NoteProperty Risk '' }
+    if ($CheckRegistration -and $reg) {
+        Write-Host "  Looking up registration dates (RDAP) for $($reg.Count) registered domains..." -ForegroundColor DarkGray
+        foreach ($r in ($reg | Select-Object -First 80)) {
+            try {
+                $rd = Invoke-RestMethod -Uri "https://rdap.org/domain/$($r.Domain)" -TimeoutSec 8 -UseBasicParsing -ErrorAction Stop
+                $ev = $rd.events | Where-Object { $_.eventAction -eq 'registration' } | Select-Object -First 1
+                if ($ev) { $r.Created = ([datetime]$ev.eventDate).ToString('yyyy-MM-dd') }
+            } catch { }
+        }
+    }
+    foreach ($r in $reg) {
+        $new = $false; if ($r.Created) { $new = ((Get-Date) - [datetime]$r.Created).TotalDays -le 180 }
+        $r.Risk = if ($r.MX -and $new) { 'HIGH - new + mail' } elseif ($r.MX -and -not $r.Parked) { 'HIGH - has mail (MX)' } elseif ($new) { 'MED - registered < 6 months' } elseif ($r.Parked) { 'LOW - parked' } else { 'LOW' }
+    }
+    $sorted = $reg | Sort-Object @{ e = { if ($_.Risk -like 'HIGH*') { 0 } elseif ($_.Risk -like 'MED*') { 1 } else { 2 } } }, Created -Descending
+    Write-H "$($reg.Count) of $($cands.Count) variants are registered"
+    $sorted | Select-Object Domain, Kind, Risk, Created, MX, A | Format-Table -AutoSize -Wrap
+    $hi = @($reg | Where-Object { $_.Risk -like 'HIGH*' })
+    if ($hi) {
+        Write-Host "  $($hi.Count) look-alike(s) can send/receive email. Next steps:" -ForegroundColor Red
+        Write-Host '   1. Block them: New-TenantAllowBlockListItems -ListType Sender -Block -Entries <domain> -NoExpiration' -ForegroundColor Yellow
+        Write-Host '   2. Run -Action Tenant to see whether any of them already emailed your users (message trace).' -ForegroundColor Yellow
+        Write-Host '   3. Add your domain to Defender anti-phishing domain impersonation protection.' -ForegroundColor Yellow
+        Write-Host '   4. Report abuse to the registrar shown in the RDAP record (rdap.org/domain/<name>).' -ForegroundColor Yellow
+    } else { Write-Host '  No registered look-alikes with mail servers.' -ForegroundColor Green }
+    Write-Host '  Covers common typo/homoglyph/keyword patterns, not every possible variant. For ongoing monitoring see openSquat or dnstwist.' -ForegroundColor DarkGray
+    $f = Join-Path $OutDir ("Lookalikes_{0}.csv" -f (Get-Stamp))
+    $sorted | Select-Object Domain, Kind, Risk, Created, MX, A, NS, Parked | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f
+    Write-Host "  Saved: $f" -ForegroundColor DarkGray
+}
+
+# ======================================================================== TENANT
+function Invoke-Tenant {
+    if (-not (Get-Module -ListAvailable ExchangeOnlineManagement)) {
+        if ((Ask '  ExchangeOnlineManagement is not installed. Install it now (current user)? Y/N' 'Y') -notmatch '^[Yy]') { throw 'ExchangeOnlineManagement is required.' }
+        Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
+    }
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop -WarningAction SilentlyContinue
+    $c = @{ ShowBanner = $false; ErrorAction = 'Stop' }
+    if ($AdminUPN) { $c.UserPrincipalName = $AdminUPN }
+    if ($DelegatedOrganization) { $c.DelegatedOrganization = $DelegatedOrganization }
+    Write-Host '  Connecting to Exchange Online...' -ForegroundColor DarkGray
+    Connect-ExchangeOnline @c
+    $org = Get-OrganizationConfig
+    Write-Host "  Connected: $($org.DisplayName)" -ForegroundColor Green
+    $accepted = @(Get-AcceptedDomain | ForEach-Object { $_.DomainName.ToString().ToLower() })
+
+    Write-H 'Direct Send'
+    if ($org.RejectDirectSend) { Out-Finding 'OK' 'RejectDirectSend is ON - unauthenticated mail "from" your domains is rejected.' }
+    else { Out-Finding 'HIGH' 'RejectDirectSend is OFF - anyone on the internet can send mail into this tenant that appears to come from your own domains. Create an inbound connector for scanners/apps, then: Set-OrganizationConfig -RejectDirectSend $true' }
+    $conn = @(Get-InboundConnector -ErrorAction SilentlyContinue)
+    if ($conn) { $conn | Select-Object Name, Enabled, ConnectorType, SenderDomains, @{n='SenderIPs';e={$_.SenderIPAddresses -join ', '}}, RequireTls, RestrictDomainsToIPAddresses | Format-Table -AutoSize -Wrap }
+    else { Write-Host '  No inbound connectors.' }
+
+    Write-H 'Anti-phishing / impersonation protection'
+    foreach ($p in @(Get-AntiPhishPolicy)) {
+        Write-Host "  Policy: $($p.Name) $(if ($p.IsDefault) { '(default)' })" -ForegroundColor Cyan
+        $props = 'EnableSpoofIntelligence','HonorDmarcPolicy','EnableUnauthenticatedSender','EnableViaTag','EnableFirstContactSafetyTips','EnableOrganizationDomainsProtection','EnableTargetedDomainsProtection','EnableTargetedUserProtection','EnableMailboxIntelligenceProtection'
+        foreach ($pr in $props) { if ($p.PSObject.Properties[$pr]) { Write-Host ("    {0,-38} {1}" -f $pr, $p.$pr) } }
+        if ($p.PSObject.Properties['TargetedUsersToProtect']) { Write-Host ("    {0,-38} {1}" -f 'TargetedUsersToProtect', (@($p.TargetedUsersToProtect).Count)) }
+        if ($p.PSObject.Properties['TargetedDomainsToProtect']) { Write-Host ("    {0,-38} {1}" -f 'TargetedDomainsToProtect', ($p.TargetedDomainsToProtect -join ', ')) }
+        if ($p.PSObject.Properties['EnableOrganizationDomainsProtection'] -and -not $p.EnableOrganizationDomainsProtection -and -not $p.EnableTargetedDomainsProtection) { Out-Finding 'MED' "Policy '$($p.Name)': domain impersonation protection is off (needs Defender for Office 365)." }
+        if ($p.PSObject.Properties['EnableTargetedUserProtection'] -and -not $p.EnableTargetedUserProtection) { Out-Finding 'MED' "Policy '$($p.Name)': user impersonation protection is off - add executives and finance staff." }
+        if ($p.PSObject.Properties['HonorDmarcPolicy'] -and -not $p.HonorDmarcPolicy) { Out-Finding 'MED' "Policy '$($p.Name)': HonorDmarcPolicy is off - senders' DMARC reject/quarantine is ignored." }
+    }
+
+    Write-H 'Spoof intelligence - who is sending as your domains (last 7 days)'
+    try {
+        $si = @(Get-SpoofIntelligenceInsight -ErrorAction Stop)
+        $own = @($si | Where-Object { $sd = (Get-DomainOf $_.SpoofedUser); $accepted -contains $sd -or ($accepted | Where-Object { $sd.EndsWith('.' + $_) }) })
+        if ($own) {
+            $own | Sort-Object MessageCount -Descending | Select-Object SpoofedUser, SendingInfrastructure, SpoofType, Action, MessageCount, LastSeen | Format-Table -AutoSize -Wrap
+            $allowed = @($own | Where-Object { $_.Action -eq 'Allow' })
+            if ($allowed) { Out-Finding 'MED' "$($allowed.Count) spoofing source(s) are ALLOWED to send as your domains - confirm each is a real service (scanner, app, vendor)." }
+        } else { Write-Host '  No one was detected spoofing your own domains in the last 7 days.' -ForegroundColor Green }
+        $f = Join-Path $OutDir ("SpoofIntelligence_{0}.csv" -f (Get-Stamp)); $si | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f
+        Write-Host "  All spoof-intelligence entries saved: $f" -ForegroundColor DarkGray
+    } catch { Write-Host "  Spoof intelligence not available: $($_.Exception.Message)" -ForegroundColor DarkGray }
+    try {
+        $tabl = @(Get-TenantAllowBlockListSpoofItems -ErrorAction Stop)
+        if ($tabl) { Write-Host '  Tenant Allow/Block List spoof entries:'; $tabl | Select-Object Action, SpoofedUser, SendingInfrastructure, SpoofType | Format-Table -AutoSize }
+    } catch { }
+
+    Write-H "Mail from registered look-alike domains (message trace, last $([math]::Min($Days, 90)) days)"
+    $last = Get-ChildItem $OutDir -Filter 'Lookalikes_*.csv' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $look = @()
+    if ($last) { $look = @(Import-Csv $last.FullName | Where-Object { $_.MX } | ForEach-Object { $_.Domain }) }
+    $extra = Ask '  Extra sender domains to trace (comma-separated, blank = none)' ''
+    if ($extra) { $look += @($extra -split '[,;]' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ }) }
+    $look = @($look | Select-Object -Unique)
+    if (-not $look) { Write-Host '  No look-alike domains to trace - run the Lookalikes scan first (it saves a list this step reuses).' -ForegroundColor DarkGray }
+    else {
+        Write-Host "  Tracing $($look.Count) domain(s)$(if ($last) { " from $($last.Name)" })..."
+        $useV2 = [bool](Get-Command Get-MessageTraceV2 -ErrorAction SilentlyContinue)
+        $hits = New-Object System.Collections.Generic.List[object]
+        $end = Get-Date; $start = $end.AddDays(-[math]::Min([math]::Max($Days, 1), 90))
+        foreach ($dom in $look) {
+            $s = $start
+            while ($s -lt $end) {
+                $e = $s.AddDays(10); if ($e -gt $end) { $e = $end }
+                try {
+                    $r = if ($useV2) { Get-MessageTraceV2 -SenderAddress "*@$dom" -StartDate $s -EndDate $e -ResultSize 5000 -ErrorAction Stop } else { Get-MessageTrace -SenderAddress "*@$dom" -StartDate $s -EndDate $e -PageSize 5000 -ErrorAction Stop }
+                    foreach ($x in @($r)) { $hits.Add([pscustomobject]@{ Received = $x.Received; Sender = $x.SenderAddress; Recipient = $x.RecipientAddress; Subject = $x.Subject; Status = $x.Status; FromIP = $x.FromIP }) }
+                } catch { Write-Host "  Trace for $dom ($($s.ToShortDateString())): $($_.Exception.Message)" -ForegroundColor DarkGray; break }
+                $s = $e
+            }
+        }
+        if ($hits.Count) {
+            Out-Finding 'HIGH' "$($hits.Count) message(s) from look-alike domains reached this tenant."
+            $hits | Sort-Object Received -Descending | Select-Object -First 50 | Format-Table -AutoSize -Wrap
+            $f = Join-Path $OutDir ("LookalikeTrace_{0}.csv" -f (Get-Stamp)); $hits | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f
+            Write-Host "  Saved: $f" -ForegroundColor DarkGray
+        } else { Out-Finding 'OK' 'No mail from the traced look-alike domains in this period.' }
+    }
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    $f = Join-Path $OutDir ("TenantImpersonation_{0}.csv" -f (Get-Stamp)); $Script:Findings | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f
+    Write-Host "  Findings saved: $f" -ForegroundColor DarkGray
+}
+
+# ======================================================================== SPOOF HUNT
+function Test-InCidr([string]$ip, [string]$cidr) {
+    try {
+        $parts = $cidr.Split('/'); $net = [Net.IPAddress]::Parse($parts[0]); $a = [Net.IPAddress]::Parse($ip)
+        if ($net.AddressFamily -ne $a.AddressFamily) { return $false }
+        $bits = if ($parts.Count -gt 1) { [int]$parts[1] } else { $net.GetAddressBytes().Count * 8 }
+        $nb = $net.GetAddressBytes(); $ab = $a.GetAddressBytes()
+        for ($i = 0; $i -lt $nb.Count -and $bits -gt 0; $i++) {
+            $m = if ($bits -ge 8) { 255 } else { (0xFF -shl (8 - $bits)) -band 0xFF }
+            if (($nb[$i] -band $m) -ne ($ab[$i] -band $m)) { return $false }
+            $bits -= 8
+        }
+        return $true
+    } catch { return $false }
+}
+
+function Get-TraceAll([datetime]$Start, [datetime]$End) {
+    $out = New-Object System.Collections.Generic.List[object]
+    $useV2 = [bool](Get-Command Get-MessageTraceV2 -ErrorAction SilentlyContinue)
+    $s = $Start
+    while ($s -lt $End) {
+        $e = $s.AddDays(10); if ($e -gt $End) { $e = $End }
+        if ($useV2) {
+            $pageEnd = $e; $startRcpt = $null; $guard = 0
+            do {
+                $p = @{ StartDate = $s; EndDate = $pageEnd; ResultSize = 5000; ErrorAction = 'Stop' }
+                if ($startRcpt) { $p.StartingRecipientAddress = $startRcpt }
+                $r = @(Get-MessageTraceV2 @p)
+                foreach ($x in $r) { $out.Add($x) }
+                Write-Host ("  {0:MM/dd} - {1:MM/dd}: {2} messages so far" -f $s, $e, $out.Count) -ForegroundColor DarkGray
+                if ($r.Count -lt 5000) { break }
+                $last = $r[-1]; $pageEnd = $last.Received; $startRcpt = $last.RecipientAddress; $guard++
+            } while ($guard -lt 40)
+        } else {
+            $page = 1
+            do {
+                $r = @(Get-MessageTrace -StartDate $s -EndDate $e -PageSize 5000 -Page $page -ErrorAction Stop)
+                foreach ($x in $r) { $out.Add($x) }; $page++
+            } while ($r.Count -eq 5000 -and $page -le 1000)
+        }
+        $s = $e
+    }
+    return $out
+}
+
+function Invoke-SpoofHunt {
+    if (-not (Get-Module -ListAvailable ExchangeOnlineManagement)) {
+        if ((Ask '  ExchangeOnlineManagement is not installed. Install it now (current user)? Y/N' 'Y') -notmatch '^[Yy]') { throw 'ExchangeOnlineManagement is required.' }
+        Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
+    }
+    Import-Module ExchangeOnlineManagement -ErrorAction Stop -WarningAction SilentlyContinue
+    $c = @{ ShowBanner = $false; ErrorAction = 'Stop' }
+    if ($AdminUPN) { $c.UserPrincipalName = $AdminUPN }
+    if ($DelegatedOrganization) { $c.DelegatedOrganization = $DelegatedOrganization }
+    Write-Host '  Connecting to Exchange Online...' -ForegroundColor DarkGray
+    Connect-ExchangeOnline @c
+    $org = Get-OrganizationConfig
+    Write-Host "  Connected: $($org.DisplayName)   RejectDirectSend: $($org.RejectDirectSend)" -ForegroundColor Green
+
+    $doms = if ($Domain) { @($Domain -split '[,;]' | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ }) } else { @(Get-AcceptedDomain | ForEach-Object { $_.DomainName.ToString().ToLower() }) }
+    Write-Host "  Domains: $($doms -join ', ')"
+    # Trusted sources: inbound-connector IPs + IPs you list + Microsoft 365 / EOP ranges
+    $trusted = @()
+    foreach ($ic in @(Get-InboundConnector -ErrorAction SilentlyContinue | Where-Object Enabled)) { $trusted += @($ic.SenderIPAddresses | ForEach-Object { "$_" }) }
+    if ($TrustedIPs) { $trusted += @($TrustedIPs -split '[,; ]' | Where-Object { $_ }) }
+    $ms = '40.92.0.0/15','40.107.0.0/16','52.100.0.0/14','52.238.78.88/32','104.47.0.0/17','2a01:111:f400::/48','2a01:111:f403::/48','2603:10b6::/32','2603:1036::/32','2603:1046::/32','2603:1056::/32','2603:1096::/32'
+    Write-Host "  Trusted connector / listed IPs: $(if ($trusted) { $trusted -join ', ' } else { '(none)' })"
+
+    $d = [math]::Min([math]::Max($Days, 1), 90)
+    $end = Get-Date; $start = $end.AddDays(-$d)
+    Write-H "Message trace, last $d days (all messages - may take a few minutes)"
+    $all = Get-TraceAll $start $end
+    $own = @($all | Where-Object { $sd = Get-DomainOf $_.SenderAddress; $doms -contains $sd -or @($doms | Where-Object { $sd.EndsWith('.' + $_) }).Count })
+    $rows = foreach ($m in $own) {
+        $ip = "$($m.FromIP)"
+        if (-not $ip) { continue }
+        if (@($trusted | Where-Object { Test-InCidr $ip $_ }).Count) { continue }
+        if (@($ms | Where-Object { Test-InCidr $ip $_ }).Count) { continue }
+        $rd = Get-DomainOf $m.RecipientAddress
+        [pscustomobject]@{ Received = ([datetime]$m.Received).ToLocalTime(); Sender = $m.SenderAddress; Recipient = $m.RecipientAddress
+                           ToOwnDomain = [bool]($doms -contains $rd); FromIP = $ip; Subject = $m.Subject; Status = $m.Status; MessageTraceId = $m.MessageTraceId }
+    }
+    $rows = @($rows)
+    Write-Host "  $($all.Count) messages traced; $($own.Count) claim to be from your domains; $($rows.Count) of those came from an OUTSIDE IP." -ForegroundColor Cyan
+
+    if ($rows.Count) {
+        Write-H 'Outside IPs sending as your domains'
+        $ptr = @{}
+        $byIp = foreach ($g in ($rows | Group-Object FromIP | Sort-Object Count -Descending)) {
+            if (-not $ptr.ContainsKey($g.Name)) { try { $ptr[$g.Name] = (Resolve-DnsName -Name $g.Name -Type PTR -DnsOnly -QuickTimeout -ErrorAction Stop | Select-Object -First 1).NameHost } catch { $ptr[$g.Name] = '' } }
+            $h = $ptr[$g.Name]
+            $kind = if ($h -match 'colocrossing|vps|vultr|digitalocean|linode|ovh|hetzner|contabo|amazonaws|googleusercontent|azure|hostwinds|m247|datacamp|choopa|leaseweb|server|host') { 'HOSTING / VPS - likely spoof' } elseif ($h -match 'comcast|verizon|fios|spectrum|charter|cox|att|xfinity|optonline|rr\.com|frontier|windstream|myvzw|tmobile') { 'ISP / home or office - check if a user, scanner or app' } else { 'unknown - review' }
+            [pscustomobject]@{ FromIP = $g.Name; PTR = $h; Type = $kind; Messages = $g.Count; ToInternal = @($g.Group | Where-Object ToOwnDomain).Count
+                               First = ($g.Group | Sort-Object Received | Select-Object -First 1).Received; Last = ($g.Group | Sort-Object Received | Select-Object -Last 1).Received
+                               Statuses = (($g.Group | Group-Object Status | ForEach-Object { "$($_.Name):$($_.Count)" }) -join ' ')
+                               SampleSubject = ($g.Group | Select-Object -First 1).Subject }
+        }
+        $byIp | Format-Table FromIP, Type, Messages, ToInternal, Last, Statuses, SampleSubject -AutoSize -Wrap
+
+        if ($FixDate) {
+            $fd = [datetime]$FixDate
+            $before = @($rows | Where-Object { $_.Received -lt $fd }); $after = @($rows | Where-Object { $_.Received -ge $fd })
+            $afterDelivered = @($after | Where-Object { $_.Status -match 'Delivered' })
+            Write-H "Before vs after the fix ($($fd.ToString('yyyy-MM-dd HH:mm')))"
+            Write-Host ("  Before: {0} message(s) from outside IPs ({1} delivered)" -f $before.Count, @($before | Where-Object { $_.Status -match 'Delivered' }).Count)
+            Write-Host ("  After:  {0} message(s) from outside IPs ({1} delivered)" -f $after.Count, $afterDelivered.Count) -ForegroundColor $(if ($afterDelivered) { 'Red' } else { 'Green' })
+            if ($afterDelivered) {
+                Out-Finding 'HIGH' "$($afterDelivered.Count) message(s) claiming your domain from outside IPs were still DELIVERED after the fix. Review the IPs below - a real scanner/app needs a connector; anything else is still getting through."
+                $afterDelivered | Sort-Object Received -Descending | Select-Object -First 30 Received, FromIP, Sender, Recipient, Subject, Status | Format-Table -AutoSize -Wrap
+            } else { Out-Finding 'OK' 'No spoofed own-domain mail from outside IPs has been delivered since the fix.' }
+        }
+        Write-H 'Per day'
+        $rows | Group-Object { $_.Received.ToString('yyyy-MM-dd') } | Sort-Object Name | ForEach-Object {
+            $dl = @($_.Group | Where-Object { $_.Status -match 'Delivered' }).Count
+            Write-Host ("  {0}  {1,4} total  {2,4} delivered  {3}" -f $_.Name, $_.Count, $dl, ('#' * [math]::Min($_.Count, 60)))
+        }
+        $f = Join-Path $OutDir ("SpoofHunt_Messages_{0}.csv" -f (Get-Stamp)); $rows | Sort-Object Received | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f
+        $f2 = Join-Path $OutDir ("SpoofHunt_IPs_{0}.csv" -f (Get-Stamp)); $byIp | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f2
+        Write-Host "  Saved: $f" -ForegroundColor DarkGray; Write-Host "  Saved: $f2" -ForegroundColor DarkGray
+    } else { Out-Finding 'OK' "No mail claiming your domains arrived from an outside IP in the last $d days." }
+
+    Write-H 'Look-alike sweep: every outside sender domain vs your domains'
+    $extCount = @{}
+    foreach ($m in $all) {
+        $sd = Get-DomainOf $m.SenderAddress
+        if (-not $sd -or $doms -contains $sd) { continue }
+        $sub = $false; foreach ($dm in $doms) { if ($sd.EndsWith('.' + $dm)) { $sub = $true; break } }
+        if ($sub) { continue }
+        if ($extCount.ContainsKey($sd)) { $extCount[$sd]++ } else { $extCount[$sd] = 1 }
+    }
+    $ext = @($extCount.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Domain = $_.Key; Count = $_.Value } })
+    $look = @(foreach ($x in $ext) { foreach ($dm in $doms) { if ($dm -notmatch 'onmicrosoft\.com$' -and (Test-LookAlike $x.Domain $dm)) { [pscustomobject]@{ SenderDomain = $x.Domain; LooksLike = $dm; Messages = $x.Count }; break } } })
+    Write-Host "  $($ext.Count) outside sender domains checked."
+    if ($look) {
+        Out-Finding 'HIGH' "$($look.Count) sender domain(s) look like your own domains - review and block: New-TenantAllowBlockListItems -ListType Sender -Block -Entries <domain> -NoExpiration"
+        $look | Sort-Object Messages -Descending | Format-Table -AutoSize
+        $lm = @($all | Where-Object { $look.SenderDomain -contains (Get-DomainOf $_.SenderAddress) } | Select-Object Received, SenderAddress, RecipientAddress, Subject, Status, FromIP)
+        $f3 = Join-Path $OutDir ("SpoofHunt_Lookalikes_{0}.csv" -f (Get-Stamp)); $lm | Export-Csv -NoTypeInformation -Encoding UTF8 -Path $f3
+        Write-Host "  Saved: $f3" -ForegroundColor DarkGray
+    } else { Out-Finding 'OK' 'No look-alike sender domains found in the traced mail.' }
+
+    Write-H 'Spoof intelligence for your domains (last 7 days)'
+    try {
+        $si = @(Get-SpoofIntelligenceInsight -ErrorAction Stop | Where-Object { $sd = Get-DomainOf $_.SpoofedUser; $doms -contains $sd -or @($doms | Where-Object { $sd.EndsWith('.' + $_) }).Count })
+        if ($si) { $si | Sort-Object MessageCount -Descending | Select-Object SpoofedUser, SendingInfrastructure, SpoofType, Action, MessageCount, LastSeen | Format-Table -AutoSize -Wrap }
+        else { Write-Host '  None.' -ForegroundColor Green }
+    } catch { Write-Host "  Not available: $($_.Exception.Message)" -ForegroundColor DarkGray }
+    Write-H 'Defender advanced hunting (needs Defender for Office 365 Plan 2 / E5) - paste into security.microsoft.com > Hunting'
+    $dl = ($doms | Where-Object { $_ -notmatch 'onmicrosoft\.com$' } | ForEach-Object { '"' + $_ + '"' }) -join ', '
+    $kql = @(
+        "let own = dynamic([$dl]);",
+        "EmailEvents",
+        "| where Timestamp > ago(${d}d) and EmailDirection == ""Inbound""",
+        "| extend dmarc = tostring(parse_json(AuthenticationDetails).DMARC), spf = tostring(parse_json(AuthenticationDetails).SPF)",
+        "| where (SenderFromDomain in~ (own) and (dmarc != ""pass"" or spf != ""pass""))   // own-domain spoof / Direct Send",
+        "    or DetectionMethods has_any (""Spoof intra-org"", ""Spoof DMARC"", ""Spoof external domain"", ""Impersonation domain"", ""Impersonation user"", ""Mailbox intelligence impersonation"")",
+        "| project Timestamp, SenderFromAddress, SenderDisplayName, SenderIPv4, RecipientEmailAddress, Subject, dmarc, spf, DetectionMethods, DeliveryAction, DeliveryLocation",
+        "| order by Timestamp desc")
+    $kql | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+    $fk = Join-Path $OutDir ("SpoofHunt_DefenderQuery_{0}.kql" -f (Get-Stamp)); $kql | Set-Content -Path $fk -Encoding UTF8
+    Write-Host "  Saved: $fk  (this query also catches display-name impersonation, which message trace cannot see)" -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '  Notes: messages rejected at the door by RejectDirectSend (550 5.7.68) usually never appear in message trace -' -ForegroundColor DarkGray
+    Write-Host '  "nothing delivered after the fix" is the success signal. Your DMARC aggregate reports still show the attempts.' -ForegroundColor DarkGray
+    Write-Host '  An outside IP marked ISP may be a user sending from home through a client that relays; check before blocking.' -ForegroundColor DarkGray
+    Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+}
+
+switch ($Action) {
+    'Headers'    { Invoke-Headers }
+    'DomainAuth' { Invoke-DomainAuth }
+    'Lookalikes' { Invoke-Lookalikes }
+    'Tenant'     { Invoke-Tenant }
+    'SpoofHunt'  { Invoke-SpoofHunt }
+}
 '@
 
 # ======================= New-RemediationPlan.ps1 =======================

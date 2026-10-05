@@ -2,7 +2,7 @@
 
 *Prepared by [Sigma Data Systems Inc.](https://sigmadatainc.com/)*
 
-<!-- AUTO-VERSION -->**Current version: v2.0** | 129 options | updated 2026-10-05<!-- /AUTO-VERSION -->
+<!-- AUTO-VERSION -->**Current version: v2.0** | 130 options | updated 2026-10-05<!-- /AUTO-VERSION -->
 
 ```
   _____ _____ _____ __  __            _____       _______
@@ -14,10 +14,10 @@
 ```
 
 One PowerShell file you can copy to any Windows workstation or server and run.
-It opens a numbered menu of **129 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
+It opens a numbered menu of **130 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
 Each option either checks something and writes a report, or makes a fix after asking you to confirm.
 
-- **One file, nothing to install.** 35 longer scripts (plus 2 data files) are built into the file as plain, readable text.
+- **One file, nothing to install.** 36 longer scripts (plus 2 data files) are built into the file as plain, readable text.
 - **Nothing is tied to one client.** Hostnames, domains, VMs, IPs and users are detected automatically or asked for, with defaults you can accept by pressing ENTER.
 - **Changes always ask first.** Options marked `[!]` change the machine, and you must type `YES` before they do anything. Everything else only reads.
 - **All output goes to `C:\temp`**, in one subfolder per area.
@@ -92,7 +92,7 @@ The home screen shows the banner, a line about the machine (host, domain, OS, ad
 | Type | Does |
 |---|---|
 | A section letter (`A`, `C`, `D`...) | Open that section |
-| Any option number (`1`-`129`) | Run that option directly, from any screen |
+| Any option number (`1`-`130`) | Run that option directly, from any screen |
 | `ALL` | List every option |
 | `B` | Back to the section list |
 | `O` | Change the output folder |
@@ -110,7 +110,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 ## All options
 
 <!-- AUTO-OPTIONS:START -->
-<details><summary><b>Quick index of all 129 options</b> (auto-generated from the script, 2026-10-05)</summary>
+<details><summary><b>Quick index of all 130 options</b> (auto-generated from the script, 2026-10-05)</summary>
 
 **A. SYSTEM HEALTH**
 
@@ -279,6 +279,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 127. M365 IR: Hawk - compromised user / tenant investigation
 128. M365 audit: CISA ScubaGear - SCuBA secure-baseline assessment (HTML)
 129. M365 audit: Maester - automated Entra / Exchange / CISA security tests (HTML)
+130. M365: domain impersonation / spoofing - headers, SPF/DMARC, look-alike domains, Direct Send
 
 </details>
 <!-- AUTO-OPTIONS:END -->
@@ -468,6 +469,7 @@ Each option runs in its own PowerShell window and signs in only to the services 
 | 127 | Hawk | User investigation (mailbox config, rules, forwarding, auth history, mailbox audit, message trace, mobile devices) or tenant investigation (admin / config changes, consent grants, transport rules). Output in `C:\temp\M365\Hawk` |
 | 128 | CISA ScubaGear | Tenant configuration vs. CISA SCuBA baselines (Entra, Defender, Exchange, SharePoint, Teams, optional Power Platform / Power BI). HTML report. Windows PowerShell 5.1; sign in with an account **in** the client tenant (Global Reader is enough), GDAP is not supported |
 | 129 | Maester | Hundreds of Entra / Exchange / CISA / EIDSCA Pester tests with an HTML pass/fail report and the fix for each. Test library kept in `C:\temp\Maester\tests` and updated on request |
+| 130 | Domain impersonation / spoofing | 1) Header analysis of a suspicious message: real sender, sending IP and country, SPF / DKIM / DMARC / CompAuth with reason codes explained, Microsoft category, **Direct Send** (anonymous mail claiming your own domain), Reply-To / Return-Path mismatches, look-alike sender domain, free-mail display-name impersonation, plain-English verdict. 2) Domain spoofability: SPF with DNS-lookup count, DMARC policy, DKIM selectors, MX gateway, MTA-STS. 3) dnstwist-style look-alike scan in pure PowerShell (typo, homoglyph, hyphen, keyword and TLD variants; registered, MX, RDAP age, risk). 4) Tenant: RejectDirectSend, inbound connectors, anti-phishing impersonation settings, spoof intelligence and a message trace for mail from registered look-alikes. 5) Tenant-wide spoof hunt ("is it still happening?"): every message claiming your own domains that entered from an outside IP (not a connector, trusted IP or Microsoft 365), grouped by IP with hosting/ISP flag, per-day counts and before-vs-after a fix date; a look-alike sweep of every outside sender domain in the trace; spoof intelligence; and a ready-made Defender advanced-hunting query (Plan 2) that also covers display-name impersonation. Output in `C:\temp\M365\Impersonation` |
 
 Options 125-129 install their PowerShell Gallery modules for the current user on first use (you're asked first), and offer an update when a newer version is published. Options 126, 127 and 129 load Microsoft Graph and Exchange Online in the same session, which can clash in Windows PowerShell 5.1 ("GetTokenAsync ... does not have an implementation" / "method not found"). They therefore run in **PowerShell 7** (`pwsh.exe`) when it's installed, and offer to install it (Microsoft-signed MSI from GitHub, silent) when it isn't. If you decline, they run in 5.1 with Graph loaded before Exchange. ScubaGear (128) always runs in Windows PowerShell 5.1, as it requires.
 
@@ -561,6 +563,10 @@ Before a downloaded `.exe` / `.msi` is run:
 | Hawk (PowerShell Gallery) | https://github.com/T0pCyber/hawk |
 | CISA ScubaGear (PowerShell Gallery) | https://github.com/cisagov/ScubaGear |
 | Maester (PowerShell Gallery) | https://maester.dev |
+| dnstwist (reference for option 130) | https://github.com/elceef/dnstwist |
+| openSquat | https://github.com/atenreiro/opensquat |
+| Microsoft Message Header Analyzer | https://github.com/microsoft/MHA |
+| parsedmarc | https://github.com/domainaware/parsedmarc |
 | Built-in speed test servers | https://speed.cloudflare.com/ |
 
 **Deliberately excluded:** NirSoft password-recovery tools and PsExec. EDR products flag these as hacking tools.
@@ -663,6 +669,7 @@ SigmaDataSystems-ToolKit-v2.ps1
 ## Changelog
 
 ### v2.0 (2026-10)
+- **Domain impersonation / spoofing investigation (option 130)**: header analysis with Direct Send detection, SPF/DMARC/DKIM spoofability check, built-in look-alike domain scan, tenant spoof-intelligence and look-alike message trace, and a tenant-wide spoof hunt with before/after-fix comparison.
 - **M365 incident response / audit (options 125-129)**: failed sign-in alert check with error-code verdict (Graph, with Unified Audit Log fallback for tenants without P1), Microsoft-Extractor-Suite (Invictus IR) triage, Hawk user / tenant investigation, CISA ScubaGear baseline assessment, Maester security tests.
 - **Microsoft 365 section (options 91-124)**: compromised-account audit and containment, inbox rules with audit-log timestamps, forwarding, message trace, quarantine release, sender filtering diagnosis (BCL vs SCL), SPF / DKIM / DMARC, Direct Send connectors, mobile device wipe, audit log, sign-ins, MFA, stale accounts, admin roles, licenses, new users, app consent, expiring app secrets, Intune / BitLocker escrow, OneDrive sharing, retention exclusions, tenant hardening, posture audit and remediation plan, app registration, hybrid join and BitLocker-to-Entra on the PC. Works for client tenants via GDAP.
 - Section menu: section letters, direct option numbers, `ALL`, `B` back.
