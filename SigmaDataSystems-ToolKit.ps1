@@ -1050,6 +1050,28 @@ function Invoke-SQLConnectivity {
     Invoke-Tool 'Test-SQLConnectivity' ([ordered]@{ InstanceName = $inst; Fix = $fix; TcpPort = $port; OutDir = (Get-OutDir 'SQL') }) | Out-Null
 }
 
+function Invoke-EmailAuthDnsCheck {
+    Write-Title 'Email DNS auth check - SPF / DKIM / DMARC / MX with change history and alerts'
+    Write-Host '  Checks SPF (recursive lookup count, void lookups, all mechanism), DMARC (policy, rua, report'
+    Write-Host '  authorization record), DKIM keys (revoked / 1024-bit) and MX for any domains via public DNS.'
+    Write-Host '  Saves a snapshot each run and reports what changed since the last run on this machine.'
+    $mode = Read-Default '1 = enter domain(s), 2 = every domain in a dmarc-records.csv (Get-DmarcReports.ps1)' '1'
+    $p = [ordered]@{ OutputPath = (Get-OutDir 'EmailAuthDNS') }
+    if ("$mode" -eq '2') {
+        $csv = Read-Default 'Path to dmarc-records.csv' 'C:\DMARC\dmarc-records.csv'
+        if (-not (Test-Path -LiteralPath $csv)) { Write-Host "  File not found: $csv" -ForegroundColor Red; return }
+        $p.DmarcCsv = $csv
+    } else {
+        $d = Read-Default 'Domain(s) to check, comma-separated' ''
+        $list = @("$d" -split '[,;\s]+' | Where-Object { $_ -match '\.' })
+        if (-not $list.Count) { Write-Host '  No domain entered.' -ForegroundColor Yellow; return }
+        $p.Domain = $list
+    }
+    $p.ReportAddress = Read-Default 'Address every DMARC rua should include (blank = skip this check)' ''
+    $p.WriteEventLog = Read-YesNo 'Also write results to the Application Event Log (source SDSI-DNSMonitor) for RMM alerting?' $false
+    Invoke-Tool 'Get-EmailAuthDnsCheck' $p | Out-Null
+}
+
 function Invoke-CitrixState {
     Write-Title 'Citrix Workspace app - install state'
     Write-Sub 'reg.exe: HKLM\SOFTWARE\Citrix'
@@ -3836,6 +3858,7 @@ $Script:Menu = @(
     @{               Text = 'Wi-Fi live monitor (signal / roams / channel changes / drops / lag over time)';    Action = { Invoke-WifiMonitor } }
     @{ Test='safe'; Text = 'Network connections & listening ports by process';                              Action = { Invoke-TcpConnections } }
     @{ Test='safe'; Text = 'SMTP / scan-to-email relay test + SPF/DMARC/MX lookup';                         Action = { Invoke-SmtpTest } }
+    @{               Text = 'Email DNS auth check: SPF / DKIM / DMARC / MX + change history & alerts';   Action = { Invoke-EmailAuthDnsCheck } }
     @{               Text = '[!] Network quick fixes (flush DNS / renew / Winsock + TCP/IP reset)';          Action = { Invoke-NetworkReset } }
     @{ Test='safe'; Text = 'DHCP Event 1059 / DC authorization diagnostics';                                Action = { Invoke-Dhcp1059 } }
     @{ Test='safe'; Text = 'DHCP mobile device lease audit / cleanup';                                      Action = { Invoke-MobileLeases } }
@@ -20163,6 +20186,424 @@ else {
 }
 Stop-Transcript | Out-Null
 Write-Host "`nReport: $report" -ForegroundColor Green
+'@
+
+# ======================= Get-EmailAuthDnsCheck.ps1 =======================
+$Script:Payloads['Get-EmailAuthDnsCheck'] = @'
+<#
+.SYNOPSIS
+    Checks SPF, DMARC, DKIM and MX for one or more domains, keeps a history of every record,
+    detects changes between runs, and raises alerts (console, CSV, Windows Event Log).
+
+.DESCRIPTION
+    Prepared by Sigma Data Systems Inc.
+
+    Universal - no domains, tenants or client values are hardcoded. Domains come from parameters,
+    a plain domain list, or a dmarc-records.csv produced by Get-DmarcReports.ps1 (which also supplies
+    the DKIM selectors each domain really uses).
+
+    Checks (against public resolvers, so internal/split DNS doesn't skew results):
+      SPF    exactly one v=spf1 record, total DNS lookups <= 10 (recursive), void lookups <= 2, -all/~all
+      DMARC  record present and valid, p= / sp= / pct, optional check that rua contains your report address
+      Auth   external report authorization record (<domain>._report._dmarc.<rua-domain>) when rua is off-domain
+      DKIM   key present per selector, not revoked, key length (flags 1024-bit), CNAME target
+      MX     current mail servers and inferred provider
+
+    Output (in -OutputPath):
+      dns-status.csv                 current state of every domain (overwritten each run)
+      dns-changes.csv                every record change ever detected (appended)
+      dns-alerts.csv                 every alert raised (appended)
+      snapshots\YYYY-MM-DD_HHmm.json full snapshot of this run
+      state\last-snapshot.json       previous snapshot used for change detection
+      logs\dns-YYYY-MM-DD.log
+
+    Event Log (-WriteEventLog, run elevated once to register the source):
+      Source SDSI-DNSMonitor, Application log
+      1000 Information  run summary (heartbeat - alert in N-central if missing)
+      1001 Error        critical alert(s)
+      1002 Warning      warning alert(s)
+
+.EXAMPLE
+    .\Get-EmailAuthDnsCheck.ps1 -Domain example.com
+    One-off check of a single domain; results print to screen and land in C:\temp\EmailAuthDNS.
+
+.EXAMPLE
+    .\Get-EmailAuthDnsCheck.ps1 -DmarcCsv C:\DMARC\dmarc-records.csv -ReportAddress reports@yourmsp.com -OutputPath C:\DMARC\dns -WriteEventLog
+    Daily scheduled run: checks every domain seen in DMARC reports, verifies they still send reports to you,
+    records history and writes Event Log entries for N-central to alert on.
+#>
+[CmdletBinding()]
+param(
+    [string[]]$Domain,
+    [string]$DomainList,                       # text/CSV file: one domain per line, or a column named Domain
+    [string]$DmarcCsv,                         # dmarc-records.csv from Get-DmarcReports.ps1
+    [string]$ReportAddress,                    # e.g. reports@yourmsp.com - verify each DMARC rua still includes it
+    [string]$OutputPath = 'C:\temp\EmailAuthDNS',
+    [string[]]$Resolver = @('1.1.1.1', '8.8.8.8'),
+    [string[]]$ExtraSelectors,
+    [switch]$WriteEventLog,
+    [switch]$Quiet
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+# ---------------- setup ----------------
+$snapDir = Join-Path $OutputPath 'snapshots'; $stateDir = Join-Path $OutputPath 'state'; $logDir = Join-Path $OutputPath 'logs'
+foreach ($d in $OutputPath, $snapDir, $stateDir, $logDir) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null } }
+$runTime  = Get-Date
+$stamp    = $runTime.ToString('yyyy-MM-dd_HHmm')
+$logFile  = Join-Path $logDir ("dns-{0}.log" -f $runTime.ToString('yyyy-MM-dd'))
+$lastFile = Join-Path $stateDir 'last-snapshot.json'
+
+function Write-Log([string]$Msg, [string]$Level = 'INFO') {
+    $line = '{0} [{1}] {2}' -f (Get-Date -Format 's'), $Level, $Msg
+    Add-Content -Path $logFile -Value $line
+    if (-not $Quiet) {
+        $c = switch ($Level) { 'CRIT' { 'Red' } 'WARN' { 'Yellow' } 'OK' { 'Green' } default { 'Gray' } }
+        Write-Host $line -ForegroundColor $c
+    }
+}
+
+$DefaultSelectors = @('selector1','selector2','google','k1','k2','k3','s1','s2','default','dkim','mail','smtp','mxvault','sig1')
+
+# ---------------- DNS helpers ----------------
+# Returns @{ Status = 'OK' | 'NXDOMAIN' | 'NODATA' | 'ERROR'; Values = @(...); Cname = '...' }
+function Invoke-Dns([string]$Name, [string]$Type) {
+    $lastErr = $null
+    foreach ($srv in $Resolver) {
+        try {
+            $r = Resolve-DnsName -Name $Name -Type $Type -Server $srv -DnsOnly -QuickTimeout -ErrorAction Stop
+            $ans   = @($r | Where-Object { $_.Section -eq 'Answer' })
+            $cname = ($ans | Where-Object { $_.Type -eq 'CNAME' } | Select-Object -First 1).NameHost
+            $vals  = switch ($Type) {
+                'TXT' { $ans | Where-Object { $_.Type -eq 'TXT' } | ForEach-Object { ($_.Strings -join '') } }
+                'MX'  { $ans | Where-Object { $_.Type -eq 'MX' }  | Sort-Object Preference, NameExchange | ForEach-Object { '{0} {1}' -f $_.Preference, $_.NameExchange.ToLower() } }
+                default { $ans | Where-Object { $_.Type -eq $Type } | ForEach-Object { if ($_.IPAddress) { $_.IPAddress } else { $_.NameHost } } }
+            }
+            $vals = @($vals | Where-Object { $_ -ne $null })
+            if ($vals.Count) { return @{ Status = 'OK'; Values = $vals; Cname = $cname } }
+            return @{ Status = 'NODATA'; Values = @(); Cname = $cname }
+        }
+        catch {
+            $msg = $_.Exception.Message
+            if ($msg -match 'does not exist|DNS name does not exist|9003') { return @{ Status = 'NXDOMAIN'; Values = @(); Cname = $null } }
+            $lastErr = $msg
+        }
+    }
+    return @{ Status = 'ERROR'; Values = @(); Cname = $null; Error = $lastErr }
+}
+
+function Get-OrgDomain([string]$d) {
+    # Rough organizational domain: last two labels, or three for common 2-level public suffixes
+    $p = $d.ToLower().TrimEnd('.').Split('.')
+    if ($p.Count -ge 3 -and $p[-2] -match '^(co|com|org|net|gov|edu|ac)$' -and $p[-1].Length -eq 2) { return ($p[-3..-1] -join '.') }
+    if ($p.Count -ge 2) { return ($p[-2..-1] -join '.') }
+    return $d
+}
+
+# ---------------- SPF ----------------
+function Get-SpfTree([string]$Name, [hashtable]$Ctx, [int]$Depth) {
+    if ($Depth -gt 10 -or $Ctx.Seen.ContainsKey($Name)) { $Ctx.Errors += "loop or excessive depth at $Name"; return }
+    $Ctx.Seen[$Name] = $true
+    $q = Invoke-Dns $Name 'TXT'
+    if ($q.Status -eq 'ERROR') { $Ctx.Errors += "lookup failed for $Name"; return }
+    $spf = @($q.Values | Where-Object { $_ -match '^\s*v=spf1(\s|$)' })
+    if ($spf.Count -eq 0) { if ($Depth -gt 0) { $Ctx.Void++ ; $Ctx.Errors += "no SPF record at $Name" }; return }
+    if ($spf.Count -gt 1 -and $Depth -gt 0) { $Ctx.Errors += "multiple SPF records at $Name" }
+    foreach ($term in ($spf[0] -split '\s+' | Where-Object { $_ })) {
+        $t = $term.ToLower() -replace '^[\+\-~\?]', ''
+        if ($t -match '^include:(.+)$')        { $Ctx.Lookups++; $Ctx.Includes += $Matches[1]; Get-SpfTree $Matches[1] $Ctx ($Depth + 1) }
+        elseif ($t -match '^redirect=(.+)$')   { $Ctx.Lookups++; $Ctx.Includes += "redirect:$($Matches[1])"; Get-SpfTree $Matches[1] $Ctx ($Depth + 1) }
+        elseif ($t -match '^(a|mx)(:|/|$)')    { $Ctx.Lookups++ }
+        elseif ($t -match '^ptr')              { $Ctx.Lookups++; $Ctx.Errors += "ptr mechanism used (deprecated) at $Name" }
+        elseif ($t -match '^exists:')          { $Ctx.Lookups++ }
+    }
+}
+
+function Test-Spf([string]$Dom) {
+    $q = Invoke-Dns $Dom 'TXT'
+    $res = [ordered]@{ Status = $q.Status; Records = @(); Lookups = 0; Void = 0; All = ''; Includes = @(); Errors = @() }
+    if ($q.Status -eq 'ERROR') { return $res }
+    $res.Records = @($q.Values | Where-Object { $_ -match '^\s*v=spf1(\s|$)' })
+    if ($res.Records.Count -eq 1) {
+        $ctx = @{ Seen = @{}; Lookups = 0; Void = 0; Includes = @(); Errors = @() }
+        Get-SpfTree $Dom $ctx 0
+        $res.Lookups = $ctx.Lookups; $res.Void = $ctx.Void; $res.Includes = $ctx.Includes; $res.Errors = $ctx.Errors
+        if ($res.Records[0] -match '(^|\s)([\+\-~\?]?)all(\s|$)') { $res.All = ($Matches[2] + 'all') -replace '^all$', '+all' }
+        elseif ($res.Records[0] -match 'redirect=') { $res.All = '(redirect)' }
+    }
+    return $res
+}
+
+# ---------------- DMARC ----------------
+function Test-Dmarc([string]$Dom) {
+    $q = Invoke-Dns "_dmarc.$Dom" 'TXT'
+    $res = [ordered]@{ Status = $q.Status; Records = @(); Tags = @{}; RuaDomains = @(); AuthMissing = @(); AuthChecked = @() }
+    if ($q.Status -eq 'ERROR') { return $res }
+    $res.Records = @($q.Values | Where-Object { $_ -match '^\s*v=DMARC1' })
+    if ($res.Records.Count -ge 1) {
+        foreach ($kv in ($res.Records[0] -split ';')) {
+            if ($kv -match '^\s*([a-z]+)\s*=\s*(.*?)\s*$') { $res.Tags[$Matches[1].ToLower()] = $Matches[2] }
+        }
+        $rua = @()
+        if ($res.Tags.ContainsKey('rua')) { $rua = $res.Tags['rua'] -split ',' | ForEach-Object { ($_ -replace '^\s*mailto:', '' -replace '!.*$', '').Trim().ToLower() } | Where-Object { $_ } }
+        $res.Rua = $rua
+        foreach ($addr in $rua) {
+            $rd = ($addr -split '@')[-1]
+            if ((Get-OrgDomain $rd) -ne (Get-OrgDomain $Dom)) {
+                $res.RuaDomains += $rd
+                $authName = "$Dom._report._dmarc.$rd"
+                $a = Invoke-Dns $authName 'TXT'
+                $res.AuthChecked += $authName
+                if ($a.Status -ne 'ERROR' -and -not ($a.Values | Where-Object { $_ -match '^\s*v=DMARC1' })) {
+                    # Also accept a wildcard authorization (*._report._dmarc.<rua-domain>)
+                    $w = Invoke-Dns "*._report._dmarc.$rd" 'TXT'
+                    if (-not ($w.Values | Where-Object { $_ -match '^\s*v=DMARC1' })) { $res.AuthMissing += $authName }
+                }
+            }
+        }
+    }
+    return $res
+}
+
+# ---------------- DKIM ----------------
+function Test-Dkim([string]$Dom, [string[]]$Selectors) {
+    $out = [ordered]@{}
+    foreach ($s in ($Selectors | Where-Object { $_ } | Sort-Object -Unique)) {
+        $q = Invoke-Dns "$s._domainkey.$Dom" 'TXT'
+        if ($q.Status -eq 'NXDOMAIN' -or ($q.Status -eq 'NODATA' -and -not $q.Cname)) { continue }
+        if ($q.Status -eq 'ERROR') { $out[$s] = [ordered]@{ Status = 'ERROR'; Value = $null; Cname = $null; KeyType = ''; Bits = 0; Revoked = $false }; continue }
+        $rec = $q.Values | Where-Object { $_ -match '(^|;)\s*(v=DKIM1|p=)' } | Select-Object -First 1
+        $info = [ordered]@{ Status = $q.Status; Value = $rec; Cname = $q.Cname; KeyType = 'rsa'; Bits = 0; Revoked = $false }
+        if ($q.Status -eq 'NODATA' -and $q.Cname) { $info.Status = 'CNAME-DANGLING' }
+        if ($rec) {
+            if ($rec -match '(^|;)\s*k=\s*([a-z0-9]+)') { $info.KeyType = $Matches[2] }
+            if ($rec -match '(^|;)\s*p=\s*([A-Za-z0-9+/=\s]*)') {
+                $p = $Matches[2] -replace '\s', ''
+                if (-not $p) { $info.Revoked = $true }
+                elseif ($info.KeyType -eq 'ed25519') { $info.Bits = 256 }
+                else {
+                    try { $len = [Convert]::FromBase64String($p).Length
+                          $info.Bits = if ($len -lt 120) { 512 } elseif ($len -lt 200) { 1024 } elseif ($len -lt 330) { 2048 } else { 4096 } } catch {}
+                }
+            }
+        }
+        $out[$s] = $info
+    }
+    return $out
+}
+
+function Get-MxProvider([string[]]$Mx) {
+    $j = ($Mx -join ' ')
+    switch -Regex ($j) {
+        'barracudanetworks\.com|ess\.barracuda' { return 'Barracuda' }
+        'mail\.protection\.outlook\.com'        { return 'Microsoft 365' }
+        'mimecast'                              { return 'Mimecast' }
+        'pphosted\.com|ppe-hosted'              { return 'Proofpoint' }
+        'google\.com|googlemail\.com'           { return 'Google' }
+        'iphmx\.com'                            { return 'Cisco Secure Email' }
+        'messagelabs|symantec'                  { return 'Symantec' }
+        'secureserver\.net'                     { return 'GoDaddy' }
+        default { if ($Mx.Count) { return 'Other' } else { return 'None' } }
+    }
+}
+
+# ---------------- collect domains + selectors ----------------
+$domains   = New-Object 'System.Collections.Generic.HashSet[string]'
+$selectors = @{}
+foreach ($d in $Domain) { if ($d) { [void]$domains.Add($d.Trim().ToLower().TrimEnd('.')) } }
+if ($DomainList) {
+    if ($DomainList -like '*.csv') { Import-Csv $DomainList | ForEach-Object { if ($_.Domain) { [void]$domains.Add($_.Domain.Trim().ToLower()) } } }
+    else { Get-Content $DomainList | ForEach-Object { $x = ($_ -split '[,;\s#]')[0].Trim().ToLower(); if ($x -match '\.') { [void]$domains.Add($x) } } }
+}
+if ($DmarcCsv) {
+    if (-not (Test-Path $DmarcCsv)) { throw "DMARC CSV not found: $DmarcCsv" }
+    foreach ($r in (Import-Csv $DmarcCsv)) {
+        $pd = "$($r.PolicyDomain)".Trim().ToLower(); if (-not $pd) { continue }
+        [void]$domains.Add($pd)
+        if ($r.DKIM_Selector -and $r.DKIM_Domains) {
+            $sd = $r.DKIM_Domains -split ';'; $ss = $r.DKIM_Selector -split ';'
+            for ($i = 0; $i -lt $sd.Count; $i++) {
+                $dd = $sd[$i].Trim().ToLower()
+                if ($i -lt $ss.Count -and $ss[$i] -and ($dd -eq $pd -or $dd.EndsWith(".$pd"))) {
+                    if (-not $selectors.ContainsKey($pd)) { $selectors[$pd] = New-Object 'System.Collections.Generic.HashSet[string]' }
+                    [void]$selectors[$pd].Add($ss[$i].Trim())
+                }
+            }
+        }
+    }
+}
+if ($domains.Count -eq 0) {
+    if ([Environment]::UserInteractive -and -not $Quiet) {
+        $in = Read-Host 'Enter domain(s) to check, comma separated'
+        $in -split '[,\s]+' | Where-Object { $_ -match '\.' } | ForEach-Object { [void]$domains.Add($_.Trim().ToLower()) }
+    }
+    if ($domains.Count -eq 0) { throw 'No domains to check. Use -Domain, -DomainList or -DmarcCsv.' }
+}
+Write-Log ("Checking {0} domain(s) via {1}" -f $domains.Count, ($Resolver -join ', '))
+
+# ---------------- run checks ----------------
+$snapshot = [ordered]@{ CheckedAt = $runTime.ToString('s'); Domains = [ordered]@{} }
+$statusRows = @()
+
+foreach ($dom in [string[]]@($domains | Sort-Object)) {
+    $sel = @($DefaultSelectors) + @($ExtraSelectors)
+    if ($selectors.ContainsKey($dom)) { $sel += @($selectors[$dom]) }
+
+    $spf   = Test-Spf $dom
+    $dmarc = Test-Dmarc $dom
+    $dkim  = Test-Dkim $dom $sel
+    $mxQ   = Invoke-Dns $dom 'MX'
+    $mx    = @($mxQ.Values)
+
+    $f = New-Object System.Collections.Generic.List[object]
+    function Add-F($sev, $msg) { $f.Add([pscustomobject]@{ Severity = $sev; Finding = $msg }) }
+
+    # SPF findings
+    if ($spf.Status -eq 'ERROR') { Add-F 'Warning' 'SPF lookup failed (DNS error) - not evaluated' }
+    elseif ($spf.Records.Count -eq 0) { Add-F 'Warning' 'No SPF record' }
+    elseif ($spf.Records.Count -gt 1) { Add-F 'Critical' "Multiple SPF records ($($spf.Records.Count)) - SPF permerror for all mail" }
+    else {
+        if ($spf.Lookups -gt 10) { Add-F 'Critical' "SPF needs $($spf.Lookups) DNS lookups (limit 10) - SPF permerror" }
+        elseif ($spf.Lookups -ge 9) { Add-F 'Warning' "SPF uses $($spf.Lookups) of 10 DNS lookups - one more include breaks it" }
+        if ($spf.Void -gt 2) { Add-F 'Critical' "SPF has $($spf.Void) void lookups (limit 2) - SPF permerror" }
+        elseif ($spf.Void -gt 0) { Add-F 'Warning' "SPF include(s) with no SPF record: $($spf.Void)" }
+        if ($spf.All -eq '+all') { Add-F 'Critical' 'SPF ends in +all - anyone can send as this domain' }
+        elseif ($spf.All -eq '?all' -or -not $spf.All) { Add-F 'Warning' "SPF has no enforcing all mechanism ($(if ($spf.All) { $spf.All } else { 'missing' }))" }
+        foreach ($e in ($spf.Errors | Where-Object { $_ -match 'multiple|loop|ptr' })) { Add-F 'Warning' "SPF: $e" }
+    }
+    # DMARC findings
+    $pol = ''; $pct = ''
+    if ($dmarc.Status -eq 'ERROR') { Add-F 'Warning' 'DMARC lookup failed (DNS error) - not evaluated' }
+    elseif ($dmarc.Records.Count -eq 0) { Add-F 'Critical' 'No DMARC record' }
+    elseif ($dmarc.Records.Count -gt 1) { Add-F 'Critical' 'Multiple DMARC records - receivers ignore DMARC' }
+    else {
+        $pol = "$($dmarc.Tags['p'])".ToLower(); $pct = if ($dmarc.Tags.ContainsKey('pct')) { $dmarc.Tags['pct'] } else { '100' }
+        if ($pol -notin 'none','quarantine','reject') { Add-F 'Critical' "DMARC policy invalid or missing (p=$pol)" }
+        elseif ($pol -eq 'none') { Add-F 'Info' 'DMARC p=none (monitor only)' }
+        if ($pct -ne '100' -and $pol -ne 'none') { Add-F 'Info' "DMARC applies to pct=$pct only" }
+        if (-not $dmarc.Tags.ContainsKey('rua')) { Add-F 'Warning' 'DMARC has no rua - no aggregate reports are sent' }
+        if ($ReportAddress -and ($dmarc.Rua -notcontains $ReportAddress.ToLower())) { Add-F 'Critical' "DMARC rua no longer includes $ReportAddress" }
+        foreach ($m in $dmarc.AuthMissing) { Add-F 'Critical' "Report authorization record missing: $m (receivers may not send reports)" }
+    }
+    # DKIM findings
+    $found = @($dkim.Keys | Where-Object { $dkim[$_].Value -and -not $dkim[$_].Revoked })
+    if (-not $found.Count) { Add-F 'Warning' "No DKIM key found on selectors checked ($(@($sel | Sort-Object -Unique).Count) tried)" }
+    foreach ($s in $dkim.Keys) {
+        $k = $dkim[$s]
+        if ($k.Status -eq 'CNAME-DANGLING') { Add-F 'Warning' "DKIM selector '$s' CNAME points to $($k.Cname) which has no key" }
+        elseif ($k.Revoked) { if ($selectors.ContainsKey($dom) -and $selectors[$dom].Contains($s)) { Add-F 'Warning' "DKIM selector '$s' is revoked but still used in mail" } }
+        elseif ($k.Bits -and $k.Bits -le 1024 -and $k.KeyType -eq 'rsa') { Add-F 'Warning' "DKIM selector '$s' is $($k.Bits)-bit - rotate to 2048" }
+    }
+    if ($mxQ.Status -eq 'OK' -and -not $mx.Count) { Add-F 'Info' 'No MX records' }
+
+    $status = if ($f | Where-Object Severity -eq 'Critical') { 'Critical' } elseif ($f | Where-Object Severity -eq 'Warning') { 'Warning' } else { 'OK' }
+
+    # normalized records for history/change detection (ERROR = keep previous, don't compare)
+    $recs = [ordered]@{}
+    $recs['SPF']   = if ($spf.Status -eq 'ERROR') { $null } else { ($spf.Records | ForEach-Object { ($_ -replace '\s+', ' ').Trim() }) -join ' | ' }
+    $recs['DMARC'] = if ($dmarc.Status -eq 'ERROR') { $null } else { ($dmarc.Records | ForEach-Object { ($_ -replace '\s+', '').Trim().ToLower() }) -join ' | ' }
+    $recs['MX']    = if ($mxQ.Status -eq 'ERROR') { $null } else { $mx -join ', ' }
+    foreach ($s in $dkim.Keys) { $recs["DKIM:$s"] = if ($dkim[$s].Status -eq 'ERROR') { $null } elseif ($dkim[$s].Value) { ($dkim[$s].Value -replace '\s', '') } else { "CNAME->$($dkim[$s].Cname)" } }
+    foreach ($a in $dmarc.AuthChecked) { $recs["ReportAuth:$a"] = if ($dmarc.AuthMissing -contains $a) { 'MISSING' } else { 'present' } }
+
+    $snapshot.Domains[$dom] = [ordered]@{
+        Status = $status; Records = $recs; Findings = $f.ToArray()
+        SpfLookups = $spf.Lookups; SpfVoid = $spf.Void; SpfAll = $spf.All; SpfIncludes = $spf.Includes
+        DmarcPolicy = $pol; DmarcPct = $pct; DmarcRua = ($dmarc.Rua -join ','); MxProvider = (Get-MxProvider $mx)
+        DkimSelectors = @($found)
+    }
+    $statusRows += [pscustomobject]@{
+        CheckedAt = $runTime.ToString('s'); Domain = $dom; Status = $status
+        SPF = $recs['SPF']; SPF_Lookups = $spf.Lookups; SPF_All = $spf.All
+        DMARC_Policy = $pol; DMARC_Pct = $pct; DMARC_Rua = ($dmarc.Rua -join ',')
+        DKIM_Selectors = ($found | ForEach-Object { '{0}({1})' -f $_, $dkim[$_].Bits }) -join ' '
+        MX_Provider = (Get-MxProvider $mx); MX = $recs['MX']
+        Findings = (($f | Where-Object Severity -ne 'Info' | ForEach-Object { "[$($_.Severity)] $($_.Finding)" }) -join '; ')
+    }
+    $lvl = switch ($status) { 'Critical' { 'CRIT' } 'Warning' { 'WARN' } default { 'OK' } }
+    Write-Log ("{0,-32} {1,-8} SPF {2}/10 {3}  DMARC p={4}  DKIM {5}  MX {6}" -f $dom, $status, $spf.Lookups, $spf.All, $(if ($pol) { $pol } else { '-' }), $(if ($found.Count) { $found -join ',' } else { 'none' }), (Get-MxProvider $mx)) $lvl
+    foreach ($x in ($f | Where-Object Severity -ne 'Info')) { Write-Log ("    {0}: {1}" -f $x.Severity, $x.Finding) $(if ($x.Severity -eq 'Critical') { 'CRIT' } else { 'WARN' }) }
+}
+
+# ---------------- change detection ----------------
+$prev = $null
+if (Test-Path $lastFile) { try { $prev = Get-Content $lastFile -Raw | ConvertFrom-Json } catch { Write-Log "Could not read previous snapshot - treating as first run" 'WARN' } }
+
+$changes = @(); $alerts = @()
+$rank = @{ 'none' = 0; 'quarantine' = 1; 'reject' = 2 }
+function Get-DmarcTag([string]$rec, [string]$tag) { if ($rec -match "(^|;)$tag=([^;|]*)") { return $Matches[2] } return '' }
+
+foreach ($dom in $snapshot.Domains.Keys) {
+    $cur = $snapshot.Domains[$dom]
+    $old = if ($prev -and $prev.Domains.PSObject.Properties[$dom]) { $prev.Domains.$dom } else { $null }
+    if (-not $old) { continue }   # new domain: baseline only
+
+    $keys = @($cur.Records.Keys) + @($old.Records.PSObject.Properties.Name) | Sort-Object -Unique
+    foreach ($k in $keys) {
+        $nv = $cur.Records[$k]
+        $ov = if ($old.Records.PSObject.Properties[$k]) { $old.Records.$k } else { $null }
+        if ($cur.Records.Contains($k) -and $null -eq $nv) { $cur.Records[$k] = $ov; continue }   # lookup error: carry forward, no alert
+        if ("$nv" -eq "$ov") { continue }
+        $type = if (-not $ov) { 'Added' } elseif (-not $nv) { 'Removed' } else { 'Modified' }
+        $sev = 'Warning'
+        switch -Wildcard ($k) {
+            'DMARC' {
+                if ($type -eq 'Removed') { $sev = 'Critical' }
+                elseif ($type -eq 'Modified') {
+                    $po = Get-DmarcTag $ov 'p'; $pn = Get-DmarcTag $nv 'p'
+                    if ($rank.ContainsKey($po) -and $rank.ContainsKey($pn)) { if ($rank[$pn] -lt $rank[$po]) { $sev = 'Critical' } elseif ($rank[$pn] -gt $rank[$po]) { $sev = 'Info' } }
+                    if ($ReportAddress -and $ov -like "*$($ReportAddress.ToLower())*" -and $nv -notlike "*$($ReportAddress.ToLower())*") { $sev = 'Critical' }
+                }
+            }
+            'SPF'          { if ($type -eq 'Removed') { $sev = 'Critical' } }
+            'MX'           { $sev = 'Warning' }
+            'DKIM:*'       { if ($type -eq 'Added') { $sev = 'Info' } }
+            'ReportAuth:*' { if ($nv -eq 'MISSING') { $sev = 'Critical' } else { $sev = 'Info' } }
+        }
+        $changes += [pscustomobject]@{ DetectedAt = $runTime.ToString('s'); Domain = $dom; Record = $k; Change = $type; Severity = $sev; OldValue = $ov; NewValue = $nv }
+    }
+
+    # findings that are new since last run
+    $oldF = @($old.Findings | ForEach-Object { $_.Finding })
+    foreach ($x in ($cur.Findings | Where-Object { $_.Severity -in 'Critical','Warning' -and $oldF -notcontains $_.Finding })) {
+        $alerts += [pscustomobject]@{ RaisedAt = $runTime.ToString('s'); Domain = $dom; Severity = $x.Severity; Type = 'New finding'; Detail = $x.Finding }
+    }
+}
+foreach ($c in ($changes | Where-Object Severity -in 'Critical','Warning')) {
+    $alerts += [pscustomobject]@{ RaisedAt = $c.DetectedAt; Domain = $c.Domain; Severity = $c.Severity; Type = "$($c.Record) $($c.Change.ToLower())"; Detail = "Old: $($c.OldValue)  New: $($c.NewValue)" }
+}
+
+# ---------------- write output ----------------
+$statusRows | Export-Csv -Path (Join-Path $OutputPath 'dns-status.csv') -NoTypeInformation
+if ($changes.Count) { $changes | Export-Csv -Path (Join-Path $OutputPath 'dns-changes.csv') -NoTypeInformation -Append }
+if ($alerts.Count)  { $alerts  | Export-Csv -Path (Join-Path $OutputPath 'dns-alerts.csv')  -NoTypeInformation -Append }
+$json = $snapshot | ConvertTo-Json -Depth 8
+$json | Set-Content -Path (Join-Path $snapDir "$stamp.json") -Encoding UTF8
+$json | Set-Content -Path $lastFile -Encoding UTF8
+
+$crit = @($alerts | Where-Object Severity -eq 'Critical'); $warn = @($alerts | Where-Object Severity -eq 'Warning')
+$summary = "Checked $($domains.Count) domain(s): " +
+           "$(@($statusRows | Where-Object Status -eq 'Critical').Count) critical, $(@($statusRows | Where-Object Status -eq 'Warning').Count) warning, $(@($statusRows | Where-Object Status -eq 'OK').Count) OK. " +
+           "Changes since last run: $($changes.Count). New alerts: $($crit.Count) critical, $($warn.Count) warning." +
+           $(if (-not $prev) { ' (First run - baseline saved, no change alerts.)' } else { '' })
+Write-Log $summary $(if ($crit.Count) { 'CRIT' } elseif ($warn.Count) { 'WARN' } else { 'OK' })
+foreach ($a in $alerts) { Write-Log ("ALERT {0} {1} {2}: {3}" -f $a.Severity, $a.Domain, $a.Type, $a.Detail) $(if ($a.Severity -eq 'Critical') { 'CRIT' } else { 'WARN' }) }
+
+# ---------------- Event Log ----------------
+if ($WriteEventLog) {
+    $src = 'SDSI-DNSMonitor'
+    try {
+        if (-not [System.Diagnostics.EventLog]::SourceExists($src)) { New-EventLog -LogName Application -Source $src }
+        Write-EventLog -LogName Application -Source $src -EventId 1000 -EntryType Information -Message $summary
+        if ($crit.Count) { Write-EventLog -LogName Application -Source $src -EventId 1001 -EntryType Error -Message (($crit | ForEach-Object { "$($_.Domain): $($_.Type) - $($_.Detail)" }) -join "`r`n") }
+        if ($warn.Count) { Write-EventLog -LogName Application -Source $src -EventId 1002 -EntryType Warning -Message (($warn | ForEach-Object { "$($_.Domain): $($_.Type) - $($_.Detail)" }) -join "`r`n") }
+    }
+    catch { Write-Log "Event Log write failed (run elevated once to register source '$src'): $($_.Exception.Message)" 'WARN' }
+}
+
+Write-Log "Output: $OutputPath"
 '@
 
 # ======================= data/all-checks.json =======================
