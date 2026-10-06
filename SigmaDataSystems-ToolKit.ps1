@@ -1036,6 +1036,20 @@ function Invoke-CheckScannerDiag {
     Invoke-Tool 'Get-CheckScannerDiagnostics' ([ordered]@{ Days = $days; ExtraPattern = $extra; ApplyFixes = $fix; OutputPath = (Get-OutDir 'CheckScanner') }) | Out-Null
 }
 
+function Invoke-SQLConnectivity {
+    Write-Title 'SQL Server connectivity diagnostics (error 1225 / 26 / 40 / 53 - "network-related or instance-specific")'
+    Write-Host '  Checks installed instances, SQL + Browser services, TCP/IP + Named Pipes, static/dynamic port,'
+    Write-Host '  what sqlservr.exe is listening on, firewall rules, and test connections with several server-name formats.'
+    $inst = Read-Default 'Instance name (blank = all instances)' ''
+    $fix  = Read-YesNo 'Also apply fixes (start services, enable TCP/IP on a static port, firewall rules, restart SQL)?' $false
+    $port = 1433
+    if ($fix) {
+        $port = Read-Int 'Static TCP port to use' 1433
+        if (-not (Confirm-Change "Start SQL/Browser services, enable TCP/IP on static port $port, add inbound firewall rules (TCP $port, UDP 1434) and restart the SQL instance.")) { $fix = $false }
+    }
+    Invoke-Tool 'Test-SQLConnectivity' ([ordered]@{ InstanceName = $inst; Fix = $fix; TcpPort = $port; OutDir = (Get-OutDir 'SQL') }) | Out-Null
+}
+
 function Invoke-CitrixState {
     Write-Title 'Citrix Workspace app - install state'
     Write-Sub 'reg.exe: HKLM\SOFTWARE\Citrix'
@@ -3840,6 +3854,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'GUEST: hang timeline / NMI crash-dump readiness';                               Action = { Invoke-GuestTimeline } }
     @{ Section = 'SERVER / ACTIVE DIRECTORY / BACKUP' }
     @{ Test='safe'; Text = 'Server roles & key services (SQL, IIS, Exchange, QuickBooks, Sage, backup...)'; Action = { Invoke-ServerRolesStatus } }
+    @{ Test='safe'; Text = 'SQL Server connectivity diagnostics (error 1225/26/40) + optional fix';        Action = { Invoke-SQLConnectivity } }
     @{ Test='slow'; Text = 'Windows server audit (roles, shares, software, IIS, SMTP) HTML';                Action = { Invoke-ServerAudit } }
     @{ Test='safe'; Text = 'Active Directory / DC health (dcdiag, repadmin, FSMO, SYSVOL/DFSR)';            Action = { Invoke-ADHealth } }
     @{ Test='safe'; Text = 'Group Policy audit (HTML + CSV)';                                               Action = { Invoke-GPOAudit } }
@@ -19982,6 +19997,172 @@ Write-Host "or run: (New-Object -ComObject Microsoft.Update.AutoUpdate).DetectNo
 Write-Host "`nLog saved to: $logFile"
 
 Stop-Transcript
+'@
+
+# ======================= Test-SQLConnectivity.ps1 =======================
+$Script:Payloads['Test-SQLConnectivity'] = @'
+<#
+.SYNOPSIS
+    SQL Server connectivity diagnostics (+ optional auto-fix).
+    Prepared by Sigma Data Systems Inc.
+
+.DESCRIPTION
+    Troubleshoots errors like 1225 / 26 / 40 / 53 ("network-related or instance-specific
+    error", "remote computer refused the network connection").
+    Checks: installed instances, SQL + Browser services, TCP/IP + Named Pipes state,
+    static/dynamic port, what sqlservr.exe is actually listening on, firewall rules,
+    and test connections using several server-name formats.
+    -Fix: starts services, enables TCP/IP on a static port, sets Browser to Automatic,
+    adds firewall rules, restarts the instance.
+    Report saved to C:\temp. Generic - no client/machine-specific values.
+
+.EXAMPLE
+    .\Test-SQLConnectivity.ps1
+.EXAMPLE
+    .\Test-SQLConnectivity.ps1 -InstanceName SQLEXPRESS -Fix -TcpPort 1433
+#>
+[CmdletBinding()]
+param(
+    [string]$InstanceName,          # default: every instance found
+    [switch]$Fix,
+    [int]$TcpPort = 1433,
+    [string]$OutDir = 'C:\temp'
+)
+
+$ErrorActionPreference = 'Continue'
+New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+$report = Join-Path $OutDir ("SQLConnectivity_{0:yyyyMMdd_HHmmss}.txt" -f (Get-Date))
+Start-Transcript -Path $report | Out-Null
+
+function H($m)   { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
+function OK($m)  { Write-Host "  [OK]   $m" -ForegroundColor Green }
+function BAD($m) { Write-Host "  [FAIL] $m" -ForegroundColor Red;    $script:issues += $m }
+function INF($m) { Write-Host "  [i]    $m" -ForegroundColor Gray }
+$script:issues = @()
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+           [Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($Fix -and -not $isAdmin) { Write-Host "-Fix requires an elevated PowerShell." -ForegroundColor Red; Stop-Transcript | Out-Null; exit 1 }
+
+# ---------- Instances ----------
+H "Installed SQL Server instances"
+$instKey = 'HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\Instance Names\SQL'
+$instProps = Get-ItemProperty -Path $instKey -ErrorAction SilentlyContinue
+if (-not $instProps) { BAD "No SQL Server instances found on this machine."; Stop-Transcript | Out-Null; exit 1 }
+$instances = $instProps.PSObject.Properties | Where-Object { $_.Name -notlike 'PS*' } |
+             ForEach-Object { [pscustomobject]@{ Name = $_.Name; Id = $_.Value } }
+$instances | ForEach-Object { INF "$($_.Name)  ($($_.Id))" }
+if ($InstanceName) {
+    $instances = $instances | Where-Object Name -eq $InstanceName
+    if (-not $instances) { BAD "Instance '$InstanceName' is not installed. Use one of the names above."; Stop-Transcript | Out-Null; exit 1 }
+}
+if (-not ($instances.Name -contains 'MSSQLSERVER')) {
+    INF "No DEFAULT instance - connecting to just 'localhost' or '.' will be REFUSED (error 1225). Use COMPUTER\INSTANCE."
+}
+
+# ---------- SQL Browser ----------
+H "SQL Server Browser"
+$br = Get-Service SQLBrowser -ErrorAction SilentlyContinue
+if (-not $br) { BAD "SQL Browser service not installed." }
+else {
+    if ($br.Status -eq 'Running') { OK "Running ($($br.StartType))" } else { BAD "SQL Browser is $($br.Status) / $($br.StartType) - named instances can't be found remotely." }
+    if ($Fix -and $br.Status -ne 'Running') { Set-Service SQLBrowser -StartupType Automatic; Start-Service SQLBrowser; OK "Fixed: Browser set Automatic + started" }
+}
+
+foreach ($i in $instances) {
+    $svcName = if ($i.Name -eq 'MSSQLSERVER') { 'MSSQLSERVER' } else { "MSSQL`$$($i.Name)" }
+    $root    = "HKLM:\SOFTWARE\Microsoft\Microsoft SQL Server\$($i.Id)\MSSQLServer\SuperSocketNetLib"
+    $restart = $false
+
+    # ---------- Service ----------
+    H "Instance $($i.Name) - service"
+    $svc = Get-Service $svcName -ErrorAction SilentlyContinue
+    if ($svc.Status -eq 'Running') { OK "$svcName running ($($svc.StartType))" }
+    else {
+        BAD "$svcName is $($svc.Status)"
+        if ($Fix) { Set-Service $svcName -StartupType Automatic; Start-Service $svcName; OK "Fixed: started $svcName" }
+    }
+
+    # ---------- Protocols ----------
+    H "Instance $($i.Name) - protocols"
+    $tcp   = Get-ItemProperty "$root\Tcp" -ErrorAction SilentlyContinue
+    $ipAll = Get-ItemProperty "$root\Tcp\IPAll" -ErrorAction SilentlyContinue
+    $np    = Get-ItemProperty "$root\Np" -ErrorAction SilentlyContinue
+    $sm    = Get-ItemProperty "$root\Sm" -ErrorAction SilentlyContinue
+    INF "Shared Memory: $(if($sm.Enabled){'Enabled'}else{'Disabled'})   Named Pipes: $(if($np.Enabled){'Enabled'}else{'Disabled'})"
+    if ($tcp.Enabled -eq 1) { OK "TCP/IP enabled" } else {
+        BAD "TCP/IP is DISABLED - only local shared-memory connections work."
+        if ($Fix) { Set-ItemProperty "$root\Tcp" -Name Enabled -Value 1; $restart = $true; OK "Fixed: TCP/IP enabled" }
+    }
+    INF "IPAll static port: '$($ipAll.TcpPort)'   dynamic port: '$($ipAll.TcpDynamicPorts)'"
+    if (-not $ipAll.TcpPort) {
+        INF "Using a DYNAMIC port - remote clients rely on SQL Browser (UDP 1434)."
+        if ($Fix) {
+            Set-ItemProperty "$root\Tcp\IPAll" -Name TcpDynamicPorts -Value ''
+            Set-ItemProperty "$root\Tcp\IPAll" -Name TcpPort -Value "$TcpPort"
+            $restart = $true; OK "Fixed: static port $TcpPort"
+        }
+    }
+
+    if ($restart) { Restart-Service $svcName -Force; Start-Sleep 3; OK "Restarted $svcName" }
+
+    # ---------- Listening ports ----------
+    H "Instance $($i.Name) - listening ports"
+    $svcPid = (Get-CimInstance Win32_Service -Filter "Name='$svcName'").ProcessId
+    if ($svcPid) {
+        $listen = Get-NetTCPConnection -State Listen -OwningProcess $svcPid -ErrorAction SilentlyContinue |
+                  Select-Object LocalAddress, LocalPort -Unique
+        if ($listen) { $listen | ForEach-Object { OK "Listening on $($_.LocalAddress):$($_.LocalPort)" } }
+        else { BAD "sqlservr.exe (PID $svcPid) is not listening on any TCP port." }
+        $ports = $listen.LocalPort | Select-Object -Unique
+    } else { BAD "No process for $svcName - service not running."; $ports = @() }
+
+    # ---------- Firewall ----------
+    H "Instance $($i.Name) - Windows Firewall"
+    $fwProfiles = Get-NetFirewallProfile | Where-Object Enabled
+    INF "Firewall enabled on: $(( $fwProfiles.Name ) -join ', ')"
+    foreach ($p in ($ports + 1434 | Select-Object -Unique)) {
+        $proto = if ($p -eq 1434) { 'UDP' } else { 'TCP' }
+        $rule = Get-NetFirewallPortFilter -Protocol $proto -ErrorAction SilentlyContinue |
+                Where-Object { $_.LocalPort -eq "$p" } | Get-NetFirewallRule -ErrorAction SilentlyContinue |
+                Where-Object { $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' -and $_.Action -eq 'Allow' }
+        if ($rule) { OK "$proto $p allowed ($($rule[0].DisplayName))" }
+        else {
+            BAD "No inbound allow rule for $proto $p"
+            if ($Fix) {
+                New-NetFirewallRule -DisplayName "SQL Server $proto $p" -Direction Inbound -Action Allow `
+                    -Protocol $proto -LocalPort $p -Profile Domain,Private | Out-Null
+                OK "Fixed: added firewall rule $proto $p"
+            }
+        }
+    }
+
+    # ---------- Test connections ----------
+    H "Instance $($i.Name) - test connections"
+    $suffix  = if ($i.Name -eq 'MSSQLSERVER') { '' } else { "\$($i.Name)" }
+    $targets = @(".$suffix", "localhost$suffix", "$env:COMPUTERNAME$suffix")
+    if ($ports) { $targets += "tcp:$env:COMPUTERNAME,$($ports[0])" }
+    if ($i.Name -ne 'MSSQLSERVER') { $targets += 'localhost  (default instance - expected to FAIL)' }
+    foreach ($t in $targets) {
+        $ds = ($t -split '\s')[0]
+        $conn = New-Object System.Data.SqlClient.SqlConnection "Data Source=$ds;Integrated Security=True;Connect Timeout=5"
+        try   { $conn.Open(); OK "$t  -> connected ($($conn.ServerVersion))" }
+        catch { $msg = $_.Exception.InnerException.Message; if (-not $msg) { $msg = $_.Exception.Message }
+                if ($t -like '*expected*') { INF "$t -> failed as expected" } else { BAD "$t -> $($msg.Split("`n")[0])" } }
+        finally { $conn.Dispose() }
+    }
+    INF "Use from SSMS/apps:  $env:COMPUTERNAME$suffix   (or $env:COMPUTERNAME,<port> if Browser is blocked)"
+}
+
+# ---------- Summary ----------
+H "Summary"
+if ($script:issues.Count -eq 0) { OK "No problems found." }
+else {
+    $script:issues | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+    if (-not $Fix) { Write-Host "`nRe-run elevated with -Fix to correct service/protocol/port/firewall issues." -ForegroundColor Yellow }
+}
+Stop-Transcript | Out-Null
+Write-Host "`nReport: $report" -ForegroundColor Green
 '@
 
 # ======================= data/all-checks.json =======================
