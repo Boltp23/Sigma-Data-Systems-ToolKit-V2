@@ -2,7 +2,7 @@
 
 *Prepared by [Sigma Data Systems Inc.](https://sigmadatainc.com/)*
 
-<!-- AUTO-VERSION -->**Current version: v2.0** | 134 options | updated 2026-10-06<!-- /AUTO-VERSION -->
+<!-- AUTO-VERSION -->**Current version: v2.0** | 134 options | updated 2026-10-07<!-- /AUTO-VERSION -->
 
 ```
   _____ _____ _____ __  __            _____       _______
@@ -110,7 +110,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 ## All options
 
 <!-- AUTO-OPTIONS:START -->
-<details><summary><b>Quick index of all 134 options</b> (auto-generated from the script, 2026-10-06)</summary>
+<details><summary><b>Quick index of all 134 options</b> (auto-generated from the script, 2026-10-07)</summary>
 
 **A. SYSTEM HEALTH**
 
@@ -261,7 +261,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 109. M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe
 110. M365: unified audit log search (user / operation / IP, up to 180 days)
 111. M365: sign-in log for a user (IPs, countries, legacy protocols)
-112. M365: MFA registration report (admins without MFA flagged)
+112. M365: MFA report (registered methods, enforcement, per-user state; no P1 needed)
 113. M365: stale / never-used / guest / disabled-but-licensed accounts
 114. M365: admin role members (Global Admin count check)
 115. M365: license report (subscriptions, who has what, wasted licenses)

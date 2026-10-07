@@ -3944,7 +3944,7 @@ $Script:Menu = @(
     @{               Text = 'M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe';    Action = { Invoke-M365Simple 'Mobile devices' 'MobileDevices' -AskUser } }
     @{               Text = 'M365: unified audit log search (user / operation / IP, up to 180 days)';          Action = { Invoke-M365 'AuditSearch' } }
     @{               Text = 'M365: sign-in log for a user (IPs, countries, legacy protocols)';                 Action = { Invoke-M365Simple 'Sign-ins' 'SignIns' -AskUser } }
-    @{               Text = 'M365: MFA registration report (admins without MFA flagged)';                      Action = { Invoke-M365 'MfaReport' } }
+    @{               Text = 'M365: MFA report (registered methods, enforcement, per-user state; no P1 needed)'; Action = { Invoke-M365 'MfaReport' } }
     @{               Text = 'M365: stale / never-used / guest / disabled-but-licensed accounts';               Action = { Invoke-M365 'StaleAccounts' } }
     @{               Text = 'M365: admin role members (Global Admin count check)';                            Action = { Invoke-M365 'AdminRoles' } }
     @{               Text = 'M365: license report (subscriptions, who has what, wasted licenses)';             Action = { Invoke-M365 'LicenseReport' } }
@@ -16498,23 +16498,55 @@ switch ($Action) {
 
 # ======================================================================== GRAPH: IDENTITY REPORTS
 'MfaReport' {
-    Connect-Graph @('AuditLog.Read.All', 'UserAuthenticationMethod.Read.All', 'User.Read.All')
+    Connect-Graph @('AuditLog.Read.All', 'UserAuthenticationMethod.Read.All', 'User.Read.All', 'Policy.Read.All', 'RoleManagement.Read.Directory')
+
+    # --- What is ENFORCING MFA? (the legacy per-user MFA page only shows per-user state, so CA / Security Defaults users look 'Disabled' there)
+    Write-H 'MFA enforcement in this tenant'
+    try {
+        $sd = Invoke-Graph 'v1.0/policies/identitySecurityDefaultsEnforcementPolicy' -NoPaging | Select-Object -First 1
+        Write-Host "  Security Defaults : $(if ($sd.isEnabled) { 'ENABLED (all users must register / use MFA)' } else { 'disabled' })" -ForegroundColor $(if ($sd.isEnabled) { 'Green' } else { 'Yellow' })
+    } catch { Write-Host "  Security Defaults : could not read ($($_.Exception.Message))" -ForegroundColor DarkGray }
+    try {
+        $ca = @(Invoke-Graph 'v1.0/identity/conditionalAccess/policies' | Where-Object { $_.grantControls.builtInControls -contains 'mfa' -or $_.grantControls.authenticationStrength })
+        if ($ca) { $ca | ForEach-Object { Write-Host "  CA policy (MFA)   : $($_.displayName) [$($_.state)]" -ForegroundColor $(if ($_.state -eq 'enabled') { 'Green' } else { 'DarkYellow' }) } }
+        else { Write-Host '  CA policy (MFA)   : none found' -ForegroundColor Yellow }
+    } catch { Write-Host '  CA policy (MFA)   : not readable (Conditional Access needs Entra ID P1)' -ForegroundColor DarkGray }
+
+    # --- Admins (directory role members) - works without P1
+    $adminIds = @{}
+    try { Invoke-Graph 'v1.0/directoryRoles?$expand=members' | ForEach-Object { foreach ($m in $_.members) { $adminIds[$m.id] = $true } } } catch { }
+
+    # --- Per-user registration. P1 report first, free per-user lookup as fallback.
     Write-H 'MFA registration'
     try {
         $rows = Invoke-Graph 'v1.0/reports/authenticationMethods/userRegistrationDetails' | ForEach-Object {
-            [pscustomobject]@{ UPN = $_.userPrincipalName; Name = $_.userDisplayName; Admin = $_.isAdmin; MfaRegistered = $_.isMfaRegistered; MfaCapable = $_.isMfaCapable; Passwordless = $_.isPasswordlessCapable; Methods = ($_.methodsRegistered -join ', '); Default = $_.userPreferredMethodForSecondaryAuthentication }
+            [pscustomobject]@{ Id = $_.id; UPN = $_.userPrincipalName; Name = $_.userDisplayName; Admin = ($_.isAdmin -or $adminIds.ContainsKey($_.id)); MfaRegistered = $_.isMfaRegistered; MfaCapable = $_.isMfaCapable; Passwordless = $_.isPasswordlessCapable; Methods = ($_.methodsRegistered -join ', '); Default = $_.userPreferredMethodForSecondaryAuthentication; PerUserMfa = $null }
         }
     } catch {
-        Write-Host '  Registration report needs Entra ID P1 - falling back to per-user method lookup (slower).' -ForegroundColor DarkGray
+        Write-Host '  Registration report needs Entra ID P1 - using per-user method lookup instead (free, slower).' -ForegroundColor DarkGray
         $rows = Invoke-Graph "v1.0/users?`$select=id,userPrincipalName,displayName,accountEnabled,userType&`$top=999" | Where-Object { $_.accountEnabled -and $_.userType -eq 'Member' } | ForEach-Object {
-            $m = @(Invoke-Graph "v1.0/users/$($_.id)/authentication/methods" | ForEach-Object { $_.'@odata.type' -replace '#microsoft.graph.|AuthenticationMethod', '' } | Where-Object { $_ -ne 'password' })
-            [pscustomobject]@{ UPN = $_.userPrincipalName; Name = $_.displayName; Admin = $null; MfaRegistered = ($m.Count -gt 0); MfaCapable = ($m.Count -gt 0); Passwordless = $null; Methods = ($m -join ', '); Default = $null }
+            $m = @(Invoke-Graph "v1.0/users/$($_.id)/authentication/methods" | ForEach-Object { $_.'@odata.type' -replace '#microsoft.graph.|AuthenticationMethod', '' } | Where-Object { $_ -notin @('password', 'email') })
+            [pscustomobject]@{ Id = $_.id; UPN = $_.userPrincipalName; Name = $_.displayName; Admin = $adminIds.ContainsKey($_.id); MfaRegistered = ($m.Count -gt 0); MfaCapable = ($m.Count -gt 0); Passwordless = $null; Methods = ($m -join ', '); Default = $null; PerUserMfa = $null }
         }
     }
+
+    # --- Legacy per-user MFA state (what the old 'Multi-factor authentication' page shows)
+    $i = 0; $total = @($rows).Count
+    foreach ($r in $rows) {
+        $i++; Write-Progress -Activity 'Per-user MFA state' -Status $r.UPN -PercentComplete ([int](100 * $i / [math]::Max($total, 1)))
+        try { $r.PerUserMfa = (Invoke-Graph "beta/users/$($r.Id)/authentication/requirements" -NoPaging | Select-Object -First 1).perUserMfaState } catch { $r.PerUserMfa = 'n/a' }
+        if (-not $r.Default -or $r.Default -eq 'none') {
+            try { $r.Default = (Invoke-Graph "beta/users/$($r.Id)/authentication/signInPreferences" -NoPaging | Select-Object -First 1).userPreferredMethodForSecondaryAuthentication } catch { }
+        }
+    }
+    Write-Progress -Activity 'Per-user MFA state' -Completed
+
+    $rows = @($rows | Select-Object UPN, Name, Admin, MfaRegistered, MfaCapable, Passwordless, Methods, Default, PerUserMfa)
     $no = @($rows | Where-Object { -not $_.MfaRegistered })
-    $rows | Sort-Object MfaRegistered, UPN | Format-Table UPN, Admin, MfaRegistered, Methods -AutoSize -Wrap
-    Write-Host "  $($no.Count) of $(@($rows).Count) users have NO MFA method registered." -ForegroundColor $(if ($no) { 'Yellow' } else { 'Green' })
+    $rows | Sort-Object MfaRegistered, UPN | Format-Table UPN, Admin, MfaRegistered, Methods, PerUserMfa -AutoSize -Wrap
+    Write-Host "  $($no.Count) of $($rows.Count) users have NO MFA method registered." -ForegroundColor $(if ($no) { 'Yellow' } else { 'Green' })
     $adm = @($no | Where-Object Admin); if ($adm) { Write-Host "  ADMINS WITHOUT MFA: $($adm.UPN -join ', ')" -ForegroundColor Red }
+    Write-Host '  NOTE: PerUserMfa = legacy per-user setting only. "disabled" is normal when Security Defaults or Conditional Access enforce MFA.' -ForegroundColor DarkGray
     Save-Csv $rows 'MfaRegistration' | Out-Null
 }
 
