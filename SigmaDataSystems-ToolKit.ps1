@@ -187,6 +187,20 @@ function ConvertTo-PSLiteral($Value) {
     return "'" + ("$Value" -replace "'", "''") + "'"
 }
 
+function Invoke-SmtpRelayRaw {
+    Write-Title 'SMTP relay / plus-address test - full SMTP conversation (copier / scan-to-email)'
+    Write-Host '  Talks raw SMTP to the MX endpoint the way a copier does (port 25, no auth, optional STARTTLS)'
+    Write-Host '  and prints every server reply. Supports plus addresses (mailbox+tag@domain) for scan routing.'
+    $to = Read-Default 'Recipient to test (e.g. scans+test@domain.com)' ''
+    if (-not $to) { return }
+    $dom = $to.Split('@')[-1]
+    $from = Read-Default 'Sender address (match the copier''s From address)' "scanner@$dom"
+    $server = Read-Default 'SMTP server (blank = look up the domain''s MX)' ''
+    $port = Read-Int 'Port' 25
+    $tls = Read-YesNo 'Use STARTTLS? (copier "Use Secure Connection" = On)' $false
+    Invoke-Tool 'Test-SmtpRelay' ([ordered]@{ To = $to; From = $from; SmtpServer = $server; Port = $port; StartTls = $tls; OutputFolder = (Get-OutDir 'SMTP') }) | Out-Null
+}
+
 <#
     Runs an embedded tool in a separate Windows PowerShell process (same console,
     so its prompts and colors still work). $Params is an ordered hashtable:
@@ -3921,6 +3935,7 @@ $Script:Menu = @(
     @{               Text = 'Wi-Fi live monitor (signal / roams / channel changes / drops / lag over time)';    Action = { Invoke-WifiMonitor } }
     @{ Test='safe'; Text = 'Network connections & listening ports by process';                              Action = { Invoke-TcpConnections } }
     @{ Test='safe'; Text = 'SMTP / scan-to-email relay test + SPF/DMARC/MX lookup';                         Action = { Invoke-SmtpTest } }
+    @{               Text = 'SMTP relay / plus-address test - full SMTP conversation (copier, port 25, no auth)'; Action = { Invoke-SmtpRelayRaw } }
     @{               Text = 'Email DNS auth check: SPF / DKIM / DMARC / MX + change history & alerts';   Action = { Invoke-EmailAuthDnsCheck } }
     @{               Text = '[!] Network quick fixes (flush DNS / renew / Winsock + TCP/IP reset)';          Action = { Invoke-NetworkReset } }
     @{ Test='safe'; Text = 'DHCP Event 1059 / DC authorization diagnostics';                                Action = { Invoke-Dhcp1059 } }
@@ -22624,6 +22639,253 @@ try {
     foreach ($p in $pingers.Values) { $p.Dispose() }
     Write-Out "`n  Stopped. Building summary..." 'Cyan'
     Write-Summary $LogPath
+}
+'@
+
+# ======================= Test-SmtpRelay.ps1 =======================
+$Script:Payloads['Test-SmtpRelay'] = @'
+<#
+.SYNOPSIS
+    SMTP Relay / Plus-Address Test - Sigma Data Systems Inc.
+
+.DESCRIPTION
+    Tests an Exchange Online connector-based (IP) relay exactly the way a copier/scanner
+    uses it: raw SMTP to the MX endpoint on port 25, NO authentication, optional STARTTLS.
+
+    - Resolves the recipient domain's MX (or uses the server you give it)
+    - Shows this site's public IP (must match the inbound connector) and the domain's SPF
+    - Walks the full SMTP conversation and prints every server response
+    - Sends a test message to the address you enter - supports plus addressing
+      (e.g. mailbox+tag@domain) for testing scan-routing setups
+    - Explains the most common failure codes
+    - Writes a log to C:\temp
+
+    No client-specific values are stored in this script.
+
+.EXAMPLE
+    .\Test-SmtpRelay.ps1
+    (prompts for everything)
+
+.EXAMPLE
+    .\Test-SmtpRelay.ps1 -To "mailbox+test@example.com" -From "scanner@example.com" -StartTls
+
+.NOTES
+    Prepared by Sigma Data Systems Inc.
+#>
+[CmdletBinding()]
+param(
+    [string]$To,
+    [string]$From,
+    [string]$SmtpServer,
+    [int]$Port = 25,
+    [switch]$StartTls,
+    [string]$OutputFolder = 'C:\temp'
+)
+
+$ErrorActionPreference = 'Stop'
+
+if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
+$logFile = Join-Path $OutputFolder ("SMTPRelayTest_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+Start-Transcript -Path $logFile -Force | Out-Null
+
+Write-Host ""
+Write-Host "=== SMTP Relay / Plus-Address Test ===" -ForegroundColor Cyan
+Write-Host "    Sigma Data Systems Inc." -ForegroundColor DarkCyan
+Write-Host ""
+
+# ---------- Inputs ----------
+if (-not $To) { $To = Read-Host "Recipient address to test (e.g. mailbox+test@domain.com)" }
+$To = $To.Trim()
+if ($To -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { Write-Host "Invalid recipient address." -ForegroundColor Red; Stop-Transcript | Out-Null; return }
+$domain = $To.Split('@')[1]
+
+if (-not $From) {
+    $defaultFrom = "scanner@$domain"
+    $From = Read-Host "Sender address (Enter for $defaultFrom)"
+    if (-not $From) { $From = $defaultFrom }
+}
+$From = $From.Trim()
+
+if (-not $PSBoundParameters.ContainsKey('StartTls')) {
+    $ans = Read-Host "Use STARTTLS? (matches the device's 'Use Secure Connection' setting) [y/N]"
+    $StartTls = [bool]($ans -match '^[Yy]')
+}
+
+if ($To -match '\+') {
+    $local = $To.Split('@')[0]
+    Write-Host ("Plus address detected: mailbox '{0}', tag '{1}'" -f $local.Split('+')[0], $local.Split('+',2)[1]) -ForegroundColor Gray
+}
+
+# ---------- MX / server ----------
+if (-not $SmtpServer) {
+    try {
+        $mx = Resolve-DnsName -Name $domain -Type MX -ErrorAction Stop |
+              Where-Object { $_.Type -eq 'MX' } | Sort-Object Preference | Select-Object -First 1
+        $SmtpServer = $mx.NameExchange
+        Write-Host "MX for $domain : $SmtpServer" -ForegroundColor Gray
+    } catch {
+        $SmtpServer = ($domain -replace '\.', '-') + '.mail.protection.outlook.com'
+        Write-Host "MX lookup failed - falling back to $SmtpServer" -ForegroundColor Yellow
+    }
+}
+if ($SmtpServer -notlike '*.mail.protection.outlook.com') {
+    Write-Host "Note: $SmtpServer is not an Exchange Online endpoint (mail may route through a third-party gateway)." -ForegroundColor Yellow
+}
+
+# ---------- Public IP / SPF ----------
+$publicIp = $null
+try { $publicIp = (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 8).ToString().Trim() } catch { }
+if ($publicIp) { Write-Host "This site's public IP: $publicIp  (must match the inbound connector)" -ForegroundColor Gray }
+else { Write-Host "Could not determine public IP." -ForegroundColor Yellow }
+
+try {
+    $spf = (Resolve-DnsName -Name $domain -Type TXT -ErrorAction Stop |
+            Where-Object { $_.Strings -join '' -like 'v=spf1*' } | Select-Object -First 1).Strings -join ''
+    if ($spf) {
+        Write-Host "SPF: $spf" -ForegroundColor Gray
+        if ($publicIp -and $spf -notmatch [regex]::Escape($publicIp)) {
+            Write-Host "  (Public IP not listed literally in SPF - fine with a connector, but scans may be flagged if the connector isn't matching.)" -ForegroundColor DarkYellow
+        }
+    }
+} catch { }
+
+# ---------- SMTP helpers ----------
+function Read-SmtpResponse {
+    param($Reader)
+    $lines = @()
+    do {
+        $line = $Reader.ReadLine()
+        if ($null -eq $line) { throw "Connection closed by server." }
+        $lines += $line
+        Write-Host "  S: $line" -ForegroundColor DarkGray
+    } while ($line.Length -ge 4 -and $line[3] -eq '-')
+    [pscustomobject]@{ Code = [int]$lines[-1].Substring(0,3); Lines = $lines; Text = ($lines -join ' ') }
+}
+
+function Invoke-SmtpCommand {
+    param($Writer, $Reader, [string]$Command, [int[]]$Expect, [string]$Display)
+    if (-not $Display) { $Display = $Command }
+    Write-Host "  C: $Display" -ForegroundColor White
+    $Writer.WriteLine($Command)
+    $r = Read-SmtpResponse $Reader
+    if ($Expect -notcontains $r.Code) { throw [System.Exception]::new("SMTP|$($r.Code)|$($r.Text)") }
+    $r
+}
+
+function Show-Hint {
+    param([string]$Text)
+    Write-Host ""
+    Write-Host "Likely cause:" -ForegroundColor Yellow
+    switch -Regex ($Text) {
+        '5\.7\.64|TenantAttribution|Relay Access Denied' { Write-Host "  Exchange Online did not match this public IP to an inbound connector. Check the connector's IP list matches $publicIp."; break }
+        '5\.7\.1|5\.7\.606|5\.7\.708|5\.7\.750' { Write-Host "  Message rejected by policy (relay not permitted, IP reputation, or tenant send restriction). Check connector + message trace."; break }
+        '5\.1\.10|5\.1\.1|RecipientNotFound' { Write-Host "  Recipient not found. Check the mailbox exists. If using a plus address, check plus addressing is enabled: Get-OrganizationConfig | fl *PlusAddress*"; break }
+        '5\.7\.57|5\.7\.3' { Write-Host "  Server expected authentication - you may be hitting smtp.office365.com instead of the MX endpoint."; break }
+        '4\.\d\.\d' { Write-Host "  Temporary failure - retry; if it persists check message trace and service health."; break }
+        default { Write-Host "  See the server response above." }
+    }
+}
+
+# ---------- Conversation ----------
+$client = $null
+$ok = $false
+try {
+    Write-Host ""
+    Write-Host "Connecting to ${SmtpServer}:$Port ..." -ForegroundColor Cyan
+    $client = New-Object System.Net.Sockets.TcpClient
+    if (-not $client.ConnectAsync($SmtpServer, $Port).Wait(10000)) {
+        throw [System.Exception]::new("CONNECT|Timed out connecting to ${SmtpServer}:$Port")
+    }
+    $stream = $client.GetStream()
+    $stream.ReadTimeout = 20000; $stream.WriteTimeout = 20000
+
+    $enc = [System.Text.Encoding]::ASCII
+    $reader = New-Object System.IO.StreamReader($stream, $enc)
+    $writer = New-Object System.IO.StreamWriter($stream, $enc); $writer.NewLine = "`r`n"; $writer.AutoFlush = $true
+
+    $banner = Read-SmtpResponse $reader
+    if ($banner.Code -ne 220) { throw [System.Exception]::new("SMTP|$($banner.Code)|$($banner.Text)") }
+
+    $helo = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [System.Net.Dns]::GetHostName() }
+    $ehlo = Invoke-SmtpCommand $writer $reader "EHLO $helo" 250
+
+    if ($StartTls) {
+        if ($ehlo.Text -notmatch 'STARTTLS') { Write-Host "Server did not advertise STARTTLS." -ForegroundColor Yellow }
+        Invoke-SmtpCommand $writer $reader "STARTTLS" 220 | Out-Null
+        $ssl = New-Object System.Net.Security.SslStream($stream, $false)
+        $ssl.AuthenticateAsClient($SmtpServer, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false)
+        Write-Host ("  TLS negotiated: {0} / {1}" -f $ssl.SslProtocol, $ssl.CipherAlgorithm) -ForegroundColor Green
+        $reader = New-Object System.IO.StreamReader($ssl, $enc)
+        $writer = New-Object System.IO.StreamWriter($ssl, $enc); $writer.NewLine = "`r`n"; $writer.AutoFlush = $true
+        Invoke-SmtpCommand $writer $reader "EHLO $helo" 250 | Out-Null
+    }
+
+    Invoke-SmtpCommand $writer $reader "MAIL FROM:<$From>" 250 | Out-Null
+    Invoke-SmtpCommand $writer $reader "RCPT TO:<$To>" 250,251 | Out-Null
+    Invoke-SmtpCommand $writer $reader "DATA" 354 | Out-Null
+
+    $now = Get-Date
+    $msgId = "<{0}@{1}>" -f ([guid]::NewGuid().ToString('N')), $From.Split('@')[1]
+    $subject = "SMTP Relay Test $($now.ToString('yyyy-MM-dd HH:mm:ss'))"
+    $message = @(
+        "From: <$From>"
+        "To: <$To>"
+        "Subject: $subject"
+        "Date: $($now.ToUniversalTime().ToString('r'))"
+        "Message-ID: $msgId"
+        "MIME-Version: 1.0"
+        "Content-Type: text/plain; charset=us-ascii"
+        ""
+        "SMTP relay test sent from $env:COMPUTERNAME."
+        "Server: ${SmtpServer}:$Port   STARTTLS: $StartTls"
+        "Public IP: $publicIp"
+        "Recipient: $To"
+        ""
+        "Prepared by Sigma Data Systems Inc."
+    ) -join "`r`n"
+    $writer.Write($message + "`r`n.`r`n")
+    Write-Host "  C: <message body sent>" -ForegroundColor White
+    $dataResp = Read-SmtpResponse $reader
+    if ($dataResp.Code -ne 250) { throw [System.Exception]::new("SMTP|$($dataResp.Code)|$($dataResp.Text)") }
+
+    try { Invoke-SmtpCommand $writer $reader "QUIT" 221 | Out-Null } catch { }
+    $ok = $true
+
+    Write-Host ""
+    Write-Host "RESULT: PASS - message accepted and queued." -ForegroundColor Green
+    Write-Host "  Subject:    $subject"
+    Write-Host "  Message-ID: $msgId"
+    Write-Host ""
+    Write-Host "Next:" -ForegroundColor Cyan
+    Write-Host "  1. Confirm it landed in the target mailbox."
+    if ($To -match '\+') { Write-Host "  2. Open it and check the To: line still shows $To (that's what the routing flow reads)." }
+    Write-Host "  3. If it doesn't arrive: Exchange admin center > Mail flow > Message trace, search by subject above."
+}
+catch {
+    $msg = $_.Exception.Message
+    if ($_.Exception.InnerException) { $msg = $_.Exception.InnerException.Message }
+    Write-Host ""
+    if ($msg -like 'SMTP|*') {
+        $parts = $msg.Split('|', 3)
+        Write-Host "RESULT: FAIL - server returned $($parts[1])" -ForegroundColor Red
+        Write-Host "  $($parts[2])"
+        Show-Hint $parts[2]
+    } elseif ($msg -like 'CONNECT|*' -or $msg -match 'actively refused|did not properly respond|No such host|timed out') {
+        Write-Host "RESULT: FAIL - could not connect to ${SmtpServer}:$Port" -ForegroundColor Red
+        Write-Host "  $($msg -replace '^CONNECT\|','')"
+        Write-Host ""
+        Write-Host "Likely cause:" -ForegroundColor Yellow
+        Write-Host "  Outbound port $Port blocked by the ISP or firewall, or DNS can't resolve the server."
+    } else {
+        Write-Host "RESULT: FAIL - $msg" -ForegroundColor Red
+        if ($StartTls) { Write-Host "  (If this failed during TLS, re-run without STARTTLS to compare.)" -ForegroundColor Yellow }
+    }
+}
+finally {
+    if ($client) { $client.Close() }
+    Write-Host ""
+    Write-Host "Log saved: $logFile" -ForegroundColor Gray
+    Stop-Transcript | Out-Null
 }
 '@
 #endregion
