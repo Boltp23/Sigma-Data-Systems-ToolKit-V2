@@ -33,7 +33,7 @@
     report to C:\temp\SelfTest. Add -IncludeSlow and/or -IncludeDownloads for full coverage.
 
 .NOTES
-    v2.0 - adds: section menu, self-test, security posture, hardware/SMART, reliability, perf,
+    v2.0 - adds: internet drop monitor (PingInfo-style, LAN / gateway / WAN-ISP diagnosis), section menu, self-test, security posture, hardware/SMART, reliability, perf,
     boot performance, pending-reboot detail, Windows Update list/install, SFC/DISM, AD/DC health,
     backup/VSS health, shares/open files, advanced network (MTU/tracert/proxy/Wi-Fi), server roles,
     quick fixes (spooler, network, Teams, Office, OneDrive + OneDrive won't-start diagnostics), software deployment (Ninite, vendor
@@ -644,6 +644,68 @@ function Invoke-ReachabilityTest {
             Start-Sleep -Milliseconds 250
         }
     }
+}
+
+function Invoke-InternetDropMonitor {
+    Write-Title 'Internet drop monitor (PingInfo) - log drops and show WHERE they happen (LAN / gateway / WAN-ISP)'
+    Write-Host '  Pings the default gateway, any devices you add (switch, AP, server) and public hosts, logs every sample,' -ForegroundColor DarkGray
+    Write-Host '  then summarizes each drop window. Run it on a PC on the affected LAN.' -ForegroundColor DarkGray
+    $task = 'SDSI - Internet Drop Monitor'
+    $dir  = Get-OutDir 'Network\InternetDropMonitor'
+    Write-Host ''
+    Write-Host '  1. Watch live in this window (press Q to stop)'
+    Write-Host '  2. [!] Run in the background as a scheduled task (keeps logging when you log off)'
+    Write-Host '  3. Summarize an existing log'
+    Write-Host '  4. [!] Stop / remove the background task'
+    $mode = Read-Default 'Choice' '1'
+    switch ($mode) {
+        '3' {
+            $logs = @(Get-ChildItem -Path $dir -Filter 'DropMonitor_*.csv' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+            if (-not $logs) { Write-Host "  No logs in $dir." -ForegroundColor Yellow; return }
+            for ($i = 0; $i -lt [math]::Min(10, $logs.Count); $i++) { Write-Host ("  {0}. {1}  ({2:g})" -f ($i + 1), $logs[$i].Name, $logs[$i].LastWriteTime) }
+            $n = Read-Int 'Which log' 1
+            if ($n -lt 1 -or $n -gt $logs.Count) { return }
+            Invoke-Tool 'Start-InternetDropMonitor' ([ordered]@{ ReportOnly = $true; LogPath = $logs[$n - 1].FullName }) | Out-Null
+            return
+        }
+        '4' {
+            if (-not (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue)) { Write-Host '  No background monitor task found.' -ForegroundColor Yellow; return }
+            if (Confirm-Change "Stop and remove the '$task' scheduled task (logs are kept).") {
+                Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName $task -Confirm:$false
+                Write-Host "  Removed. Logs: $dir  (use option 3 to summarize)" -ForegroundColor Green
+            }
+            return
+        }
+    }
+
+    $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
+           Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1).NextHop
+    $gw   = Read-Default 'Gateway / firewall IP (none = skip)' $(if ($gw) { $gw } else { 'none' })
+    Write-Host '  Extra devices to watch, e.g.  10.0.0.2=Core switch, 10.0.0.20=AP lobby' -ForegroundColor DarkGray
+    $devs = @(Read-List 'Devices (IP or IP=Label, comma separated, blank = none)' '')
+    $inet = @(Read-List 'Internet hosts' '8.8.8.8,1.1.1.1')
+    $int  = Read-Int 'Seconds between samples' 5
+    $p = [ordered]@{ Gateway = $gw; Targets = $devs; InternetTargets = $inet; IntervalSeconds = $int; OutputDir = $dir }
+
+    if ($mode -eq '2') {
+        $hrs = Read-Int 'Hours to keep monitoring' 24
+        if (-not (Confirm-Change "Create scheduled task '$task' (runs as SYSTEM for $hrs h, logs to $dir).")) { return }
+        $script = Save-Payload 'Start-InternetDropMonitor' $dir
+        $argText = "-NoProfile -ExecutionPolicy Bypass -File `"$script`" -Background -DurationMinutes $($hrs * 60) -IntervalSeconds $int -OutputDir `"$dir`" -Gateway `"$gw`""
+        if ($devs) { $argText += ' -Targets ' + (($devs | ForEach-Object { "`"$_`"" }) -join ',') }
+        if ($inet) { $argText += ' -InternetTargets ' + (($inet | ForEach-Object { "`"$_`"" }) -join ',') }
+        $action = New-ScheduledTaskAction -Execute $Script:PSExe -Argument $argText
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5)
+        $set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours ($hrs + 1))
+        $prin = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName $task -Action $action -Trigger $trigger -Settings $set -Principal $prin -Force | Out-Null
+        Start-ScheduledTask -TaskName $task
+        Write-Host "  Background monitor started for $hrs h. Logs + summary: $dir" -ForegroundColor Green
+        Write-Host '  Come back and use option 3 to summarize, or option 4 to stop it early.' -ForegroundColor DarkGray
+        return
+    }
+    Invoke-Tool 'Start-InternetDropMonitor' $p | Out-Null
 }
 
 function Invoke-Dhcp1059 {
@@ -3853,6 +3915,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'What is my public IP? (IPv4/IPv6, ISP, location, proxy check)';               Action = { Invoke-PublicIP } }
     @{ Test='net';  Text = 'Internet speed test (built-in Cloudflare test or Ookla Speedtest CLI)';       Action = { Invoke-SpeedTest } }
     @{ Test='safe'; Text = 'Ping / port reachability test (optional live monitor)';                         Action = { Invoke-ReachabilityTest } }
+    @{               Text = 'Internet drop monitor (PingInfo) - log drops, LAN vs gateway vs WAN/ISP diagnosis'; Action = { Invoke-InternetDropMonitor } }
     @{ Test='slow'; Text = 'Advanced network diagnostics (DNS per server, loss, MTU, tracert, proxy, Wi-Fi)'; Action = { Invoke-NetworkDeepDive } }
     @{ Test='safe'; Text = 'Wi-Fi deep diagnostics (signal, channels & congestion, neighbors, roaming, driver, drops)'; Action = { Invoke-WifiDiagnostics } }
     @{               Text = 'Wi-Fi live monitor (signal / roams / channel changes / drops / lag over time)';    Action = { Invoke-WifiMonitor } }
@@ -22343,6 +22406,221 @@ $Script:Payloads['data/license-sku-map.json'] = @'
     "ENTERPRISEPREMIUM",
     "SPE_E5"
   ]
+}
+'@
+
+# ======================= Start-InternetDropMonitor.ps1 =======================
+$Script:Payloads['Start-InternetDropMonitor'] = @'
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    Internet drop monitor (PingInfo-style) - pings the LAN gateway, any devices you
+    add (switch, AP, server...) and public internet hosts on a short interval, logs
+    every sample, and works out WHERE each drop happened (LAN / gateway / WAN-ISP).
+
+.DESCRIPTION
+    Prepared by Sigma Data Systems Inc. - https://sigmadatainc.com/
+
+    Universal - nothing is hardcoded to a client. The default gateway is auto-detected;
+    add any other devices with -Targets. Every sample is written to a CSV, and a summary
+    of outage windows with a diagnosis is written when the monitor stops (or with -ReportOnly).
+
+    Diagnosis per sample:
+      - Gateway answers, every Internet host fails     -> WAN / ISP side
+      - Gateway fails                                  -> LAN side / firewall / this PC's link
+      - A Device fails while the gateway is fine        -> that device (rebooting, power, routing)
+    Internet is only "down" when ALL internet hosts fail, so one provider dropping
+    ICMP doesn't look like an outage.
+
+.PARAMETER Targets
+    Extra devices to watch, as "IP" or "IP=Label" (e.g. "10.0.0.2=Core switch").
+.PARAMETER Gateway
+    Gateway to watch. Default: auto-detected from the default route. Use "none" to skip.
+.PARAMETER InternetTargets
+    Public hosts. Default 8.8.8.8 and 1.1.1.1.
+.PARAMETER IntervalSeconds
+    Seconds between samples (default 5).
+.PARAMETER DurationMinutes
+    Stop after this many minutes. 0 = until Q is pressed (live) / 24 hours (background).
+.PARAMETER Background
+    No console interaction (for a scheduled task). Requires -DurationMinutes or uses 24 h.
+.PARAMETER ReportOnly
+    Don't ping - just summarize an existing log given with -LogPath.
+.PARAMETER OutputDir
+    Where logs go. Default C:\temp\Network\InternetDropMonitor.
+
+.EXAMPLE
+    .\Start-InternetDropMonitor.ps1 -Targets '10.0.0.2=Core switch'
+.EXAMPLE
+    .\Start-InternetDropMonitor.ps1 -Background -DurationMinutes 1440
+.EXAMPLE
+    .\Start-InternetDropMonitor.ps1 -ReportOnly -LogPath C:\temp\Network\InternetDropMonitor\DropMonitor_PC1_20261008_120000.csv
+#>
+[CmdletBinding()]
+param(
+    [string[]]$Targets = @(),
+    [string]$Gateway = '',
+    [string[]]$InternetTargets = @('8.8.8.8', '1.1.1.1'),
+    [int]$IntervalSeconds = 5,
+    [int]$DurationMinutes = 0,
+    [int]$TimeoutMs = 1000,
+    [switch]$Background,
+    [switch]$ReportOnly,
+    [string]$LogPath = '',
+    [string]$OutputDir = 'C:\temp\Network\InternetDropMonitor'
+)
+
+$ErrorActionPreference = 'Continue'
+if (-not (Test-Path -LiteralPath $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+
+function Write-Out([string]$Text, [string]$Color = 'Gray') {
+    if ($Background) { return }
+    Write-Host $Text -ForegroundColor $Color
+}
+
+# ------------------------------------------------------------------ summary / diagnosis
+function Get-SampleDiagnosis($Rows) {
+    $gw   = @($Rows | Where-Object { $_.Role -eq 'Gateway' })
+    $dev  = @($Rows | Where-Object { $_.Role -eq 'Device' })
+    $inet = @($Rows | Where-Object { $_.Role -eq 'Internet' })
+    $gwDown   = ($gw.Count -gt 0)   -and -not ($gw   | Where-Object { $_.Up -eq 'True' })
+    $inetDown = ($inet.Count -gt 0) -and -not ($inet | Where-Object { $_.Up -eq 'True' })
+    $devDown  = @($dev | Where-Object { $_.Up -ne 'True' })
+    if ($gwDown -and $inetDown) { return 'LAN: gateway and internet both unreachable (this PC''s link, switch, or firewall)' }
+    if ($gwDown)                { return 'Gateway not answering (internet still OK - gateway may just be busy/rate-limiting ICMP)' }
+    if ($inetDown)              { return 'WAN / ISP: gateway OK but no internet host answers' }
+    if ($devDown.Count)         { return 'Device down: ' + (($devDown | ForEach-Object { $_.Label }) -join ', ') }
+    return ''
+}
+
+function Write-Summary([string]$Csv) {
+    $rows = @(Import-Csv -LiteralPath $Csv)
+    if (-not $rows.Count) { Write-Host '  Log is empty.' -ForegroundColor Yellow; return }
+    $summaryPath = [IO.Path]::ChangeExtension($Csv, $null).TrimEnd('.') + '_Summary.txt'
+    $lines = New-Object System.Collections.Generic.List[string]
+    $first = [datetime]$rows[0].Time; $last = [datetime]$rows[-1].Time
+    $lines.Add("Internet drop monitor summary - $env:COMPUTERNAME")
+    $lines.Add("Prepared by Sigma Data Systems Inc.")
+    $lines.Add("Period: $first  to  $last  ($([math]::Round(($last - $first).TotalMinutes)) min)")
+    $lines.Add('')
+
+    # Site-level events: consecutive samples with the same diagnosis = one event
+    $lines.Add('DROP EVENTS (consecutive samples with the same diagnosis)')
+    $events = @(); $cur = $null
+    foreach ($s in ($rows | Group-Object Time)) {
+        $d = Get-SampleDiagnosis $s.Group
+        $t = [datetime]$s.Name
+        if ($cur -and $cur.Diagnosis -eq $d) { $cur.End = $t; $cur.Samples++ ; continue }
+        if ($cur -and $cur.Diagnosis) { $cur.End = $t; $events += $cur }   # ends when the next, different sample arrives
+        $cur = [pscustomobject]@{ Start = $t; End = $t; Samples = 1; Diagnosis = $d }
+    }
+    if ($cur -and $cur.Diagnosis) { $events += $cur }
+    if ($events.Count) {
+        foreach ($e in $events) {
+            $secs = [math]::Max(1, [math]::Round(($e.End - $e.Start).TotalSeconds))
+            $lines.Add(('  {0:MM/dd HH:mm:ss} - {1:HH:mm:ss}  ~{2,5}s  {3}' -f $e.Start, $e.End, $secs, $e.Diagnosis))
+        }
+        $lines.Add('')
+        foreach ($g in ($events | Group-Object Diagnosis | Sort-Object Count -Descending)) {
+            $lines.Add(('  {0,3} x  {1}' -f $g.Count, $g.Name))
+        }
+    } else { $lines.Add('  No drops recorded.') }
+    $lines.Add('')
+
+    $lines.Add('PER TARGET')
+    foreach ($g in ($rows | Group-Object Target)) {
+        $up = @($g.Group | Where-Object { $_.Up -eq 'True' })
+        $ms = @($up | Where-Object { $_.Ms -match '^\d+$' } | ForEach-Object { [int]$_.Ms })
+        $pct = [math]::Round(100 * $up.Count / $g.Count, 2)
+        $lat = if ($ms.Count) { 'avg {0} ms / max {1} ms' -f [math]::Round(($ms | Measure-Object -Average).Average), ($ms | Measure-Object -Maximum).Maximum } else { 'n/a' }
+        $lines.Add(('  {0,-16} {1,-30} {2,7}% up  ({3} of {4} lost)  {5}' -f $g.Name, ($g.Group[0].Label), $pct, ($g.Count - $up.Count), $g.Count, $lat))
+    }
+    $lines.Add('')
+    $lines.Add('How to read it: WAN / ISP events -> check the firewall''s WAN link log and the ISP. LAN events -> switch / cabling / this PC''s NIC or Wi-Fi.')
+    $lines.Add('A device that drops while everything else is fine (e.g. a switch) points at that device - power, reboot, or routing to its management IP.')
+    [IO.File]::WriteAllLines($summaryPath, $lines)
+    if (-not $Background) { $lines | ForEach-Object { Write-Host "  $_" } ; Write-Host "`n  Summary: $summaryPath" -ForegroundColor Green }
+}
+
+if ($ReportOnly) {
+    if (-not $LogPath -or -not (Test-Path -LiteralPath $LogPath)) { Write-Host '  -ReportOnly needs -LogPath pointing at a monitor CSV.' -ForegroundColor Red; exit 1 }
+    Write-Summary $LogPath; exit 0
+}
+
+# ------------------------------------------------------------------ build target list
+$list = New-Object System.Collections.Generic.List[object]
+if ($Gateway -ne 'none') {
+    if (-not $Gateway) {
+        $Gateway = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+                    Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
+                    Sort-Object { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1).NextHop
+    }
+    if ($Gateway) { $list.Add([pscustomobject]@{ Target = $Gateway; Label = 'Default gateway'; Role = 'Gateway' }) }
+    else { Write-Out '  No default gateway found - gateway column skipped.' 'Yellow' }
+}
+foreach ($t in $Targets) {
+    if (-not $t) { continue }
+    $ip, $lab = $t -split '=', 2
+    $ip = $ip.Trim(); if (-not $ip) { continue }
+    if ($list.Target -contains $ip) { continue }
+    $list.Add([pscustomobject]@{ Target = $ip; Label = $(if ($lab) { $lab.Trim() } else { $ip }); Role = 'Device' })
+}
+foreach ($t in $InternetTargets) {
+    if ($t -and -not ($list.Target -contains $t)) { $list.Add([pscustomobject]@{ Target = $t.Trim(); Label = "Internet $t"; Role = 'Internet' }) }
+}
+if (-not $list.Count) { Write-Host '  Nothing to monitor.' -ForegroundColor Red; exit 1 }
+
+if ($Background -and $DurationMinutes -le 0) { $DurationMinutes = 1440 }
+$end = if ($DurationMinutes -gt 0) { (Get-Date).AddMinutes($DurationMinutes) } else { [datetime]::MaxValue }
+if (-not $LogPath) { $LogPath = Join-Path $OutputDir ("DropMonitor_{0}_{1}.csv" -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd_HHmmss')) }
+'"Time","Target","Label","Role","Up","Ms"' | Set-Content -LiteralPath $LogPath -Encoding UTF8
+
+Write-Out ''
+Write-Out ("  Monitoring {0} target(s) every {1}s{2}. Log: {3}" -f $list.Count, $IntervalSeconds, $(if ($DurationMinutes -gt 0) { " for $DurationMinutes min" } else { ' - press Q to stop' }), $LogPath) 'Cyan'
+foreach ($x in $list) { Write-Out ("    {0,-9} {1,-16} {2}" -f $x.Role, $x.Target, $x.Label) 'DarkGray' }
+Write-Out ''
+Write-Out ('  {0,-8}  {1}' -f 'Time', (($list | ForEach-Object { '{0,-16}' -f $_.Target }) -join ' ')) 'DarkGray'
+
+# ------------------------------------------------------------------ sample loop
+$pingers = @{}; foreach ($x in $list) { $pingers[$x.Target] = New-Object System.Net.NetworkInformation.Ping }
+$lastDiag = ''; $dropStart = $null
+try {
+    while ((Get-Date) -lt $end) {
+        $tick = Get-Date
+        $stamp = $tick.ToString('yyyy-MM-dd HH:mm:ss')
+        # Fire all pings in parallel so one dead target doesn't skew the others' timing
+        $tasks = @{}
+        foreach ($x in $list) { try { $tasks[$x.Target] = $pingers[$x.Target].SendPingAsync($x.Target, $TimeoutMs) } catch { $tasks[$x.Target] = $null } }
+        $rows = foreach ($x in $list) {
+            $ok = $false; $ms = ''
+            $tk = $tasks[$x.Target]
+            if ($tk) { try { $r = $tk.GetAwaiter().GetResult(); if ($r.Status -eq 'Success') { $ok = $true; $ms = [int]$r.RoundtripTime } } catch { } }
+            [pscustomobject]@{ Time = $stamp; Target = $x.Target; Label = $x.Label; Role = $x.Role; Up = "$ok"; Ms = $ms }
+        }
+        $rows | Export-Csv -LiteralPath $LogPath -NoTypeInformation -Append -Encoding UTF8
+
+        $diag = Get-SampleDiagnosis $rows
+        $cells = ($rows | ForEach-Object { if ($_.Up -eq 'True') { '{0,-16}' -f "$($_.Ms) ms" } else { '{0,-16}' -f 'DOWN' } }) -join ' '
+        Write-Out ('  {0:HH:mm:ss}  {1}' -f $tick, $cells) $(if ($diag) { 'Red' } elseif ($rows | Where-Object { $_.Ms -match '^\d+$' -and [int]$_.Ms -gt 150 }) { 'Yellow' } else { 'Green' })
+        if ($diag -ne $lastDiag) {
+            if ($diag) { $dropStart = $tick; Write-Out "  >>> DROP START $($tick.ToString('HH:mm:ss')): $diag" 'Magenta' }
+            elseif ($dropStart) { Write-Out ("  <<< RECOVERED {0:HH:mm:ss} after ~{1}s" -f $tick, [math]::Round(($tick - $dropStart).TotalSeconds)) 'Magenta'; $dropStart = $null }
+            $lastDiag = $diag
+        }
+
+        $until = $tick.AddSeconds($IntervalSeconds)
+        while ((Get-Date) -lt $until) {
+            if (-not $Background) {
+                $q = $false; try { $q = [Console]::KeyAvailable -and [Console]::ReadKey($true).Key -eq 'Q' } catch { }
+                if ($q) { $end = Get-Date; break }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+} finally {
+    foreach ($p in $pingers.Values) { $p.Dispose() }
+    Write-Out "`n  Stopped. Building summary..." 'Cyan'
+    Write-Summary $LogPath
 }
 '@
 #endregion
