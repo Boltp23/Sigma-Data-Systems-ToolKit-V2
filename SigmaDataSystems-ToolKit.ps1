@@ -20631,8 +20631,9 @@ foreach ($dom in [string[]]@($domains | Sort-Object)) {
 
     # normalized records for history/change detection (ERROR = keep previous, don't compare)
     $recs = [ordered]@{}
-    $recs['SPF']   = if ($spf.Status -eq 'ERROR') { $null } else { ($spf.Records | ForEach-Object { ($_ -replace '\s+', ' ').Trim() }) -join ' | ' }
-    $recs['DMARC'] = if ($dmarc.Status -eq 'ERROR') { $null } else { ($dmarc.Records | ForEach-Object { ($_ -replace '\s+', '').Trim().ToLower() }) -join ' | ' }
+    # sorted so a domain with several TXT records returned in random order doesn't count as a change
+    $recs['SPF']   = if ($spf.Status -eq 'ERROR') { $null } else { (@($spf.Records | ForEach-Object { ($_ -replace '\s+', ' ').Trim() }) | Sort-Object) -join ' | ' }
+    $recs['DMARC'] = if ($dmarc.Status -eq 'ERROR') { $null } else { (@($dmarc.Records | ForEach-Object { ($_ -replace '\s+', '').Trim().ToLower() }) | Sort-Object) -join ' | ' }
     $recs['MX']    = if ($mxQ.Status -eq 'ERROR') { $null } else { $mx -join ', ' }
     foreach ($s in $dkim.Keys) { $recs["DKIM:$s"] = if ($dkim[$s].Status -eq 'ERROR') { $null } elseif ($dkim[$s].Value) { ($dkim[$s].Value -replace '\s', '') } else { "CNAME->$($dkim[$s].Cname)" } }
     foreach ($a in $dmarc.AuthChecked) { $recs["ReportAuth:$a"] = if ($dmarc.AuthMissing -contains $a) { 'MISSING' } else { 'present' } }
@@ -20675,6 +20676,8 @@ foreach ($dom in $snapshot.Domains.Keys) {
         $ov = if ($old.Records.PSObject.Properties[$k]) { $old.Records.$k } else { $null }
         if ($cur.Records.Contains($k) -and $null -eq $nv) { $cur.Records[$k] = $ov; continue }   # lookup error: carry forward, no alert
         if ("$nv" -eq "$ov") { continue }
+        # same set of records in a different order (older snapshots weren't sorted) = no change
+        if ($nv -and $ov -and (((("$nv" -split ' \| ') | Sort-Object) -join ' | ') -eq ((("$ov" -split ' \| ') | Sort-Object) -join ' | '))) { continue }
         $type = if (-not $ov) { 'Added' } elseif (-not $nv) { 'Removed' } else { 'Modified' }
         $sev = 'Warning'
         switch -Wildcard ($k) {
