@@ -20335,6 +20335,27 @@ function Get-OrgDomain([string]$d) {
 }
 
 # ---------------- SPF ----------------
+function Test-SpfTerm([string]$Term) {
+    $t = $Term.ToLower() -replace '^[\+\-~\?]', ''
+    $ipv4 = '((25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(25[0-5]|2[0-4]\d|1?\d?\d)'
+    $dom  = '[a-z0-9_%{}\.\-]+\.[a-z0-9_%{}\-]+\.?'
+    $ok = @(
+        '^all$',
+        "^include:$dom$",
+        "^exists:$dom$",
+        "^a(:$dom)?(/\d{1,2})?(//\d{1,3})?$",
+        "^mx(:$dom)?(/\d{1,2})?(//\d{1,3})?$",
+        "^ptr(:$dom)?$",
+        "^ip4:$ipv4(/([0-9]|[12][0-9]|3[0-2]))?$",
+        '^ip6:[0-9a-f:\.]+(/\d{1,3})?$',
+        "^redirect=$dom$",
+        '^exp=\S+$',
+        '^[a-z][a-z0-9_\-\.]*=\S*$'      # unknown modifiers are allowed by RFC 7208
+    )
+    foreach ($re in $ok) { if ($t -match $re) { return $true } }
+    return $false
+}
+
 function Get-SpfTree([string]$Name, [hashtable]$Ctx, [int]$Depth) {
     if ($Depth -gt 10 -or $Ctx.Seen.ContainsKey($Name)) { $Ctx.Errors += "loop or excessive depth at $Name"; return }
     $Ctx.Seen[$Name] = $true
@@ -20343,7 +20364,13 @@ function Get-SpfTree([string]$Name, [hashtable]$Ctx, [int]$Depth) {
     $spf = @($q.Values | Where-Object { $_ -match '^\s*v=spf1(\s|$)' })
     if ($spf.Count -eq 0) { if ($Depth -gt 0) { $Ctx.Void++ ; $Ctx.Errors += "no SPF record at $Name" }; return }
     if ($spf.Count -gt 1 -and $Depth -gt 0) { $Ctx.Errors += "multiple SPF records at $Name" }
-    foreach ($term in ($spf[0] -split '\s+' | Where-Object { $_ })) {
+    $terms = @($spf[0] -split '\s+' | Where-Object { $_ })
+    for ($ti = 1; $ti -lt $terms.Count; $ti++) {
+        # Syntax check - receivers return permerror for any invalid term (common cause: a long record
+        # split into several TXT strings without a space at the join, gluing two mechanisms together)
+        if (-not (Test-SpfTerm $terms[$ti])) { $Ctx.Syntax += "invalid term '$($terms[$ti])' in SPF at $Name" }
+    }
+    foreach ($term in $terms) {
         $t = $term.ToLower() -replace '^[\+\-~\?]', ''
         if ($t -match '^include:(.+)$')        { $Ctx.Lookups++; $Ctx.Includes += $Matches[1]; Get-SpfTree $Matches[1] $Ctx ($Depth + 1) }
         elseif ($t -match '^redirect=(.+)$')   { $Ctx.Lookups++; $Ctx.Includes += "redirect:$($Matches[1])"; Get-SpfTree $Matches[1] $Ctx ($Depth + 1) }
@@ -20355,13 +20382,13 @@ function Get-SpfTree([string]$Name, [hashtable]$Ctx, [int]$Depth) {
 
 function Test-Spf([string]$Dom) {
     $q = Invoke-Dns $Dom 'TXT'
-    $res = [ordered]@{ Status = $q.Status; Records = @(); Lookups = 0; Void = 0; All = ''; Includes = @(); Errors = @() }
+    $res = [ordered]@{ Status = $q.Status; Records = @(); Lookups = 0; Void = 0; All = ''; Includes = @(); Errors = @(); Syntax = @() }
     if ($q.Status -eq 'ERROR') { return $res }
     $res.Records = @($q.Values | Where-Object { $_ -match '^\s*v=spf1(\s|$)' })
     if ($res.Records.Count -eq 1) {
-        $ctx = @{ Seen = @{}; Lookups = 0; Void = 0; Includes = @(); Errors = @() }
+        $ctx = @{ Seen = @{}; Lookups = 0; Void = 0; Includes = @(); Errors = @(); Syntax = @() }
         Get-SpfTree $Dom $ctx 0
-        $res.Lookups = $ctx.Lookups; $res.Void = $ctx.Void; $res.Includes = $ctx.Includes; $res.Errors = $ctx.Errors
+        $res.Lookups = $ctx.Lookups; $res.Void = $ctx.Void; $res.Includes = $ctx.Includes; $res.Errors = $ctx.Errors; $res.Syntax = $ctx.Syntax
         if ($res.Records[0] -match '(^|\s)([\+\-~\?]?)all(\s|$)') { $res.All = ($Matches[2] + 'all') -replace '^all$', '+all' }
         elseif ($res.Records[0] -match 'redirect=') { $res.All = '(redirect)' }
     }
@@ -20444,9 +20471,10 @@ function Get-MxProvider([string[]]$Mx) {
 # ---------------- collect domains + selectors ----------------
 $domains   = New-Object 'System.Collections.Generic.HashSet[string]'
 $selectors = @{}
+$clientOf  = @{}   # optional Domain -> Client label from a -DomainList CSV with a Client column
 foreach ($d in $Domain) { if ($d) { [void]$domains.Add($d.Trim().ToLower().TrimEnd('.')) } }
 if ($DomainList) {
-    if ($DomainList -like '*.csv') { Import-Csv $DomainList | ForEach-Object { if ($_.Domain) { [void]$domains.Add($_.Domain.Trim().ToLower()) } } }
+    if ($DomainList -like '*.csv') { Import-Csv $DomainList | ForEach-Object { if ($_.Domain) { $dn = $_.Domain.Trim().ToLower(); [void]$domains.Add($dn); if ($_.PSObject.Properties['Client'] -and $_.Client) { $clientOf[$dn] = $_.Client.Trim() } } } }
     else { Get-Content $DomainList | ForEach-Object { $x = ($_ -split '[,;\s#]')[0].Trim().ToLower(); if ($x -match '\.') { [void]$domains.Add($x) } } }
 }
 if ($DmarcCsv) {
@@ -20504,6 +20532,7 @@ foreach ($dom in [string[]]@($domains | Sort-Object)) {
         if ($spf.All -eq '+all') { Add-F 'Critical' 'SPF ends in +all - anyone can send as this domain' }
         elseif ($spf.All -eq '?all' -or -not $spf.All) { Add-F 'Warning' "SPF has no enforcing all mechanism ($(if ($spf.All) { $spf.All } else { 'missing' }))" }
         foreach ($e in ($spf.Errors | Where-Object { $_ -match 'multiple|loop|ptr' })) { Add-F 'Warning' "SPF: $e" }
+        foreach ($e in $spf.Syntax) { Add-F 'Critical' "SPF syntax error - $e (permerror for all mail)" }
     }
     # DMARC findings
     $pol = ''; $pct = ''
@@ -20522,6 +20551,11 @@ foreach ($dom in [string[]]@($domains | Sort-Object)) {
     # DKIM findings
     $found = @($dkim.Keys | Where-Object { $dkim[$_].Value -and -not $dkim[$_].Revoked })
     if (-not $found.Count) { Add-F 'Warning' "No DKIM key found on selectors checked ($(@($sel | Sort-Object -Unique).Count) tried)" }
+    if ($selectors.ContainsKey($dom)) {
+        foreach ($s in $selectors[$dom]) {
+            if (-not $dkim.Contains($s)) { Add-F 'Warning' "DKIM selector '$s' is used in mail (per DMARC reports) but has no key in DNS - that mail fails DKIM" }
+        }
+    }
     foreach ($s in $dkim.Keys) {
         $k = $dkim[$s]
         if ($k.Status -eq 'CNAME-DANGLING') { Add-F 'Warning' "DKIM selector '$s' CNAME points to $($k.Cname) which has no key" }
@@ -20547,7 +20581,7 @@ foreach ($dom in [string[]]@($domains | Sort-Object)) {
         DkimSelectors = @($found)
     }
     $statusRows += [pscustomobject]@{
-        CheckedAt = $runTime.ToString('s'); Domain = $dom; Status = $status
+        CheckedAt = $runTime.ToString('s'); Client = $(if ($clientOf.ContainsKey($dom)) { $clientOf[$dom] } else { '' }); Domain = $dom; Status = $status
         SPF = $recs['SPF']; SPF_Lookups = $spf.Lookups; SPF_All = $spf.All
         DMARC_Policy = $pol; DMARC_Pct = $pct; DMARC_Rua = ($dmarc.Rua -join ',')
         DKIM_Selectors = ($found | ForEach-Object { '{0}({1})' -f $_, $dkim[$_].Bits }) -join ' '
