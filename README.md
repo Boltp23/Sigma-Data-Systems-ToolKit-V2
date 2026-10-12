@@ -2,7 +2,7 @@
 
 *Prepared by [Sigma Data Systems Inc.](https://sigmadatainc.com/)*
 
-<!-- AUTO-VERSION -->**Current version: v2.0** | 136 options | updated 2026-10-08<!-- /AUTO-VERSION -->
+<!-- AUTO-VERSION -->**Current version: v2.0** | 138 options | updated 2026-10-12<!-- /AUTO-VERSION -->
 
 ```
   _____ _____ _____ __  __            _____       _______
@@ -14,7 +14,7 @@
 ```
 
 One PowerShell file you can copy to any Windows workstation or server and run.
-It opens a numbered menu of **136 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
+It opens a numbered menu of **138 diagnostics, fixes, Microsoft 365 and deployment tasks** for MSP / IT support work.
 Each option either checks something and writes a report, or makes a fix after asking you to confirm.
 
 - **One file, nothing to install.** 36 longer scripts (plus 2 data files) are built into the file as plain, readable text.
@@ -92,7 +92,7 @@ The home screen shows the banner, a line about the machine (host, domain, OS, ad
 | Type | Does |
 |---|---|
 | A section letter (`A`, `C`, `D`...) | Open that section |
-| Any option number (`1`-`136`) | Run that option directly, from any screen |
+| Any option number (`1`-`138`) | Run that option directly, from any screen |
 | `ALL` | List every option |
 | `B` | Back to the section list |
 | `O` | Change the output folder |
@@ -110,7 +110,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 ## All options
 
 <!-- AUTO-OPTIONS:START -->
-<details><summary><b>Quick index of all 136 options</b> (auto-generated from the script, 2026-10-08)</summary>
+<details><summary><b>Quick index of all 138 options</b> (auto-generated from the script, 2026-10-12)</summary>
 
 **A. SYSTEM HEALTH**
 
@@ -215,77 +215,79 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 75. Install provenance for a program (when/how/by whom)
 76. .NET / Node.js / Java / Python / VC++ runtime versions
 77. Citrix Workspace app - install state
-78. Time sync (w32time) check / resync
+78. Adobe Acrobat / Reader - version, Server 2016 SetThreadDescription check, update lock, PDF default
+79. [!] Adobe Acrobat / Reader - freeze / unfreeze updates, set default PDF app for all users
+80. Time sync (w32time) check / resync
 
 **K. QUICK FIXES**
 
-79. [!] Print spooler reset (clear stuck jobs)
-80. [!] Microsoft Teams cache clear (classic + new)
-81. [!] Office quick / online repair
-82. OneDrive will not start / sync - diagnostics (policy block, installs, startup, logs)
-83. [!] OneDrive reset
-84. [!] Repair .zip association / reset default browser (per user)
-85. [!] Remove bloatware (OEM + consumer Store apps)
-86. [!] Power settings - never sleep / hibernate
-87. Check scanner (Panini etc.) hangs / not detected - diagnostics + optional USB power fix
+81. [!] Print spooler reset (clear stuck jobs)
+82. [!] Microsoft Teams cache clear (classic + new)
+83. [!] Office quick / online repair
+84. OneDrive will not start / sync - diagnostics (policy block, installs, startup, logs)
+85. [!] OneDrive reset
+86. [!] Repair .zip association / reset default browser (per user)
+87. [!] Remove bloatware (OEM + consumer Store apps)
+88. [!] Power settings - never sleep / hibernate
+89. Check scanner (Panini etc.) hangs / not detected - diagnostics + optional USB power fix
 
 **L. SOFTWARE DEPLOYMENT (downloads to C:\temp\Tools)**
 
-88. [!] Install common apps with Ninite (Chrome, Firefox, 7-Zip, Zoom...)
-89. [!] Install apps silently from the vendor (Chrome/Firefox/Edge MSI, Zoom, Teams, OneDrive)
-90. [!] Install Microsoft 365 Apps / Office (ODT, removes OEM Office first)
-91. [!] Remove ALL existing Office (OEM preinstalls, extra languages, MSI)
+90. [!] Install common apps with Ninite (Chrome, Firefox, 7-Zip, Zoom...)
+91. [!] Install apps silently from the vendor (Chrome/Firefox/Edge MSI, Zoom, Teams, OneDrive)
+92. [!] Install Microsoft 365 Apps / Office (ODT, removes OEM Office first)
+93. [!] Remove ALL existing Office (OEM preinstalls, extra languages, MSI)
 
 **M. SYSINTERNALS / NIRSOFT / MICROSOFT TOOLS (downloaded on demand)**
 
-92. NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimes, LastActivity, USB
-93. Sysinternals Handle - what is locking this file?
-94. Sysinternals ProcDump - dump a hung / crashing program
-95. Download & launch a GUI tool (ProcExp, ProcMon, Autoruns, TCPView, ShellExView...)
-96. Microsoft TSS - official support log collection (SDP)
+94. NirSoft reports: BlueScreenView, AppCrashView, TurnedOnTimes, LastActivity, USB
+95. Sysinternals Handle - what is locking this file?
+96. Sysinternals ProcDump - dump a hung / crashing program
+97. Download & launch a GUI tool (ProcExp, ProcMon, Autoruns, TCPView, ShellExView...)
+98. Microsoft TSS - official support log collection (SDP)
 
 **N. MICROSOFT 365 (Exchange Online / Entra ID / Intune)**
 
-97. M365: set admin account & client tenant (GDAP / partner) for the options below
-98. M365: install / repair PowerShell modules (EXO, Graph, SPO, Teams; EXO 3.7.1 conflict fix)
-99. M365: compromised account AUDIT (rules, forwarding, sign-ins, MFA, apps - HTML)
-100. [!] M365: CONTAIN compromised account (block, revoke, reset, rules, forwarding, unblock send)
-101. M365: inbox rules - one or all mailboxes, suspicious flagged, WHEN created (audit log)
-102. M365: forwarding audit (mailbox forwarding, external forward rules, tenant policy)
-103. M365: message trace (sender / recipient / subject, up to 90 days, delivery detail)
-104. M365: quarantine - find & release messages (shows Spam / Bulk / Phish reason)
-105. M365: why is this sender filtered? (rules, BCL vs SCL, TABL, impersonation) + fixes
-106. M365: SPF / DKIM / DMARC / MX check for all domains (lookup count, DKIM status)
-107. M365: Direct Send / connectors (scanner connector, RejectDirectSend)
-108. M365: top inbound sender / outbound recipient domains (90 days)
-109. M365: mailbox permissions (Full Access / Send As / Send on Behalf)
-110. M365: mailbox sizes, quotas, archive status
-111. M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe
-112. M365: unified audit log search (user / operation / IP, up to 180 days)
-113. M365: sign-in log for a user (IPs, countries, legacy protocols)
-114. M365: MFA report (registered methods, enforcement, per-user state; no P1 needed)
-115. M365: stale / never-used / guest / disabled-but-licensed accounts
-116. M365: admin role members (Global Admin count check)
-117. M365: license report (subscriptions, who has what, wasted licenses)
-118. [!] M365: assign / remove licenses (users, group-based, remove direct)
-119. [!] M365: create a new user (random temp password, license, groups)
-120. M365: app consent audit + admin-consent link (risky app permissions)
-121. M365: app registration secrets / certificates expiring soon
-122. M365: Intune devices (compliance, stale, BitLocker key missing in Entra)
-123. M365: OneDrive folder sharing / permissions for a user
-124. [!] M365: exclude a SharePoint site from a retention policy
-125. M365: tenant hardening audit (legacy auth, forwarding, audit log, Defender, alerts)
-126. M365: security posture audit (134 checks, license-aware, client HTML report)
-127. M365: remediation plan from a posture audit (technical + client summary)
-128. [!] M365: create app registration for unattended automation (cert auth)
-129. [!] THIS PC: force a Hybrid Entra ID join attempt
-130. [!] THIS PC: back up BitLocker recovery key to Entra ID
-131. M365: failed sign-in ALERT check - user + IP -> error codes -> verdict (Augmentt)
-132. M365 IR: Microsoft-Extractor-Suite (Invictus IR) - evidence triage, user or tenant
-133. M365 IR: Hawk - compromised user / tenant investigation
-134. M365 audit: CISA ScubaGear - SCuBA secure-baseline assessment (HTML)
-135. M365 audit: Maester - automated Entra / Exchange / CISA security tests (HTML)
-136. M365: domain impersonation / spoofing - headers, SPF/DMARC, look-alike domains, Direct Send
+99. M365: set admin account & client tenant (GDAP / partner) for the options below
+100. M365: install / repair PowerShell modules (EXO, Graph, SPO, Teams; EXO 3.7.1 conflict fix)
+101. M365: compromised account AUDIT (rules, forwarding, sign-ins, MFA, apps - HTML)
+102. [!] M365: CONTAIN compromised account (block, revoke, reset, rules, forwarding, unblock send)
+103. M365: inbox rules - one or all mailboxes, suspicious flagged, WHEN created (audit log)
+104. M365: forwarding audit (mailbox forwarding, external forward rules, tenant policy)
+105. M365: message trace (sender / recipient / subject, up to 90 days, delivery detail)
+106. M365: quarantine - find & release messages (shows Spam / Bulk / Phish reason)
+107. M365: why is this sender filtered? (rules, BCL vs SCL, TABL, impersonation) + fixes
+108. M365: SPF / DKIM / DMARC / MX check for all domains (lookup count, DKIM status)
+109. M365: Direct Send / connectors (scanner connector, RejectDirectSend)
+110. M365: top inbound sender / outbound recipient domains (90 days)
+111. M365: mailbox permissions (Full Access / Send As / Send on Behalf)
+112. M365: mailbox sizes, quotas, archive status
+113. M365: mobile devices for a user (lost phone/iPad) + account-only / full wipe
+114. M365: unified audit log search (user / operation / IP, up to 180 days)
+115. M365: sign-in log for a user (IPs, countries, legacy protocols)
+116. M365: MFA report (registered methods, enforcement, per-user state; no P1 needed)
+117. M365: stale / never-used / guest / disabled-but-licensed accounts
+118. M365: admin role members (Global Admin count check)
+119. M365: license report (subscriptions, who has what, wasted licenses)
+120. [!] M365: assign / remove licenses (users, group-based, remove direct)
+121. [!] M365: create a new user (random temp password, license, groups)
+122. M365: app consent audit + admin-consent link (risky app permissions)
+123. M365: app registration secrets / certificates expiring soon
+124. M365: Intune devices (compliance, stale, BitLocker key missing in Entra)
+125. M365: OneDrive folder sharing / permissions for a user
+126. [!] M365: exclude a SharePoint site from a retention policy
+127. M365: tenant hardening audit (legacy auth, forwarding, audit log, Defender, alerts)
+128. M365: security posture audit (134 checks, license-aware, client HTML report)
+129. M365: remediation plan from a posture audit (technical + client summary)
+130. [!] M365: create app registration for unattended automation (cert auth)
+131. [!] THIS PC: force a Hybrid Entra ID join attempt
+132. [!] THIS PC: back up BitLocker recovery key to Entra ID
+133. M365: failed sign-in ALERT check - user + IP -> error codes -> verdict (Augmentt)
+134. M365 IR: Microsoft-Extractor-Suite (Invictus IR) - evidence triage, user or tenant
+135. M365 IR: Hawk - compromised user / tenant investigation
+136. M365 audit: CISA ScubaGear - SCuBA secure-baseline assessment (HTML)
+137. M365 audit: Maester - automated Entra / Exchange / CISA security tests (HTML)
+138. M365: domain impersonation / spoofing - headers, SPF/DMARC, look-alike domains, Direct Send
 
 </details>
 <!-- AUTO-OPTIONS:END -->

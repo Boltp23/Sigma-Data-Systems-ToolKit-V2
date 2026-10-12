@@ -33,7 +33,7 @@
     report to C:\temp\SelfTest. Add -IncludeSlow and/or -IncludeDownloads for full coverage.
 
 .NOTES
-    v2.0 - adds: internet drop monitor (PingInfo-style, LAN / gateway / WAN-ISP diagnosis), section menu, self-test, security posture, hardware/SMART, reliability, perf,
+    v2.0 - adds: Adobe Acrobat/Reader Server 2016 start-up check + update freeze + all-users PDF default, internet drop monitor (PingInfo-style, LAN / gateway / WAN-ISP diagnosis), section menu, self-test, security posture, hardware/SMART, reliability, perf,
     boot performance, pending-reboot detail, Windows Update list/install, SFC/DISM, AD/DC health,
     backup/VSS health, shares/open files, advanced network (MTU/tracert/proxy/Wi-Fi), server roles,
     quick fixes (spooler, network, Teams, Office, OneDrive + OneDrive won't-start diagnostics), software deployment (Ninite, vendor
@@ -1161,6 +1161,185 @@ function Invoke-CitrixState {
     Get-Process | Where-Object { $_.ProcessName -match 'SelfService|Receiver|CitrixWorkspace|wfcrun32|wfica32|AuthManSvr' } | Select-Object ProcessName, Id, Path | Format-Table -AutoSize
     Write-Sub 'Citrix services'
     Get-Service | Where-Object { $_.DisplayName -like '*Citrix*' -or $_.Name -like '*Citrix*' } | Select-Object Name, DisplayName, Status | Format-Table -AutoSize
+}
+
+function Get-AdobeAcrobatState {
+    $s = [ordered]@{}
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $s.OS    = "$($cv.ProductName)  build $($cv.CurrentBuild).$($cv.UBR)"
+    $s.Build = [int]$cv.CurrentBuild
+    $exe = @("$env:ProgramFiles\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+             "${env:ProgramFiles(x86)}\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+             "${env:ProgramFiles(x86)}\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    $s.Exe     = $exe
+    $s.Version = if ($exe) { (Get-Item $exe).VersionInfo.ProductVersion } else { $null }
+    $s.Installed = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match 'Adobe Acrobat|Acrobat Reader' } | Select-Object DisplayName, DisplayVersion, InstallDate)
+    # SetThreadDescription: kernel32 export = Windows 10 1703+/Server 2019+. On 1607/Server 2016 it is only in KernelBase.dll.
+    try {
+        if (-not ('SDSI.Kern' -as [type])) {
+            Add-Type -Namespace SDSI -Name Kern -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr GetModuleHandle(string n);
+[DllImport("kernel32.dll", CharSet=CharSet.Ansi)] public static extern IntPtr GetProcAddress(IntPtr h, string p);
+'@ -ErrorAction Stop
+        }
+        $s.K32Export = [SDSI.Kern]::GetProcAddress([SDSI.Kern]::GetModuleHandle('kernel32.dll'),   'SetThreadDescription') -ne [IntPtr]::Zero
+        $s.KBExport  = [SDSI.Kern]::GetProcAddress([SDSI.Kern]::GetModuleHandle('kernelbase.dll'), 'SetThreadDescription') -ne [IntPtr]::Zero
+    } catch { $s.K32Export = $null; $s.KBExport = $null }
+    $s.Lockdown = foreach ($p in 'HKLM:\SOFTWARE\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown','HKLM:\SOFTWARE\Policies\Adobe\Adobe Acrobat\DC\FeatureLockDown') {
+        $v = Get-ItemProperty $p -ErrorAction SilentlyContinue
+        [pscustomobject]@{ Key = ($p -replace '^HKLM:\\SOFTWARE\\Policies\\',''); bUpdater = $v.bUpdater; bDisablePDFHandlerSwitching = $v.bDisablePDFHandlerSwitching }
+    }
+    $s.Services = @(Get-Service AdobeARMservice, AdobeUpdateService, AGSService -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType)
+    $s.Tasks    = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'Adobe.*Update|AdobeGC' } | Select-Object TaskName, State)
+    $s.CreativeCloud = [bool](@("${env:ProgramFiles(x86)}\Adobe\Adobe Creative Cloud", "$env:ProgramFiles\Adobe\Adobe Creative Cloud") | Where-Object { $_ -and (Test-Path $_) })
+    $s.PdfProgId = (Get-ItemProperty 'HKLM:\SOFTWARE\Classes\.pdf' -ErrorAction SilentlyContinue).'(default)'
+    $s.AssocXml  = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name DefaultAssociationsConfiguration -ErrorAction SilentlyContinue).DefaultAssociationsConfiguration
+    $s.IsRds     = [bool](Get-WindowsFeature -Name RDS-RD-Server -ErrorAction SilentlyContinue).Installed
+    [pscustomobject]$s
+}
+
+function Invoke-AdobeAcrobatStatus {
+    Write-Title 'Adobe Acrobat / Reader - version, OS compatibility, update lock, PDF default'
+    $s = Get-AdobeAcrobatState
+    Write-Host "  OS: $($s.OS)$(if ($s.IsRds) { '   (RD Session Host)' })"
+    Write-Sub 'Installed'
+    if ($s.Installed) { $s.Installed | Format-Table -AutoSize | Out-String | Write-Host } else { Write-Host '  No Adobe Acrobat / Reader found in Programs and Features.' }
+    if ($s.Exe) { Write-Host "  $($s.Exe)  ->  $($s.Version)" }
+
+    Write-Sub 'SetThreadDescription (cause of "Entry Point Not Found ... AGM.dll" / 0xc0000139 / AppContainer popup)'
+    Write-Host ("  kernel32.dll export: {0}   KernelBase.dll export: {1}" -f $s.K32Export, $s.KBExport)
+    if ($s.K32Export -eq $false) {
+        Write-Host '  This OS does not export SetThreadDescription from kernel32 (Windows 10 1607 / Server 2016 or older).' -ForegroundColor Yellow
+        Write-Host '  Acrobat/Reader builds that link it directly (e.g. 26.002.21996) fail to start here with:' -ForegroundColor Yellow
+        Write-Host '    - "procedure entry point SetThreadDescription could not be located ... AGM.dll"' -ForegroundColor Yellow
+        Write-Host '    - "Exception Processing Message 0xc0000139"  and the "AppContainer Incompatibility" prompt' -ForegroundColor Yellow
+        Write-Host '  Repair / reinstall of the same build does NOT help. Fix: install the last build that works on this OS' -ForegroundColor Yellow
+        Write-Host '  (Adobe distribution page, select this OS - it offers the "Recommended" build), then freeze updates' -ForegroundColor Yellow
+        Write-Host '  with the [!] Adobe option until Adobe ships a fixed build. Long-term: move to Server 2019/2022.' -ForegroundColor Yellow
+    } elseif ($s.K32Export) { Write-Host '  OK - not affected by the SetThreadDescription start-up failure.' -ForegroundColor Green }
+
+    Write-Sub 'Update lock'
+    $s.Lockdown | Format-Table -AutoSize | Out-String | Write-Host
+    if ($s.Services) { $s.Services | Format-Table -AutoSize | Out-String | Write-Host }
+    if ($s.Tasks)    { $s.Tasks    | Format-Table -AutoSize | Out-String | Write-Host }
+    if ($s.CreativeCloud) { Write-Host '  Creative Cloud desktop app is installed - it can update Acrobat even when bUpdater = 0 (AdobeUpdateService).' -ForegroundColor Yellow }
+
+    Write-Sub 'Default PDF handler'
+    Write-Host "  Machine .pdf ProgId: $(if ($s.PdfProgId) { $s.PdfProgId } else { '(none)' })"
+    if ($s.AssocXml) {
+        Write-Host "  Default associations policy XML: $($s.AssocXml)"
+        if (Test-Path $s.AssocXml) {
+            $pdf = ([xml](Get-Content $s.AssocXml -Raw)).DefaultAssociations.Association | Where-Object { $_.Identifier -eq '.pdf' }
+            Write-Host "  .pdf in policy: $(if ($pdf) { "$($pdf.ProgId) ($($pdf.ApplicationName))" } else { 'not set' })"
+        } else { Write-Host '  Policy points to a file that does not exist / is not reachable.' -ForegroundColor Red }
+    } else { Write-Host '  No default associations policy - each user keeps their own PDF default (often Edge).' }
+
+    Write-Sub 'Acrobat processes by session'
+    $pr = Get-Process Acrobat, AcroRd32, AcroCEF, AdobeCollabSync -IncludeUserName -ErrorAction SilentlyContinue
+    if ($pr) { $pr | Select-Object Name, Id, SessionId, UserName | Format-Table -AutoSize | Out-String | Write-Host } else { Write-Host '  None running.' }
+}
+
+function Invoke-AdobeAcrobatFix {
+    Write-Title '[!] Adobe Acrobat / Reader - freeze updates, PDF default for all users'
+    Write-Host '  1. FREEZE updates  (bUpdater=0 for Acrobat + Reader, disable Adobe update services & scheduled tasks)'
+    Write-Host '  2. UNFREEZE updates (undo 1 once Adobe ships a fixed build)'
+    Write-Host '  3. Set Acrobat/Reader as default PDF app for ALL users (default-associations policy, applies at logon)'
+    Write-Host '  4. Remove the PDF default policy (undo 3)'
+    Write-Host '  5. Show sessions running Acrobat (close them before uninstall / reinstall)'
+    $c = Read-Default 'Choose 1-5 (blank = cancel)' ''
+    $lk  = 'HKLM:\SOFTWARE\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown','HKLM:\SOFTWARE\Policies\Adobe\Adobe Acrobat\DC\FeatureLockDown'
+    $svc = 'AdobeARMservice','AdobeUpdateService'
+    $tf  = { Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'Adobe.*Update|AdobeGC' } }
+    switch ("$c") {
+        '1' {
+            if (-not (Confirm-Change 'Set bUpdater=0 (Acrobat + Reader), stop & disable AdobeARMservice / AdobeUpdateService, disable Adobe update tasks. Creative Cloud will not update ANY Adobe app until undone.')) { return }
+            foreach ($p in $lk) {
+                if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
+                New-ItemProperty -Path $p -Name bUpdater -PropertyType DWord -Value 0 -Force | Out-Null
+            }
+            foreach ($n in $svc) {
+                if (Get-Service $n -ErrorAction SilentlyContinue) { Stop-Service $n -Force -ErrorAction SilentlyContinue; Set-Service $n -StartupType Disabled }
+            }
+            & $tf | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+            Write-Host '  Frozen. Verify:' -ForegroundColor Green
+            $lk | ForEach-Object { [pscustomobject]@{ Key = $_; bUpdater = (Get-ItemProperty $_ -ErrorAction SilentlyContinue).bUpdater } } | Format-Table -AutoSize | Out-String | Write-Host
+            Get-Service $svc -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType | Format-Table -AutoSize | Out-String | Write-Host
+            & $tf | Select-Object TaskName, State | Format-Table -AutoSize | Out-String | Write-Host
+            Write-Host '  Also hold Acrobat/Reader in your RMM patch policy for this device, or it will be pushed again.' -ForegroundColor DarkGray
+        }
+        '2' {
+            if (-not (Confirm-Change 'Remove bUpdater, set Adobe update services back to Automatic and start them, enable Adobe update tasks.')) { return }
+            foreach ($p in $lk) { Remove-ItemProperty -Path $p -Name bUpdater -ErrorAction SilentlyContinue }
+            foreach ($n in $svc) {
+                if (Get-Service $n -ErrorAction SilentlyContinue) { Set-Service $n -StartupType Automatic; Start-Service $n -ErrorAction SilentlyContinue }
+            }
+            & $tf | Enable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
+            Get-Service $svc -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType | Format-Table -AutoSize | Out-String | Write-Host
+            & $tf | Select-Object TaskName, State | Format-Table -AutoSize | Out-String | Write-Host
+            Write-Host '  Unfrozen. Remember to release the RMM patch hold too.' -ForegroundColor Green
+        }
+        '3' {
+            $prog = (Get-ItemProperty 'HKLM:\SOFTWARE\Classes\.pdf' -ErrorAction SilentlyContinue).'(default)'
+            Write-Host "  Machine .pdf ProgId: $(if ($prog) { $prog } else { '(none)' })"
+            if ($prog -notmatch '^Acro') {
+                Write-Host '  Acrobat/Reader does not own .pdf at machine level. Open Acrobat as admin -> Edit > Preferences > General >' -ForegroundColor Yellow
+                Write-Host '  "Select As Default PDF Handler", then run this again. (Expected: Acrobat.Document.DC or AcroExch.Document.DC)' -ForegroundColor Yellow
+                $prog = Read-Default 'ProgId to use anyway (blank = cancel)' ''
+                if (-not $prog) { return }
+            }
+            $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+            $cur = (Get-ItemProperty $pol -Name DefaultAssociationsConfiguration -ErrorAction SilentlyContinue).DefaultAssociationsConfiguration
+            $xmlPath = if ($cur) { $cur } else { 'C:\ProgramData\DefaultAppAssoc.xml' }
+            if ($cur -and $cur -match '^\\\\') { Write-Host "  Policy points to a network share ($cur) - probably set by GPO. Edit that XML / GPO instead." -ForegroundColor Yellow; return }
+            if (-not (Confirm-Change "Set .pdf -> $prog in $xmlPath (existing entries kept, file backed up), point the default-associations policy at it, and stop Acrobat prompting users to switch PDF handler.")) { return }
+            if (Test-Path $xmlPath) {
+                $bk = Join-Path (Get-OutDir 'Adobe') "DefaultAppAssoc-backup_$(Get-Stamp).xml"; Copy-Item $xmlPath $bk -Force
+                Write-Host "  Backup: $bk" -ForegroundColor DarkGray
+                $x = [xml](Get-Content $xmlPath -Raw)
+            } else {
+                $x = [xml]'<?xml version="1.0" encoding="UTF-8"?><DefaultAssociations></DefaultAssociations>'
+            }
+            $root = $x.SelectSingleNode('/DefaultAssociations')
+            foreach ($old in @($root.SelectNodes("Association[@Identifier='.pdf']"))) { [void]$root.RemoveChild($old) }
+            $a = $x.CreateElement('Association')
+            $a.SetAttribute('Identifier', '.pdf'); $a.SetAttribute('ProgId', $prog)
+            $a.SetAttribute('ApplicationName', $(if ($prog -like 'AcroExch*') { 'Adobe Acrobat Reader' } else { 'Adobe Acrobat' }))
+            [void]$root.AppendChild($a)
+            $x.Save($xmlPath)
+            if (-not (Test-Path $pol)) { New-Item -Path $pol -Force | Out-Null }
+            New-ItemProperty -Path $pol -Name DefaultAssociationsConfiguration -Value $xmlPath -PropertyType String -Force | Out-Null
+            foreach ($p in $lk) {
+                if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
+                New-ItemProperty -Path $p -Name bDisablePDFHandlerSwitching -PropertyType DWord -Value 1 -Force | Out-Null
+            }
+            Get-Content $xmlPath | Write-Host
+            Write-Host '  Done. Applies at each user''s NEXT logon - have a user sign out/in and open a PDF to test.' -ForegroundColor Green
+            Write-Host '  Several session hosts / domain: the same setting is in GPO (File Explorer > "Set a default associations configuration file").' -ForegroundColor DarkGray
+        }
+        '4' {
+            $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+            $cur = (Get-ItemProperty $pol -Name DefaultAssociationsConfiguration -ErrorAction SilentlyContinue).DefaultAssociationsConfiguration
+            if (-not $cur) { Write-Host '  No default-associations policy is set.'; return }
+            if (-not (Confirm-Change "Remove .pdf from $cur (policy removed if nothing else is left), remove bDisablePDFHandlerSwitching.")) { return }
+            if (Test-Path $cur) {
+                $bk = Join-Path (Get-OutDir 'Adobe') "DefaultAppAssoc-backup_$(Get-Stamp).xml"; Copy-Item $cur $bk -Force
+                $x = [xml](Get-Content $cur -Raw); $root = $x.SelectSingleNode('/DefaultAssociations')
+                foreach ($old in @($root.SelectNodes("Association[@Identifier='.pdf']"))) { [void]$root.RemoveChild($old) }
+                if ($root.SelectNodes('Association').Count -eq 0) { Remove-ItemProperty $pol -Name DefaultAssociationsConfiguration -Force; Write-Host '  No associations left - policy removed.' }
+                else { $x.Save($cur); Write-Host "  .pdf removed; other associations in $cur kept." }
+                Write-Host "  Backup: $bk" -ForegroundColor DarkGray
+            }
+            foreach ($p in $lk) { Remove-ItemProperty -Path $p -Name bDisablePDFHandlerSwitching -ErrorAction SilentlyContinue }
+            Write-Host '  Done (takes effect at next logon).' -ForegroundColor Green
+        }
+        '5' {
+            $pr = Get-Process Acrobat, AcroRd32, AcroCEF, AdobeCollabSync -IncludeUserName -ErrorAction SilentlyContinue
+            if (-not $pr) { Write-Host '  No Acrobat processes running.' -ForegroundColor Green; return }
+            $pr | Select-Object Name, Id, SessionId, UserName | Format-Table -AutoSize | Out-String | Write-Host
+            Write-Host '  Ask those users to close Acrobat, or log them off:  logoff <SessionId>' -ForegroundColor DarkGray
+        }
+    }
 }
 
 function Invoke-RemoveBloatware {
@@ -3982,6 +4161,8 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Install provenance for a program (when/how/by whom)';                           Action = { Invoke-InstallProvenance } }
     @{ Test='safe'; Text = '.NET / Node.js / Java / Python / VC++ runtime versions';                         Action = { Invoke-DotNetVersion } }
     @{ Test='safe'; Text = 'Citrix Workspace app - install state';                                          Action = { Invoke-CitrixState } }
+    @{ Test='safe'; Text = 'Adobe Acrobat / Reader - version, Server 2016 SetThreadDescription check, update lock, PDF default'; Action = { Invoke-AdobeAcrobatStatus } }
+    @{               Text = '[!] Adobe Acrobat / Reader - freeze / unfreeze updates, set default PDF app for all users'; Action = { Invoke-AdobeAcrobatFix } }
     @{ Test='safe'; Text = 'Time sync (w32time) check / resync';                                            Action = { Invoke-TimeSync } }
     @{ Section = 'QUICK FIXES' }
     @{               Text = '[!] Print spooler reset (clear stuck jobs)';                                    Action = { Invoke-SpoolerReset } }
