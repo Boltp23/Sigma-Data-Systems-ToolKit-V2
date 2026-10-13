@@ -1223,7 +1223,9 @@ function Invoke-AdobeAcrobatStatus {
     $s.Lockdown | Format-Table -AutoSize | Out-String | Write-Host
     if ($s.Services) { $s.Services | Format-Table -AutoSize | Out-String | Write-Host }
     if ($s.Tasks)    { $s.Tasks    | Format-Table -AutoSize | Out-String | Write-Host }
-    if ($s.CreativeCloud) { Write-Host '  Creative Cloud desktop app is installed - it can update Acrobat even when bUpdater = 0 (AdobeUpdateService).' -ForegroundColor Yellow }
+    $ccSvc = $s.Services | Where-Object { $_.Name -eq 'AdobeUpdateService' }
+    if ($s.CreativeCloud -and $ccSvc -and "$($ccSvc.StartType)" -ne 'Disabled') { Write-Host '  Creative Cloud is installed and its updater (AdobeUpdateService) is active - it can update Acrobat even when bUpdater = 0.' -ForegroundColor Yellow }
+    elseif ($s.CreativeCloud) { Write-Host '  Creative Cloud is installed; its updater (AdobeUpdateService) is disabled - OK.' -ForegroundColor Green }
 
     Write-Sub 'Default PDF handler'
     Write-Host "  Machine .pdf ProgId: $(if ($s.PdfProgId) { $s.PdfProgId } else { '(none)' })"
@@ -1234,6 +1236,26 @@ function Invoke-AdobeAcrobatStatus {
             Write-Host "  .pdf in policy: $(if ($pdf) { "$($pdf.ProgId) ($($pdf.ApplicationName))" } else { 'not set' })"
         } else { Write-Host '  Policy points to a file that does not exist / is not reachable.' -ForegroundColor Red }
     } else { Write-Host '  No default associations policy - each user keeps their own PDF default (often Edge).' }
+
+    Write-Sub 'Who updated Acrobat? (Windows Installer events, last 30 days)'
+    $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1022, 1033, 1036; StartTime = (Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue |
+        Where-Object { $_.Message -match 'Acrobat|Adobe Reader' } | Select-Object -First 10
+    if ($ev) {
+        $ev | Select-Object TimeCreated, Id,
+            @{ n = 'By'; e = { try { (New-Object Security.Principal.SecurityIdentifier($_.UserId)).Translate([Security.Principal.NTAccount]).Value } catch { "$($_.UserId)" } } },
+            @{ n = 'Event'; e = { ($_.Message -split "`n")[0].Trim() } } | Format-Table -AutoSize -Wrap | Out-String | Write-Host
+        Write-Host '  "NT AUTHORITY\SYSTEM" = an automated job (RMM patching, Adobe updater, SCCM/Intune). A user name = installed from a session.' -ForegroundColor DarkGray
+    } else { Write-Host '  No Acrobat install/update events in the last 30 days.' }
+    # RMM third-party patching logs (N-able N-central PME, N-able N-sight/RMM, ConnectWise Automate, Datto, NinjaOne) - generic search, nothing client-specific
+    $rmmLogRoots = 'C:\ProgramData\MspPlatform\PME\ThirdPartyPatch\logs', 'C:\ProgramData\SolarWinds MSP\PME\ThirdPartyPatch\logs',
+                   'C:\ProgramData\N-able Technologies', 'C:\ProgramData\NinjaRMMAgent', 'C:\ProgramData\CentraStage', 'C:\Windows\LTSvc'
+    $rmmLogs = foreach ($r in $rmmLogRoots) { if (Test-Path $r) { Get-ChildItem $r -Recurse -File -Filter '*Acrobat*' -ErrorAction SilentlyContinue } }
+    if ($rmmLogs) {
+        Write-Host '  RMM third-party patch logs for Acrobat (newest first):' -ForegroundColor Yellow
+        $rmmLogs | Sort-Object LastWriteTime -Descending | Select-Object -First 5 LastWriteTime, FullName | Format-Table -AutoSize -Wrap | Out-String | Write-Host
+        Write-Host '  If the newest log time matches the update above, your RMM pushed it - decline / exclude Adobe Acrobat in its patch policy.' -ForegroundColor Yellow
+        Write-Host '  RMM patching installs the .msp directly, so bUpdater / disabled Adobe services do NOT stop it (and the patch re-enables them).' -ForegroundColor Yellow
+    }
 
     Write-Sub 'Acrobat processes by session'
     $pr = Get-Process Acrobat, AcroRd32, AcroCEF, AdobeCollabSync -IncludeUserName -ErrorAction SilentlyContinue
