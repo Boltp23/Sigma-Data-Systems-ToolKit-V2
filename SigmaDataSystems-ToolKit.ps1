@@ -36,7 +36,7 @@
     v2.0 - adds: Adobe Acrobat/Reader Server 2016 start-up check + update freeze + all-users PDF default, internet drop monitor (PingInfo-style, LAN / gateway / WAN-ISP diagnosis), section menu, self-test, security posture, hardware/SMART, reliability, perf,
     boot performance, pending-reboot detail, Windows Update list/install, SFC/DISM, AD/DC health,
     backup/VSS health, shares/open files, advanced network (MTU/tracert/proxy/Wi-Fi), server roles,
-    quick fixes (spooler, network, Teams, Office, OneDrive + OneDrive won't-start diagnostics), software deployment (Ninite, vendor
+    quick fixes (spooler, network, Teams, Office, OneDrive + OneDrive won't-start diagnostics, Quick Access stale-pin cleanup), software deployment (Ninite, vendor
     MSIs, Microsoft 365 Apps via ODT, remove OEM Office), Sysinternals (Autoruns, Sigcheck, Handle,
     ProcDump, GUI tools), NirSoft reports, Microsoft SetupDiag and TSS. M365 incident response / audit:
     failed sign-in alert verdict, Microsoft-Extractor-Suite (Invictus IR), Hawk, CISA ScubaGear and Maester
@@ -1543,6 +1543,134 @@ function Invoke-SmtpTest {
             }
         }
     }
+}
+
+function Invoke-QuickAccessCleanup {
+    Write-Title '[!] File Explorer Quick Access - remove stale / stuck entries (per user)'
+    Write-Host "  Runs for: $env:USERNAME  ($env:APPDATA)" -ForegroundColor DarkGray
+    Write-Host '  Quick Access is per user - run the toolkit AS the affected user. Pins to a dead mapped drive or' -ForegroundColor DarkGray
+    Write-Host '  retired share often cannot be unpinned in Explorer and make it hang while the path times out.' -ForegroundColor DarkGray
+
+    $qaFile  = Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations\f01b4d95cf55d32a.automaticDestinations-ms'
+    $recent  = Join-Path $env:APPDATA 'Microsoft\Windows\Recent'
+    $shell   = New-Object -ComObject Shell.Application
+    $wsh     = New-Object -ComObject WScript.Shell
+    $liveDrv = @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { $_.Name.ToUpper() })
+
+    # Reachability without hanging: drive-letter paths check the drive exists; UNC paths are not probed
+    $state = {
+        param([string]$p)
+        if ([string]::IsNullOrWhiteSpace($p) -or $p -like 'shell:*' -or $p -like '::*') { return 'virtual' }
+        if ($p -match '^([A-Za-z]):') {
+            if ($liveDrv -notcontains $Matches[1].ToUpper()) { return 'DRIVE MISSING' }
+            if (Test-Path -LiteralPath $p) { return 'ok' } else { return 'NOT FOUND' }
+        }
+        if ($p -like '\\*') { return 'UNC (not tested)' }
+        return '?'
+    }
+
+    $load = {
+        $ns = $shell.Namespace('shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}')
+        $i = 0
+        @(if ($ns) { foreach ($it in $ns.Items()) {
+            $i++
+            $pin = $null; try { $pin = [bool]$it.ExtendedProperty('System.Home.IsPinned') } catch { }
+            [pscustomobject]@{ No = $i; Name = $it.Name; Pinned = $pin; State = (& $state $it.Path); Path = $it.Path; Item = $it }
+        } })
+    }
+
+    $items = & $load
+    if (-not $items) { Write-Host '  Quick Access returned no items (or the shell namespace is unavailable in this session).' -ForegroundColor Yellow }
+    else { $items | Select-Object No, Name, Pinned, State, Path | Format-Table -AutoSize | Out-String -Width 220 | Write-Host }
+    $stale = @($items | Where-Object { $_.State -in 'DRIVE MISSING','NOT FOUND' })
+    if ($stale) { Write-Host "  $($stale.Count) entr$(if ($stale.Count -eq 1) {'y'} else {'ies'}) point at a missing drive / path." -ForegroundColor Yellow }
+    if ($items -and -not ($items | Where-Object { $null -ne $_.Pinned })) { Write-Host '  Note: this Windows build does not expose the pinned flag - option 2 will re-pin every folder entry you keep.' -ForegroundColor DarkGray }
+
+    Write-Host ''
+    Write-Host '  1. Unpin / remove specific entries by number (tries the Explorer verbs - often fails on dead paths)'
+    Write-Host '  2. RESET Quick Access, then re-pin the folders you keep (reliable; drops the chosen entries + frequent/recent list)'
+    Write-Host '  3. Delete Recent-file shortcuts that point at a drive letter or path prefix'
+    $choice = "$(Read-Default 'Choose 1-3 (blank = done)' '')"
+    if (-not $choice) { return }
+
+    # Which entries to drop: numbers ("3,7"), a path prefix ("W:\" or "\\oldserver\share"), or STALE
+    $pickDrop = {
+        $sel = "$(Read-Default 'Entries to remove: numbers (e.g. 3,7), a path prefix (e.g. W:\ or \\server\share), or STALE for every missing drive/path' 'STALE')"
+        if (-not $sel) { return @() }
+        if ($sel -ieq 'STALE') { return $stale }
+        if ($sel -match '^[\d,\s;]+$') { $nums = @($sel -split '[,;\s]+' | Where-Object { $_ } | ForEach-Object { [int]$_ }); return @($items | Where-Object { $nums -contains $_.No }) }
+        return @($items | Where-Object { $_.Path -and $_.Path.StartsWith($sel, [StringComparison]::OrdinalIgnoreCase) })
+    }
+
+    switch ($choice) {
+        '1' {
+            $drop = & $pickDrop
+            if (-not $drop) { Write-Host '  Nothing matched.' -ForegroundColor Yellow; return }
+            $drop | Select-Object No, Name, Path | Format-Table -AutoSize | Out-String -Width 220 | Write-Host
+            if (-not (Confirm-Change "Unpin / remove the $($drop.Count) Quick Access entr$(if ($drop.Count -eq 1) {'y'} else {'ies'}) listed above.")) { return }
+            foreach ($d in $drop) {
+                $verbs = @($d.Item.Verbs() | Where-Object { ($_.Name -replace '&','') -match 'Unpin from Quick access|Remove from Quick access|Unpin from Home|Remove from Home' })
+                if ($verbs) { $verbs | ForEach-Object { try { $_.DoIt() } catch { } } }
+                else { try { $d.Item.InvokeVerb('unpinfromhome') } catch { }; try { $d.Item.InvokeVerb('remove') } catch { } }
+            }
+            Start-Sleep -Seconds 2
+            $left = @(& $load | Where-Object { $p = $_.Path; $drop | Where-Object { $_.Path -eq $p } })
+            if ($left) {
+                Write-Host "  $($left.Count) entr$(if ($left.Count -eq 1) {'y is'} else {'ies are'}) still there - Explorer will not unpin a path it cannot resolve." -ForegroundColor Yellow
+                Write-Host '  Run this option again and pick 2 (reset + re-pin) - that always works.' -ForegroundColor Yellow
+            } else { Write-Host '  Removed. Press F5 in Explorer if it still shows.' -ForegroundColor Green }
+        }
+        '2' {
+            $drop = & $pickDrop
+            if (-not $drop) { Write-Host '  Nothing matched - nothing to remove.' -ForegroundColor Yellow; return }
+            $dropPaths = @($drop | ForEach-Object { $_.Path })
+            $pinFlag = [bool]($items | Where-Object { $null -ne $_.Pinned })
+            $keep = @($items | Where-Object {
+                $_.Path -and ($dropPaths -notcontains $_.Path) -and $_.State -notin 'DRIVE MISSING','NOT FOUND' -and
+                $(if ($pinFlag) { $_.Pinned } else { $_.State -eq 'virtual' -or (Test-Path -LiteralPath $_.Path -PathType Container) })
+            })
+            Write-Host "`n  Will REMOVE:" -ForegroundColor Yellow
+            $drop | Select-Object Name, Path | Format-Table -AutoSize | Out-String -Width 220 | Write-Host
+            Write-Host '  Will RE-PIN afterwards:' -ForegroundColor Green
+            if ($keep) { $keep | Select-Object Name, Path | Format-Table -AutoSize | Out-String -Width 220 | Write-Host } else { Write-Host '    (nothing)' }
+            if (-not (Confirm-Change 'Restart Explorer, delete this user''s Quick Access pin/frequent-folder list (backed up first), and re-pin the folders listed above.')) { return }
+
+            $dir = Get-OutDir 'QuickAccess'; $stamp = Get-Stamp
+            $keep | Select-Object Name, Path | Export-Csv (Join-Path $dir "QuickAccess_repin_$stamp.csv") -NoTypeInformation
+            if (Test-Path -LiteralPath $qaFile) { Copy-Item -LiteralPath $qaFile -Destination (Join-Path $dir "f01b4d95cf55d32a.automaticDestinations-ms_$stamp.bak") -Force }
+            Write-Host "  Backup + re-pin list saved to $dir" -ForegroundColor DarkGray
+
+            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            Remove-Item -LiteralPath $qaFile -Force -ErrorAction SilentlyContinue
+            if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+            Start-Sleep -Seconds 5
+
+            $shell2 = New-Object -ComObject Shell.Application
+            foreach ($k in $keep) {
+                $f = $null; try { $f = $shell2.Namespace($k.Path) } catch { }
+                if ($f) { try { $f.Self.InvokeVerb('pintohome'); Write-Host "  Re-pinned  $($k.Path)" -ForegroundColor Green } catch { Write-Host "  Could not re-pin $($k.Path)" -ForegroundColor Yellow } }
+                else { Write-Host "  Could not open $($k.Path) - re-pin by hand" -ForegroundColor Yellow }
+            }
+            Write-Host '  Done. If Explorer restarted elevated, sign out/in (or restart Explorer from Task Manager) for a normal shell.' -ForegroundColor DarkGray
+            Write-Host '  To undo: copy the .bak file back over the original (Explorer closed) - path shown above.' -ForegroundColor DarkGray
+        }
+        '3' {
+            $prefix = "$(Read-Default 'Remove Recent shortcuts whose target starts with (e.g. W:\ or \\oldserver\share)' '')"
+            if (-not $prefix) { return }
+            $lnks = @(Get-ChildItem -LiteralPath $recent -Filter *.lnk -File -ErrorAction SilentlyContinue | ForEach-Object {
+                $t = $null; try { $t = $wsh.CreateShortcut($_.FullName).TargetPath } catch { }
+                if ($t -and $t.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { [pscustomobject]@{ Shortcut = $_.Name; Target = $t; Full = $_.FullName } }
+            })
+            if (-not $lnks) { Write-Host "  No Recent shortcuts point at $prefix - a stuck entry is then a pinned/frequent folder: use option 2." -ForegroundColor Yellow; return }
+            $lnks | Select-Object Shortcut, Target | Format-Table -AutoSize | Out-String -Width 220 | Write-Host
+            if (Confirm-Change "Delete these $($lnks.Count) Recent-file shortcut(s) (the files themselves are not touched).") {
+                $lnks | ForEach-Object { Remove-Item -LiteralPath $_.Full -Force -ErrorAction SilentlyContinue }
+                Write-Host '  Deleted.' -ForegroundColor Green
+            }
+        }
+    }
+    Write-Host '  Tip: if a mapped drive is retired for good, also remove it: net use X: /delete' -ForegroundColor DarkGray
 }
 
 function Invoke-ZipBrowserRepair {
@@ -4193,6 +4321,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'OneDrive will not start / sync - diagnostics (policy block, installs, startup, logs)'; Action = { Invoke-OneDriveDiag } }
     @{               Text = '[!] OneDrive reset';                                                            Action = { Invoke-OneDriveReset } }
     @{               Text = '[!] Repair .zip association / reset default browser (per user)';               Action = { Invoke-ZipBrowserRepair } }
+    @{               Text = '[!] File Explorer Quick Access - remove stale / stuck pins (dead mapped drive, old share)'; Action = { Invoke-QuickAccessCleanup } }
     @{               Text = '[!] Remove bloatware (OEM + consumer Store apps)';                              Action = { Invoke-RemoveBloatware } }
     @{               Text = '[!] Power settings - never sleep / hibernate';                                  Action = { Invoke-PowerSettings } }
     @{ Test='safe'; Text = 'Check scanner (Panini etc.) hangs / not detected - diagnostics + optional USB power fix'; Action = { Invoke-CheckScannerDiag } }
