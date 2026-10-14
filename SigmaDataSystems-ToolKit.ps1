@@ -451,6 +451,28 @@ function Invoke-WURepairServer {
     }
 }
 
+function Invoke-WUControl {
+    Write-Title '[!] Stop / pause / disable / restore Windows Update'
+    Write-Host '  1  Stop now        - kill a stuck install (workers + services), nothing persisted'
+    Write-Host '  2  Pause           - built-in pause, 1-35 days, expires on its own'
+    Write-Host '  3  Disable (hard)  - block all updates until Restore (also blocks RMM patching)'
+    Write-Host '  4  Restore         - undo Pause/Disable, put original update policy back'
+    Write-Host '  5  Status          - services, policy, pause, pending reboot (read-only)'
+    $c = Read-Default 'Choice' '5'
+    switch ($c) {
+        '1' { if (Confirm-Change 'Stop all Windows Update activity now.') { Invoke-Tool 'Kill-WindowsUpdate' ([ordered]@{ Mode = 'Stop' }) | Out-Null } }
+        '2' { $d = Read-Int 'Pause for how many days (1-35)?' 7
+              if ($d -lt 1 -or $d -gt 35) { Write-Host '  Must be 1-35.' -ForegroundColor Red; return }
+              if (Confirm-Change "Pause Windows Update for $d day(s).") { Invoke-Tool 'Kill-WindowsUpdate' ([ordered]@{ Mode = 'Pause'; PauseDays = $d }) | Out-Null } }
+        '3' { Write-Host '  Points Windows Update at a dead local server, disables wuauserv/UsoSvc/WaaSMedic and update tasks.' -ForegroundColor Yellow
+              Write-Host '  Also exclude this device from patching in your RMM, or its patch scans will alert.' -ForegroundColor Yellow
+              if (Confirm-Change 'Disable Windows Update on this machine until Restore is run.') { Invoke-Tool 'Kill-WindowsUpdate' ([ordered]@{ Mode = 'Disable' }) | Out-Null } }
+        '4' { if (Confirm-Change 'Restore Windows Update to normal.') { Invoke-Tool 'Kill-WindowsUpdate' ([ordered]@{ Mode = 'Restore' }) | Out-Null } }
+        '5' { Invoke-Tool 'Kill-WindowsUpdate' ([ordered]@{ Mode = 'Status' }) | Out-Null }
+        default { Write-Host '  Not a valid choice.' -ForegroundColor Red }
+    }
+}
+
 function Invoke-Win11Troubleshooter {
     Write-Title 'Windows 11 upgrade troubleshooter'
     Invoke-Tool 'Troubleshoot-Win11Upgrade' ([ordered]@{ ListActions = $true }) | Out-Null
@@ -4382,6 +4404,7 @@ $Script:Menu = @(
     @{ Test='slow'; Text = 'Windows Update - list available updates + history (optional install)';        Action = { Invoke-WindowsUpdateList } }
     @{               Text = '[!] Reset Windows Update components (Windows 10/11)';                           Action = { Invoke-WUReset } }
     @{               Text = '[!] Repair Windows Update (Windows Server 2016+)';                              Action = { Invoke-WURepairServer } }
+    @{               Text = '[!] Stop / pause / disable / restore Windows Update';                     Action = { Invoke-WUControl } }
     @{               Text = '[!] System file repair (DISM RestoreHealth + SFC)';                             Action = { Invoke-SfcDism } }
     @{ Test='safe'; Text = 'Windows 11 upgrade troubleshooter (status, SetupDiag, logs...)';                Action = { Invoke-Win11Troubleshooter } }
     @{ Test='net';  Text = 'Microsoft SetupDiag - why did an upgrade fail? (downloads from Microsoft)';     Action = { Invoke-SetupDiag } }
@@ -23359,6 +23382,240 @@ finally {
     Write-Host "Log saved: $logFile" -ForegroundColor Gray
     Stop-Transcript | Out-Null
 }
+'@
+
+# ======================= Kill-WindowsUpdate.ps1 =======================
+$Script:Payloads['Kill-WindowsUpdate'] = @'
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Stop, pause, disable, or restore Windows Update on the local machine.
+
+.DESCRIPTION
+    Sigma Data Systems Inc. - universal remediation script (no client-specific values).
+
+    Modes:
+      Stop     (default) Kill in-progress update activity right now: stops update
+               services and kills update worker processes. Nothing is persisted;
+               Windows will resume on its normal schedule / next reboot.
+      Pause    Uses the built-in Windows Update pause (same as Settings > Pause),
+               1-35 days. Survives reboots, expires on its own.
+      Disable  Hard block: Stop + WU policy pointed at a dead local server, internet WU
+               locations blocked, Settings page locked, wuauserv/UsoSvc disabled with
+               auto-restart cleared, WaaSMedicSvc disabled (when permitted), update tasks
+               disabled. Original WU policy is backed up to %ProgramData%\SDSI first.
+               Persists until Restore. WARNING: blocks N-central Patch Management too -
+               also exclude the device from patching in N-central.
+      Restore  Reverses Pause and Disable, sets services back to Windows defaults.
+      Status   Shows current service, policy, pause, and pending-reboot state.
+
+.EXAMPLE
+    .\Kill-WindowsUpdate.ps1                     # kill it right now
+    .\Kill-WindowsUpdate.ps1 -Mode Pause -PauseDays 14
+    .\Kill-WindowsUpdate.ps1 -Mode Disable
+    .\Kill-WindowsUpdate.ps1 -Mode Restore
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('Stop','Pause','Disable','Restore','Status')]
+    [string]$Mode = 'Stop',
+
+    [ValidateRange(1,35)]
+    [int]$PauseDays = 7
+)
+
+$ErrorActionPreference = 'Continue'
+
+$UpdateServices  = 'wuauserv','UsoSvc','bits','dosvc'
+$UpdateProcesses = 'wuauclt','usoclient','MoUsoCoreWorker','TiWorker',
+                   'WaaSMedicAgent','MusNotification','MusNotificationUx',
+                   'SIHClient','UpdateAssistant','Windows10UpgraderApp'
+$PolicyKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+$UxKey       = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+$PauseValues = 'PauseUpdatesStartTime','PauseUpdatesExpiryTime',
+               'PauseFeatureUpdatesStartTime','PauseFeatureUpdatesEndTime',
+               'PauseQualityUpdatesStartTime','PauseQualityUpdatesEndTime'
+$TaskPaths   = '\Microsoft\Windows\UpdateOrchestrator\','\Microsoft\Windows\WindowsUpdate\','\Microsoft\Windows\WaaSMedic\'
+$WUPolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+$BackupDir   = Join-Path $env:ProgramData 'SDSI'
+$BackupFile  = Join-Path $BackupDir 'WUPolicyBackup.reg'
+
+function Write-Step($msg, $color = 'Cyan') { Write-Host "[*] $msg" -ForegroundColor $color }
+
+function Stop-ServiceWithTimeout([string]$Name, [int]$TimeoutSec = 15) {
+    $s = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if (-not $s -or $s.Status -eq 'Stopped') { return }
+
+    # Non-blocking stop request (Stop-Service can wait forever on a busy wuauserv)
+    sc.exe stop $Name | Out-Null
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Service $Name).Status -ne 'Stopped' -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+    }
+
+    if ((Get-Service $Name).Status -ne 'Stopped') {
+        $svcPid = (Get-CimInstance Win32_Service -Filter "Name='$Name'").ProcessId
+        if ($svcPid -gt 0) {
+            # Only kill the host if this service is alone in it (don't take out shared svchosts)
+            $shared = @(Get-CimInstance Win32_Service -Filter "ProcessId=$svcPid")
+            if ($shared.Count -eq 1) {
+                Write-Host "    $Name hung - killing host PID $svcPid" -ForegroundColor Yellow
+                taskkill /PID $svcPid /F | Out-Null
+                Start-Sleep -Seconds 1
+            } else {
+                Write-Host "    $Name hung but shares PID $svcPid with $($shared.Count - 1) other service(s) - left running" -ForegroundColor Yellow
+            }
+        }
+    }
+    Write-Host "    $Name -> $((Get-Service $Name).Status)"
+}
+
+function Stop-UpdateActivity {
+    # Kill workers first - this is usually what keeps wuauserv from stopping
+    Write-Step "Killing update worker processes..."
+    foreach ($p in $UpdateProcesses + 'TrustedInstaller') {
+        Get-Process -Name $p -ErrorAction SilentlyContinue | ForEach-Object {
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+            Write-Host "    killed $($_.Name) (PID $($_.Id))"
+        }
+    }
+    Write-Step "Stopping update services (15s timeout each)..."
+    foreach ($svc in $UpdateServices) { Stop-ServiceWithTimeout -Name $svc }
+}
+
+function Set-UpdatePause([int]$Days) {
+    if (-not (Test-Path $UxKey)) { New-Item -Path $UxKey -Force | Out-Null }
+    $start = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $end   = (Get-Date).AddDays($Days).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    foreach ($n in 'PauseUpdatesStartTime','PauseFeatureUpdatesStartTime','PauseQualityUpdatesStartTime') {
+        Set-ItemProperty -Path $UxKey -Name $n -Value $start -Type String
+    }
+    foreach ($n in 'PauseUpdatesExpiryTime','PauseFeatureUpdatesEndTime','PauseQualityUpdatesEndTime') {
+        Set-ItemProperty -Path $UxKey -Name $n -Value $end -Type String
+    }
+    Write-Step "Updates paused until $((Get-Date).AddDays($Days).ToString('yyyy-MM-dd HH:mm'))" 'Green'
+}
+
+function Set-UpdateTasks([bool]$Enable) {
+    $TaskPaths | ForEach-Object { Get-ScheduledTask -TaskPath $_ -ErrorAction SilentlyContinue } | ForEach-Object {
+        try {
+            if ($Enable) { Enable-ScheduledTask  -InputObject $_ -ErrorAction Stop | Out-Null }
+            else         { Disable-ScheduledTask -InputObject $_ -ErrorAction Stop | Out-Null }
+            Write-Host "    $($_.TaskName) -> $(if($Enable){'Enabled'}else{'Disabled'})"
+        } catch {
+            Write-Host "    $($_.TaskName) -> protected by OS, skipped" -ForegroundColor DarkGray
+        }
+    }
+}
+
+function Show-Status {
+    Write-Step "Services"
+    Get-Service -Name ($UpdateServices + 'WaaSMedicSvc') -ErrorAction SilentlyContinue |
+        Select-Object Name, Status, StartType | Format-Table -AutoSize
+
+    Write-Step "Policy (NoAutoUpdate)"
+    $na = (Get-ItemProperty -Path $PolicyKey -Name NoAutoUpdate -ErrorAction SilentlyContinue).NoAutoUpdate
+    Write-Host "    NoAutoUpdate = $(if ($null -eq $na) {'not set'} else {$na})"
+    $wus = (Get-ItemProperty -Path $WUPolicyKey -Name WUServer -ErrorAction SilentlyContinue).WUServer
+    $use = (Get-ItemProperty -Path $PolicyKey -Name UseWUServer -ErrorAction SilentlyContinue).UseWUServer
+    Write-Host "    WUServer     = $(if ($wus) {$wus} else {'not set'})  (UseWUServer=$(if ($null -eq $use) {'not set'} else {$use}))"
+    Write-Host "    Hard block   = $(if ($wus -like '*127.0.0.1*' -and $use -eq 1) {'ACTIVE'} else {'off'})"
+
+    Write-Step "Pause"
+    $exp = (Get-ItemProperty -Path $UxKey -Name PauseUpdatesExpiryTime -ErrorAction SilentlyContinue).PauseUpdatesExpiryTime
+    Write-Host "    Paused until = $(if ($exp) {([datetime]$exp).ToLocalTime()} else {'not paused'})"
+
+    Write-Step "Pending reboot"
+    $pending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
+               (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
+    Write-Host "    Reboot pending = $pending"
+}
+
+switch ($Mode) {
+    'Stop' {
+        Stop-UpdateActivity
+        Write-Step "Done. Not persistent - Windows Update will resume on schedule/reboot." 'Green'
+    }
+    'Pause' {
+        Stop-UpdateActivity
+        Set-UpdatePause -Days $PauseDays
+    }
+    'Disable' {
+        Stop-UpdateActivity
+
+        # Back up existing WU policy (RMM/WSUS/GPO values) once, so Restore can put it back exactly
+        if (-not (Test-Path $BackupDir)) { New-Item -Path $BackupDir -ItemType Directory -Force | Out-Null }
+        if (-not (Test-Path $BackupFile)) {
+            if (Test-Path $WUPolicyKey) {
+                reg.exe export 'HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' $BackupFile /y | Out-Null
+                Write-Step "Backed up existing Windows Update policy to $BackupFile"
+            } else {
+                Set-Content -Path $BackupFile -Value 'NONE' -Encoding ASCII
+            }
+        }
+
+        Write-Step "Applying hard-block policies..."
+        foreach ($k in $WUPolicyKey, $PolicyKey) { if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null } }
+        # Point the update client at a dead local server so nothing (Windows, RMM, user) can download
+        Set-ItemProperty -Path $WUPolicyKey -Name WUServer       -Value 'http://127.0.0.1:8530' -Type String
+        Set-ItemProperty -Path $WUPolicyKey -Name WUStatusServer -Value 'http://127.0.0.1:8530' -Type String
+        Set-ItemProperty -Path $WUPolicyKey -Name DoNotConnectToWindowsUpdateInternetLocations -Value 1 -Type DWord
+        Set-ItemProperty -Path $WUPolicyKey -Name DisableWindowsUpdateAccess -Value 1 -Type DWord
+        Set-ItemProperty -Path $WUPolicyKey -Name SetDisableUXWUAccess -Value 1 -Type DWord
+        Set-ItemProperty -Path $PolicyKey   -Name UseWUServer  -Value 1 -Type DWord
+        Set-ItemProperty -Path $PolicyKey   -Name NoAutoUpdate -Value 1 -Type DWord
+        Write-Host "    WUServer -> 127.0.0.1 (dead), internet WU locations blocked, Settings page locked"
+
+        Write-Step "Disabling services and their auto-restart..."
+        foreach ($svc in 'wuauserv','UsoSvc') {
+            sc.exe config  $svc start= disabled | Out-Null
+            sc.exe failure $svc reset= 0 actions= '""' | Out-Null
+            Write-Host "    $svc -> $((Get-Service $svc).StartType), recovery actions cleared"
+        }
+        # WaaSMedicSvc ("Windows Update Medic") re-enables wuauserv; its key is OS-protected.
+        # Usually succeeds when run as SYSTEM (N-central), may be denied as a normal admin.
+        try {
+            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc' -Name Start -Value 4 -Type DWord -ErrorAction Stop
+            Write-Host "    WaaSMedicSvc -> Disabled"
+        } catch {
+            Write-Host "    WaaSMedicSvc -> protected, could not disable (policy block above still holds)" -ForegroundColor Yellow
+        }
+
+        Write-Step "Disabling update scheduled tasks..."
+        Set-UpdateTasks -Enable $false
+
+        Write-Step "Windows Update disabled. Run -Mode Restore to undo." 'Yellow'
+        Write-Host "    Also exclude this device from patching in your RMM, or its patch scans will alert/fail." -ForegroundColor DarkGray
+    }
+    'Restore' {
+        Write-Step "Removing hard-block policy..."
+        foreach ($n in 'WUServer','WUStatusServer','DoNotConnectToWindowsUpdateInternetLocations','DisableWindowsUpdateAccess','SetDisableUXWUAccess') {
+            Remove-ItemProperty -Path $WUPolicyKey -Name $n -ErrorAction SilentlyContinue
+        }
+        foreach ($n in 'UseWUServer','NoAutoUpdate') { Remove-ItemProperty -Path $PolicyKey -Name $n -ErrorAction SilentlyContinue }
+        if ((Test-Path $BackupFile) -and ((Get-Content $BackupFile -TotalCount 1) -ne 'NONE')) {
+            reg.exe import $BackupFile 2>$null
+            Write-Step "Re-imported original Windows Update policy from backup"
+        }
+        Remove-Item $BackupFile -Force -ErrorAction SilentlyContinue
+        foreach ($n in $PauseValues) { Remove-ItemProperty -Path $UxKey -Name $n -ErrorAction SilentlyContinue }
+        try { Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc' -Name Start -Value 3 -Type DWord -ErrorAction Stop } catch {}
+        sc.exe failure wuauserv reset= 86400 actions= restart/60000/restart/60000// | Out-Null
+        Write-Step "Restoring service defaults..."
+        sc.exe config wuauserv start= demand      | Out-Null
+        sc.exe config UsoSvc   start= delayed-auto | Out-Null
+        sc.exe config bits     start= demand      | Out-Null
+        sc.exe config dosvc    start= delayed-auto | Out-Null
+        Start-Service UsoSvc, wuauserv -ErrorAction SilentlyContinue
+        Write-Step "Re-enabling UpdateOrchestrator tasks..."
+        Set-UpdateTasks -Enable $true
+        Write-Step "Windows Update restored." 'Green'
+    }
+    'Status' { }
+}
+
+Write-Host ""
+Show-Status
 '@
 #endregion
 
