@@ -34,7 +34,7 @@
 
 .NOTES
     v2.0 - adds: Adobe Acrobat/Reader Server 2016 start-up check + update freeze + all-users PDF default, internet drop monitor (PingInfo-style, LAN / gateway / WAN-ISP diagnosis), section menu, self-test, security posture, hardware/SMART, reliability, perf,
-    boot performance, pending-reboot detail, Windows Update list/install, SFC/DISM, AD/DC health,
+    boot performance, pending-reboot detail, Windows Update list/install, SFC/DISM, AD/DC health, stale DC DNS records,
     backup/VSS health, shares/open files, advanced network (MTU/tracert/proxy/Wi-Fi), server roles,
     quick fixes (spooler, network, Teams, Office, OneDrive + OneDrive won't-start diagnostics, Quick Access stale-pin cleanup), software deployment (Ninite, vendor
     MSIs, Microsoft 365 Apps via ODT, remove OEM Office), Sysinternals (Autoruns, Sigcheck, Handle,
@@ -3159,6 +3159,145 @@ function Invoke-ADHealth {
     Write-Host "  Full output saved under $dir" -ForegroundColor Green
 }
 
+function Invoke-DcDnsStaleRecords {
+    Write-Title 'AD DNS - stale / unreachable domain controller records (domain A, gc, DomainDnsZones, SRV)'
+    Write-Host '  Finds DNS records that send clients to a DC address that no longer exists. Typical symptoms:' -ForegroundColor Gray
+    Write-Host '  GP errors 1058/1129 (cannot read \\domain\SysVol), slow logons, Explorer/Outlook hangs, Netlogon 5719.' -ForegroundColor Gray
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    if (-not $cs.PartOfDomain) { Write-Host '  This machine is not domain-joined - nothing to check.' -ForegroundColor Red; return }
+    $domain = $cs.Domain
+    $forest = try { [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Forest.Name } catch { $domain }
+    $dir = Get-OutDir 'ADHealth'; $stamp = Get-Stamp
+
+    # ---- Domain controllers and their real IPs
+    Write-Sub "Domain controllers for $domain"
+    $dcNames = @((nltest /dclist:$domain 2>$null) | ForEach-Object { if ($_ -match '^\s+([A-Za-z0-9\-_]+(\.[A-Za-z0-9\-_]+)+)\s') { $Matches[1] } } | Select-Object -Unique)
+    if (-not $dcNames) { Write-Host '  Could not list DCs (nltest /dclist failed).' -ForegroundColor Red; return }
+    $dcIps = @{}
+    $localDns = [bool](Get-Service -Name DNS -ErrorAction SilentlyContinue)
+    foreach ($dcName in $dcNames) {
+        $ips = @(); $how = ''
+        $short = $dcName.Split('.')[0]
+        if ($short -ieq $env:COMPUTERNAME) {
+            $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object { $_.IPAddress }); $how = 'local adapters'
+        } else {
+            try {
+                $ips = @(Get-CimInstance Win32_NetworkAdapterConfiguration -ComputerName $dcName -Filter 'IPEnabled=TRUE' -OperationTimeoutSec 15 -ErrorAction Stop |
+                    ForEach-Object { $_.IPAddress } | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' -and $_ -notlike '169.254.*' }); $how = 'remote adapters (CIM)'
+            } catch { }
+            if (-not $ips) { $ips = @(Resolve-DnsName $dcName -Type A -DnsOnly -ErrorAction SilentlyContinue | Where-Object IPAddress | ForEach-Object { $_.IPAddress }); $how = 'DNS host record (CIM unavailable)' }
+        }
+        $dcIps[$dcName.ToLower()] = $ips
+        Write-Host ("  {0,-40} {1,-32} [{2}]" -f $dcName, ($ips -join ', '), $how)
+    }
+    $validIps = @($dcIps.Values | ForEach-Object { $_ } | Select-Object -Unique)
+
+    # ---- Records to check
+    $names = @(
+        @{ Zone = $domain;            Host = '@';              Fqdn = $domain;                     What = 'Domain name (\\domain\SysVol, GP)' }
+        @{ Zone = $domain;            Host = 'DomainDnsZones'; Fqdn = "DomainDnsZones.$domain";    What = 'DomainDnsZones partition' }
+        @{ Zone = $forest;            Host = 'ForestDnsZones'; Fqdn = "ForestDnsZones.$forest";    What = 'ForestDnsZones partition' }
+        @{ Zone = "_msdcs.$forest";   Host = 'gc';             Fqdn = "gc._msdcs.$forest";         What = 'Global catalog (logon, Outlook GAL)' }
+    )
+    $dnsServer = if ($localDns) { $env:COMPUTERNAME } else { ($dcNames | Select-Object -First 1) }
+    $useServerApi = $localDns -and (Get-Module -ListAvailable -Name DnsServer)
+    if (-not $useServerApi) {
+        Write-Host "`n  DnsServer module/role not on this machine - read-only check via DNS queries. Run this option ON a DC to see timestamps and remove records." -ForegroundColor DarkYellow
+        $dnsServer = Read-Default 'DNS server to query' (($validIps | Select-Object -First 1))
+    }
+
+    Write-Sub "Checking records on $dnsServer (each address tested on LDAP 389)"
+    $rows = foreach ($n in $names) {
+        $recs = @()
+        if ($useServerApi) {
+            $zoneName = $n.Zone; $hostName = $n.Host
+            if (-not (Get-DnsServerZone -Name $zoneName -ErrorAction SilentlyContinue)) {   # _msdcs stored inside the forest zone instead of its own zone
+                if ($n.Host -eq 'gc') { $zoneName = $forest; $hostName = 'gc._msdcs' } else { continue }
+            }
+            $recs = @(Get-DnsServerResourceRecord -ZoneName $zoneName -Name $hostName -RRType A -ErrorAction SilentlyContinue |
+                ForEach-Object { [pscustomobject]@{ Zone = $zoneName; HostName = $hostName; IP = $_.RecordData.IPv4Address.IPAddressToString; Timestamp = $_.Timestamp; Obj = $_ } })
+        } else {
+            $recs = @(Resolve-DnsName $n.Fqdn -Type A -Server $dnsServer -DnsOnly -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' -and $_.Section -eq 'Answer' } |
+                ForEach-Object { [pscustomobject]@{ Zone = $n.Zone; HostName = $n.Host; IP = $_.IPAddress; Timestamp = $null; Obj = $null } })
+        }
+        foreach ($r in $recs) {
+            $isDc = $r.IP -in $validIps
+            $ldap = Test-TcpPort $r.IP 389 2000
+            $status = if ($isDc -and $ldap) { 'OK' } elseif (-not $isDc -and -not $ldap) { 'STALE' } elseif (-not $isDc) { 'NOT-A-DC (responds)' } else { 'DC-UNREACHABLE' }
+            [pscustomobject]@{
+                Status    = $status
+                Record    = $n.Fqdn
+                Used_for  = $n.What
+                IP        = $r.IP
+                Timestamp = $(if ($useServerApi) { if ($r.Timestamp) { $r.Timestamp } else { 'static' } } else { 'n/a' })
+                LDAP389   = $ldap
+                Zone      = $r.Zone
+                HostName  = $r.HostName
+                _Obj      = $r.Obj
+            }
+        }
+    }
+    $rows = @($rows)
+    if (-not $rows) { Write-Host '  No records returned - check the DNS server name.' -ForegroundColor Red; return }
+    foreach ($r in $rows) {
+        $c = switch -Wildcard ($r.Status) { 'OK' { 'Green' } 'STALE' { 'Red' } default { 'Yellow' } }
+        Write-Host ("  {0,-20} {1,-38} {2,-16} {3}" -f $r.Status, $r.Record, $r.IP, $r.Timestamp) -ForegroundColor $c
+    }
+    $csv = Join-Path $dir "DcDnsRecords_$stamp.csv"
+    $rows | Select-Object Status, Record, Used_for, IP, Timestamp, LDAP389, Zone, HostName | Export-Csv $csv -NoTypeInformation
+
+    # ---- SRV records pointing at hosts that are not current DCs (report only)
+    Write-Sub 'DC locator SRV records (targets that are not current DCs)'
+    $srvBad = foreach ($s in "_ldap._tcp.dc._msdcs.$domain", "_kerberos._tcp.dc._msdcs.$domain", "_ldap._tcp.$domain", "_kerberos._tcp.$domain", "_gc._tcp.$forest") {
+        Resolve-DnsName $s -Type SRV -Server $(if ($useServerApi) { '127.0.0.1' } else { $dnsServer }) -DnsOnly -ErrorAction SilentlyContinue |
+            Where-Object { $_.Type -eq 'SRV' -and $_.NameTarget -and ($_.NameTarget.ToLower().TrimEnd('.') -notin $dcIps.Keys) } |
+            ForEach-Object { [pscustomobject]@{ SRV = $s; Target = $_.NameTarget } }
+    }
+    if ($srvBad) { $srvBad | Format-Table -AutoSize; Write-Host '  These name a DC that no longer exists - do AD metadata cleanup for it (ntdsutil / ADUC Domain Controllers OU), then delete its SRV/A records.' -ForegroundColor Yellow }
+    else { Write-Host '  All SRV targets are current DCs.' -ForegroundColor Green }
+
+    if ($useServerApi) {
+        Write-Sub 'Aging / scavenging (stale records are normally removed automatically)'
+        $scv = Get-DnsServerScavenging -ErrorAction SilentlyContinue
+        Write-Host ("  Server scavenging: {0}   interval: {1}   last run: {2}" -f $(if ($scv.ScavengingState) { 'ON' } else { 'OFF' }), $scv.ScavengingInterval, $scv.LastScavengeTime)
+        foreach ($z in @($domain, "_msdcs.$forest") | Select-Object -Unique) {
+            $ag = Get-DnsServerZoneAging -Name $z -ErrorAction SilentlyContinue
+            if ($ag) { Write-Host ("  Zone {0,-36} aging: {1}" -f $z, $(if ($ag.AgingEnabled) { 'ON' } else { 'OFF' })) }
+        }
+    }
+
+    $stale = @($rows | Where-Object { $_.Status -eq 'STALE' })
+    if (-not $stale) { Write-Host "`n  No stale DC records found.  CSV: $csv" -ForegroundColor Green; return }
+    Write-Host "`n  $($stale.Count) stale record(s): not a DC address and nothing answers on LDAP. Clients that pick them wait for a timeout." -ForegroundColor Red
+    if (-not $useServerApi) { Write-Host "  Run this option on a DC to remove them.  CSV: $csv" -ForegroundColor Yellow; return }
+
+    if (Confirm-Change ("Delete $($stale.Count) stale DNS record(s): " + (($stale | ForEach-Object { "$($_.Record) -> $($_.IP)" }) -join '; '))) {
+        foreach ($s in $stale) {
+            try { Remove-DnsServerResourceRecord -ZoneName $s.Zone -InputObject $s._Obj -Force -ErrorAction Stop; Write-Host "  Removed $($s.Record) -> $($s.IP)" -ForegroundColor Green }
+            catch { Write-Host "  Failed $($s.Record) -> $($s.IP): $($_.Exception.Message)" -ForegroundColor Red }
+        }
+        Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
+        if (Get-Command repadmin.exe -ErrorAction SilentlyContinue) { Write-Host '  Replicating (repadmin /syncall /AdeP)...' -ForegroundColor Gray; repadmin /syncall /AdeP 2>&1 | Out-Null; Start-Sleep 15 }
+        Write-Sub "What each DC now answers for $domain (other DCs can lag a few minutes - rerun this option on any DC still showing the stale IP)"
+        foreach ($dcName in $dcNames) {
+            $ans = @(Resolve-DnsName $domain -Type A -Server $dcName -DnsOnly -ErrorAction SilentlyContinue | Where-Object IPAddress | ForEach-Object { $_.IPAddress })
+            $bad = @($ans | Where-Object { $_ -in $stale.IP })
+            Write-Host ("  {0,-40} {1}" -f $dcName, ($ans -join ', ')) -ForegroundColor $(if ($bad) { 'Red' } else { 'Green' })
+        }
+        Write-Host '  On affected clients: ipconfig /flushdns  then  gpupdate /force' -ForegroundColor Gray
+    }
+
+    $agingOff = @(@($domain, "_msdcs.$forest") | Select-Object -Unique | Where-Object { $a = Get-DnsServerZoneAging -Name $_ -ErrorAction SilentlyContinue; $a -and -not $a.AgingEnabled })
+    if ($agingOff -and (Read-YesNo 'Enable aging (7+7 days) on these zones and scavenging on THIS DNS server so this cannot build up again?' $false)) {
+        if (Confirm-Change "Enable aging on $($agingOff -join ', ') and scavenging every 7 days on $env:COMPUTERNAME (static records are never scavenged; enable on ONE DC only)") {
+            foreach ($z in $agingOff) { Set-DnsServerZoneAging -Name $z -Aging $true -NoRefreshInterval 7.00:00:00 -RefreshInterval 7.00:00:00 -ErrorAction SilentlyContinue }
+            Set-DnsServerScavenging -ScavengingState $true -ScavengingInterval 7.00:00:00 -ErrorAction SilentlyContinue
+            Write-Host '  Aging and scavenging enabled.' -ForegroundColor Green
+        }
+    }
+    Write-Host "  CSV: $csv" -ForegroundColor Green
+}
+
 function Invoke-BackupVssHealth {
     Write-Title 'Backup / VSS health (VSS writers, shadow copies, Windows Server Backup)'
     Write-Sub 'VSS writers (any not "Stable / No error" break backups)'
@@ -4287,6 +4426,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'SQL Server connectivity diagnostics (error 1225/26/40) + optional fix';        Action = { Invoke-SQLConnectivity } }
     @{ Test='slow'; Text = 'Windows server audit (roles, shares, software, IIS, SMTP) HTML';                Action = { Invoke-ServerAudit } }
     @{ Test='safe'; Text = 'Active Directory / DC health (dcdiag, repadmin, FSMO, SYSVOL/DFSR)';            Action = { Invoke-ADHealth } }
+    @{ Test='safe'; Text = 'AD DNS - stale / unreachable DC records (domain A, gc, DomainDnsZones, SRV) + cleanup'; Action = { Invoke-DcDnsStaleRecords } }
     @{ Test='safe'; Text = 'Group Policy audit (HTML + CSV)';                                               Action = { Invoke-GPOAudit } }
     @{ Test='safe'; Text = 'Group Policy results for this machine (gpresult HTML + GP errors)';             Action = { Invoke-GPResult } }
     @{ Test='slow'; Text = 'AD users - true last logon (all DCs)';                                          Action = { Invoke-ADLastLogon } }
