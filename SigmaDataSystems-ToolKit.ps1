@@ -33,10 +33,10 @@
     report to C:\temp\SelfTest. Add -IncludeSlow and/or -IncludeDownloads for full coverage.
 
 .NOTES
-    v2.0 - adds: Adobe Acrobat/Reader Server 2016 start-up check + update freeze + all-users PDF default, internet drop monitor (PingInfo-style, LAN / gateway / WAN-ISP diagnosis), section menu, self-test, security posture, hardware/SMART, reliability, perf,
-    boot performance, pending-reboot detail, Windows Update list/install, SFC/DISM, AD/DC health, stale DC DNS records,
+    v2.0 - adds: internet drop monitor (PingInfo-style, LAN / gateway / WAN-ISP diagnosis), section menu, self-test, security posture, hardware/SMART, reliability, perf,
+    boot performance, pending-reboot detail, Windows Update list/install, SFC/DISM, AD/DC health,
     backup/VSS health, shares/open files, advanced network (MTU/tracert/proxy/Wi-Fi), server roles,
-    quick fixes (spooler, network, Teams, Office, OneDrive + OneDrive won't-start diagnostics, Quick Access stale-pin cleanup), software deployment (Ninite, vendor
+    quick fixes (spooler, network, Teams, Office, OneDrive + OneDrive won't-start diagnostics), software deployment (Ninite, vendor
     MSIs, Microsoft 365 Apps via ODT, remove OEM Office), Sysinternals (Autoruns, Sigcheck, Handle,
     ProcDump, GUI tools), NirSoft reports, Microsoft SetupDiag and TSS. M365 incident response / audit:
     failed sign-in alert verdict, Microsoft-Extractor-Suite (Invictus IR), Hawk, CISA ScubaGear and Maester
@@ -185,20 +185,6 @@ function ConvertTo-PSLiteral($Value) {
     if ($Value -is [int] -or $Value -is [long] -or $Value -is [double]) { return "$Value" }
     if ($Value -is [array])      { return '@(' + (($Value | ForEach-Object { ConvertTo-PSLiteral $_ }) -join ',') + ')' }
     return "'" + ("$Value" -replace "'", "''") + "'"
-}
-
-function Invoke-SmtpRelayRaw {
-    Write-Title 'SMTP relay / plus-address test - full SMTP conversation (copier / scan-to-email)'
-    Write-Host '  Talks raw SMTP to the MX endpoint the way a copier does (port 25, no auth, optional STARTTLS)'
-    Write-Host '  and prints every server reply. Supports plus addresses (mailbox+tag@domain) for scan routing.'
-    $to = Read-Default 'Recipient to test (e.g. scans+test@domain.com)' ''
-    if (-not $to) { return }
-    $dom = $to.Split('@')[-1]
-    $from = Read-Default 'Sender address (match the copier''s From address)' "scanner@$dom"
-    $server = Read-Default 'SMTP server (blank = look up the domain''s MX)' ''
-    $port = Read-Int 'Port' 25
-    $tls = Read-YesNo 'Use STARTTLS? (copier "Use Secure Connection" = On)' $false
-    Invoke-Tool 'Test-SmtpRelay' ([ordered]@{ To = $to; From = $from; SmtpServer = $server; Port = $port; StartTls = $tls; OutputFolder = (Get-OutDir 'SMTP') }) | Out-Null
 }
 
 <#
@@ -407,6 +393,13 @@ function Invoke-PatchReport {
     Invoke-Tool 'Get-PatchAndRebootReport' ([ordered]@{ DaysBack = $days; OutputPath = $out; ComputerName = $target }) | Out-Null
 }
 
+function Invoke-PatchStatusSummary {
+    Write-Title 'Patch status summary (last install, failures, pending reboot)'
+    $days = Read-Int 'Days to count installs / failures over' 30
+    $miss = (Read-Default 'Also scan for available (missing) updates? Takes a few minutes (y/N)' 'N') -match '^(y|yes)$'
+    Invoke-Tool 'Get-PatchReport' ([ordered]@{ Days = $days; CheckMissing = [bool]$miss }) | Out-Null
+}
+
 # ---------- WINDOWS UPDATE / UPGRADE ------------------------------------------
 
 
@@ -448,28 +441,6 @@ function Invoke-WURepairServer {
         Invoke-Tool 'repairwu2016' ([ordered]@{ OutputPath = (Get-OutDir 'WindowsUpdate') }) | Out-Null
         Invoke-WUBackupCleanupPrompt
         Write-Host '  A reboot is strongly recommended before checking for updates again.' -ForegroundColor Yellow
-    }
-}
-
-function Invoke-WUControl {
-    Write-Title '[!] Stop / pause / disable / restore Windows Update'
-    Write-Host '  1  Stop now        - kill a stuck install (workers + services), nothing persisted'
-    Write-Host '  2  Pause           - built-in pause, 1-35 days, expires on its own'
-    Write-Host '  3  Disable (hard)  - block all updates until Restore (also blocks RMM patching)'
-    Write-Host '  4  Restore         - undo Pause/Disable, put original update policy back'
-    Write-Host '  5  Status          - services, policy, pause, pending reboot (read-only)'
-    $c = Read-Default 'Choice' '5'
-    switch ($c) {
-        '1' { if (Confirm-Change 'Stop all Windows Update activity now.') { Invoke-Tool 'Kill-WindowsUpdate' ([ordered]@{ Mode = 'Stop' }) | Out-Null } }
-        '2' { $d = Read-Int 'Pause for how many days (1-35)?' 7
-              if ($d -lt 1 -or $d -gt 35) { Write-Host '  Must be 1-35.' -ForegroundColor Red; return }
-              if (Confirm-Change "Pause Windows Update for $d day(s).") { Invoke-Tool 'Kill-WindowsUpdate' ([ordered]@{ Mode = 'Pause'; PauseDays = $d }) | Out-Null } }
-        '3' { Write-Host '  Points Windows Update at a dead local server, disables wuauserv/UsoSvc/WaaSMedic and update tasks.' -ForegroundColor Yellow
-              Write-Host '  Also exclude this device from patching in your RMM, or its patch scans will alert.' -ForegroundColor Yellow
-              if (Confirm-Change 'Disable Windows Update on this machine until Restore is run.') { Invoke-Tool 'Kill-WindowsUpdate' ([ordered]@{ Mode = 'Disable' }) | Out-Null } }
-        '4' { if (Confirm-Change 'Restore Windows Update to normal.') { Invoke-Tool 'Kill-WindowsUpdate' ([ordered]@{ Mode = 'Restore' }) | Out-Null } }
-        '5' { Invoke-Tool 'Kill-WindowsUpdate' ([ordered]@{ Mode = 'Status' }) | Out-Null }
-        default { Write-Host '  Not a valid choice.' -ForegroundColor Red }
     }
 }
 
@@ -1185,207 +1156,6 @@ function Invoke-CitrixState {
     Get-Service | Where-Object { $_.DisplayName -like '*Citrix*' -or $_.Name -like '*Citrix*' } | Select-Object Name, DisplayName, Status | Format-Table -AutoSize
 }
 
-function Get-AdobeAcrobatState {
-    $s = [ordered]@{}
-    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
-    $s.OS    = "$($cv.ProductName)  build $($cv.CurrentBuild).$($cv.UBR)"
-    $s.Build = [int]$cv.CurrentBuild
-    $exe = @("$env:ProgramFiles\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
-             "${env:ProgramFiles(x86)}\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
-             "${env:ProgramFiles(x86)}\Adobe\Acrobat Reader DC\Reader\AcroRd32.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-    $s.Exe     = $exe
-    $s.Version = if ($exe) { (Get-Item $exe).VersionInfo.ProductVersion } else { $null }
-    $s.Installed = @(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -match 'Adobe Acrobat|Acrobat Reader' } | Select-Object DisplayName, DisplayVersion, InstallDate)
-    # SetThreadDescription: kernel32 export = Windows 10 1703+/Server 2019+. On 1607/Server 2016 it is only in KernelBase.dll.
-    try {
-        if (-not ('SDSI.Kern' -as [type])) {
-            Add-Type -Namespace SDSI -Name Kern -MemberDefinition @'
-[DllImport("kernel32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr GetModuleHandle(string n);
-[DllImport("kernel32.dll", CharSet=CharSet.Ansi)] public static extern IntPtr GetProcAddress(IntPtr h, string p);
-'@ -ErrorAction Stop
-        }
-        $s.K32Export = [SDSI.Kern]::GetProcAddress([SDSI.Kern]::GetModuleHandle('kernel32.dll'),   'SetThreadDescription') -ne [IntPtr]::Zero
-        $s.KBExport  = [SDSI.Kern]::GetProcAddress([SDSI.Kern]::GetModuleHandle('kernelbase.dll'), 'SetThreadDescription') -ne [IntPtr]::Zero
-    } catch { $s.K32Export = $null; $s.KBExport = $null }
-    $s.Lockdown = foreach ($p in 'HKLM:\SOFTWARE\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown','HKLM:\SOFTWARE\Policies\Adobe\Adobe Acrobat\DC\FeatureLockDown') {
-        $v = Get-ItemProperty $p -ErrorAction SilentlyContinue
-        [pscustomobject]@{ Key = ($p -replace '^HKLM:\\SOFTWARE\\Policies\\',''); bUpdater = $v.bUpdater; bDisablePDFHandlerSwitching = $v.bDisablePDFHandlerSwitching }
-    }
-    $s.Services = @(Get-Service AdobeARMservice, AdobeUpdateService, AGSService -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType)
-    $s.Tasks    = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'Adobe.*Update|AdobeGC' } | Select-Object TaskName, State)
-    $s.CreativeCloud = [bool](@("${env:ProgramFiles(x86)}\Adobe\Adobe Creative Cloud", "$env:ProgramFiles\Adobe\Adobe Creative Cloud") | Where-Object { $_ -and (Test-Path $_) })
-    $s.PdfProgId = (Get-ItemProperty 'HKLM:\SOFTWARE\Classes\.pdf' -ErrorAction SilentlyContinue).'(default)'
-    $s.AssocXml  = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name DefaultAssociationsConfiguration -ErrorAction SilentlyContinue).DefaultAssociationsConfiguration
-    $s.IsRds     = [bool](Get-WindowsFeature -Name RDS-RD-Server -ErrorAction SilentlyContinue).Installed
-    [pscustomobject]$s
-}
-
-function Invoke-AdobeAcrobatStatus {
-    Write-Title 'Adobe Acrobat / Reader - version, OS compatibility, update lock, PDF default'
-    $s = Get-AdobeAcrobatState
-    Write-Host "  OS: $($s.OS)$(if ($s.IsRds) { '   (RD Session Host)' })"
-    Write-Sub 'Installed'
-    if ($s.Installed) { $s.Installed | Format-Table -AutoSize | Out-String | Write-Host } else { Write-Host '  No Adobe Acrobat / Reader found in Programs and Features.' }
-    if ($s.Exe) { Write-Host "  $($s.Exe)  ->  $($s.Version)" }
-
-    Write-Sub 'SetThreadDescription (cause of "Entry Point Not Found ... AGM.dll" / 0xc0000139 / AppContainer popup)'
-    Write-Host ("  kernel32.dll export: {0}   KernelBase.dll export: {1}" -f $s.K32Export, $s.KBExport)
-    if ($s.K32Export -eq $false) {
-        Write-Host '  This OS does not export SetThreadDescription from kernel32 (Windows 10 1607 / Server 2016 or older).' -ForegroundColor Yellow
-        Write-Host '  Acrobat/Reader builds that link it directly (e.g. 26.002.21996) fail to start here with:' -ForegroundColor Yellow
-        Write-Host '    - "procedure entry point SetThreadDescription could not be located ... AGM.dll"' -ForegroundColor Yellow
-        Write-Host '    - "Exception Processing Message 0xc0000139"  and the "AppContainer Incompatibility" prompt' -ForegroundColor Yellow
-        Write-Host '  Repair / reinstall of the same build does NOT help. Fix: install the last build that works on this OS' -ForegroundColor Yellow
-        Write-Host '  (Adobe distribution page, select this OS - it offers the "Recommended" build), then freeze updates' -ForegroundColor Yellow
-        Write-Host '  with the [!] Adobe option until Adobe ships a fixed build. Long-term: move to Server 2019/2022.' -ForegroundColor Yellow
-    } elseif ($s.K32Export) { Write-Host '  OK - not affected by the SetThreadDescription start-up failure.' -ForegroundColor Green }
-
-    Write-Sub 'Update lock'
-    $s.Lockdown | Format-Table -AutoSize | Out-String | Write-Host
-    if ($s.Services) { $s.Services | Format-Table -AutoSize | Out-String | Write-Host }
-    if ($s.Tasks)    { $s.Tasks    | Format-Table -AutoSize | Out-String | Write-Host }
-    $ccSvc = $s.Services | Where-Object { $_.Name -eq 'AdobeUpdateService' }
-    if ($s.CreativeCloud -and $ccSvc -and "$($ccSvc.StartType)" -ne 'Disabled') { Write-Host '  Creative Cloud is installed and its updater (AdobeUpdateService) is active - it can update Acrobat even when bUpdater = 0.' -ForegroundColor Yellow }
-    elseif ($s.CreativeCloud) { Write-Host '  Creative Cloud is installed; its updater (AdobeUpdateService) is disabled - OK.' -ForegroundColor Green }
-
-    Write-Sub 'Default PDF handler'
-    Write-Host "  Machine .pdf ProgId: $(if ($s.PdfProgId) { $s.PdfProgId } else { '(none)' })"
-    if ($s.AssocXml) {
-        Write-Host "  Default associations policy XML: $($s.AssocXml)"
-        if (Test-Path $s.AssocXml) {
-            $pdf = ([xml](Get-Content $s.AssocXml -Raw)).DefaultAssociations.Association | Where-Object { $_.Identifier -eq '.pdf' }
-            Write-Host "  .pdf in policy: $(if ($pdf) { "$($pdf.ProgId) ($($pdf.ApplicationName))" } else { 'not set' })"
-        } else { Write-Host '  Policy points to a file that does not exist / is not reachable.' -ForegroundColor Red }
-    } else { Write-Host '  No default associations policy - each user keeps their own PDF default (often Edge).' }
-
-    Write-Sub 'Who updated Acrobat? (Windows Installer events, last 30 days)'
-    $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1022, 1033, 1036; StartTime = (Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue |
-        Where-Object { $_.Message -match 'Acrobat|Adobe Reader' } | Select-Object -First 10
-    if ($ev) {
-        $ev | Select-Object TimeCreated, Id,
-            @{ n = 'By'; e = { try { (New-Object Security.Principal.SecurityIdentifier($_.UserId)).Translate([Security.Principal.NTAccount]).Value } catch { "$($_.UserId)" } } },
-            @{ n = 'Event'; e = { ($_.Message -split "`n")[0].Trim() } } | Format-Table -AutoSize -Wrap | Out-String | Write-Host
-        Write-Host '  "NT AUTHORITY\SYSTEM" = an automated job (RMM patching, Adobe updater, SCCM/Intune). A user name = installed from a session.' -ForegroundColor DarkGray
-    } else { Write-Host '  No Acrobat install/update events in the last 30 days.' }
-    # RMM third-party patching logs (N-able N-central PME, N-able N-sight/RMM, ConnectWise Automate, Datto, NinjaOne) - generic search, nothing client-specific
-    $rmmLogRoots = 'C:\ProgramData\MspPlatform\PME\ThirdPartyPatch\logs', 'C:\ProgramData\SolarWinds MSP\PME\ThirdPartyPatch\logs',
-                   'C:\ProgramData\N-able Technologies', 'C:\ProgramData\NinjaRMMAgent', 'C:\ProgramData\CentraStage', 'C:\Windows\LTSvc'
-    $rmmLogs = foreach ($r in $rmmLogRoots) { if (Test-Path $r) { Get-ChildItem $r -Recurse -File -Filter '*Acrobat*' -ErrorAction SilentlyContinue } }
-    if ($rmmLogs) {
-        Write-Host '  RMM third-party patch logs for Acrobat (newest first):' -ForegroundColor Yellow
-        $rmmLogs | Sort-Object LastWriteTime -Descending | Select-Object -First 5 LastWriteTime, FullName | Format-Table -AutoSize -Wrap | Out-String | Write-Host
-        Write-Host '  If the newest log time matches the update above, your RMM pushed it - decline / exclude Adobe Acrobat in its patch policy.' -ForegroundColor Yellow
-        Write-Host '  RMM patching installs the .msp directly, so bUpdater / disabled Adobe services do NOT stop it (and the patch re-enables them).' -ForegroundColor Yellow
-    }
-
-    Write-Sub 'Acrobat processes by session'
-    $pr = Get-Process Acrobat, AcroRd32, AcroCEF, AdobeCollabSync -IncludeUserName -ErrorAction SilentlyContinue
-    if ($pr) { $pr | Select-Object Name, Id, SessionId, UserName | Format-Table -AutoSize | Out-String | Write-Host } else { Write-Host '  None running.' }
-}
-
-function Invoke-AdobeAcrobatFix {
-    Write-Title '[!] Adobe Acrobat / Reader - freeze updates, PDF default for all users'
-    Write-Host '  1. FREEZE updates  (bUpdater=0 for Acrobat + Reader, disable Adobe update services & scheduled tasks)'
-    Write-Host '  2. UNFREEZE updates (undo 1 once Adobe ships a fixed build)'
-    Write-Host '  3. Set Acrobat/Reader as default PDF app for ALL users (default-associations policy, applies at logon)'
-    Write-Host '  4. Remove the PDF default policy (undo 3)'
-    Write-Host '  5. Show sessions running Acrobat (close them before uninstall / reinstall)'
-    $c = Read-Default 'Choose 1-5 (blank = cancel)' ''
-    $lk  = 'HKLM:\SOFTWARE\Policies\Adobe\Acrobat Reader\DC\FeatureLockDown','HKLM:\SOFTWARE\Policies\Adobe\Adobe Acrobat\DC\FeatureLockDown'
-    $svc = 'AdobeARMservice','AdobeUpdateService'
-    $tf  = { Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'Adobe.*Update|AdobeGC' } }
-    switch ("$c") {
-        '1' {
-            if (-not (Confirm-Change 'Set bUpdater=0 (Acrobat + Reader), stop & disable AdobeARMservice / AdobeUpdateService, disable Adobe update tasks. Creative Cloud will not update ANY Adobe app until undone.')) { return }
-            foreach ($p in $lk) {
-                if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
-                New-ItemProperty -Path $p -Name bUpdater -PropertyType DWord -Value 0 -Force | Out-Null
-            }
-            foreach ($n in $svc) {
-                if (Get-Service $n -ErrorAction SilentlyContinue) { Stop-Service $n -Force -ErrorAction SilentlyContinue; Set-Service $n -StartupType Disabled }
-            }
-            & $tf | Disable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
-            Write-Host '  Frozen. Verify:' -ForegroundColor Green
-            $lk | ForEach-Object { [pscustomobject]@{ Key = $_; bUpdater = (Get-ItemProperty $_ -ErrorAction SilentlyContinue).bUpdater } } | Format-Table -AutoSize | Out-String | Write-Host
-            Get-Service $svc -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType | Format-Table -AutoSize | Out-String | Write-Host
-            & $tf | Select-Object TaskName, State | Format-Table -AutoSize | Out-String | Write-Host
-            Write-Host '  Also hold Acrobat/Reader in your RMM patch policy for this device, or it will be pushed again.' -ForegroundColor DarkGray
-        }
-        '2' {
-            if (-not (Confirm-Change 'Remove bUpdater, set Adobe update services back to Automatic and start them, enable Adobe update tasks.')) { return }
-            foreach ($p in $lk) { Remove-ItemProperty -Path $p -Name bUpdater -ErrorAction SilentlyContinue }
-            foreach ($n in $svc) {
-                if (Get-Service $n -ErrorAction SilentlyContinue) { Set-Service $n -StartupType Automatic; Start-Service $n -ErrorAction SilentlyContinue }
-            }
-            & $tf | Enable-ScheduledTask -ErrorAction SilentlyContinue | Out-Null
-            Get-Service $svc -ErrorAction SilentlyContinue | Select-Object Name, Status, StartType | Format-Table -AutoSize | Out-String | Write-Host
-            & $tf | Select-Object TaskName, State | Format-Table -AutoSize | Out-String | Write-Host
-            Write-Host '  Unfrozen. Remember to release the RMM patch hold too.' -ForegroundColor Green
-        }
-        '3' {
-            $prog = (Get-ItemProperty 'HKLM:\SOFTWARE\Classes\.pdf' -ErrorAction SilentlyContinue).'(default)'
-            Write-Host "  Machine .pdf ProgId: $(if ($prog) { $prog } else { '(none)' })"
-            if ($prog -notmatch '^Acro') {
-                Write-Host '  Acrobat/Reader does not own .pdf at machine level. Open Acrobat as admin -> Edit > Preferences > General >' -ForegroundColor Yellow
-                Write-Host '  "Select As Default PDF Handler", then run this again. (Expected: Acrobat.Document.DC or AcroExch.Document.DC)' -ForegroundColor Yellow
-                $prog = Read-Default 'ProgId to use anyway (blank = cancel)' ''
-                if (-not $prog) { return }
-            }
-            $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
-            $cur = (Get-ItemProperty $pol -Name DefaultAssociationsConfiguration -ErrorAction SilentlyContinue).DefaultAssociationsConfiguration
-            $xmlPath = if ($cur) { $cur } else { 'C:\ProgramData\DefaultAppAssoc.xml' }
-            if ($cur -and $cur -match '^\\\\') { Write-Host "  Policy points to a network share ($cur) - probably set by GPO. Edit that XML / GPO instead." -ForegroundColor Yellow; return }
-            if (-not (Confirm-Change "Set .pdf -> $prog in $xmlPath (existing entries kept, file backed up), point the default-associations policy at it, and stop Acrobat prompting users to switch PDF handler.")) { return }
-            if (Test-Path $xmlPath) {
-                $bk = Join-Path (Get-OutDir 'Adobe') "DefaultAppAssoc-backup_$(Get-Stamp).xml"; Copy-Item $xmlPath $bk -Force
-                Write-Host "  Backup: $bk" -ForegroundColor DarkGray
-                $x = [xml](Get-Content $xmlPath -Raw)
-            } else {
-                $x = [xml]'<?xml version="1.0" encoding="UTF-8"?><DefaultAssociations></DefaultAssociations>'
-            }
-            $root = $x.SelectSingleNode('/DefaultAssociations')
-            foreach ($old in @($root.SelectNodes("Association[@Identifier='.pdf']"))) { [void]$root.RemoveChild($old) }
-            $a = $x.CreateElement('Association')
-            $a.SetAttribute('Identifier', '.pdf'); $a.SetAttribute('ProgId', $prog)
-            $a.SetAttribute('ApplicationName', $(if ($prog -like 'AcroExch*') { 'Adobe Acrobat Reader' } else { 'Adobe Acrobat' }))
-            [void]$root.AppendChild($a)
-            $x.Save($xmlPath)
-            if (-not (Test-Path $pol)) { New-Item -Path $pol -Force | Out-Null }
-            New-ItemProperty -Path $pol -Name DefaultAssociationsConfiguration -Value $xmlPath -PropertyType String -Force | Out-Null
-            foreach ($p in $lk) {
-                if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
-                New-ItemProperty -Path $p -Name bDisablePDFHandlerSwitching -PropertyType DWord -Value 1 -Force | Out-Null
-            }
-            Get-Content $xmlPath | Write-Host
-            Write-Host '  Done. Applies at each user''s NEXT logon - have a user sign out/in and open a PDF to test.' -ForegroundColor Green
-            Write-Host '  Several session hosts / domain: the same setting is in GPO (File Explorer > "Set a default associations configuration file").' -ForegroundColor DarkGray
-        }
-        '4' {
-            $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
-            $cur = (Get-ItemProperty $pol -Name DefaultAssociationsConfiguration -ErrorAction SilentlyContinue).DefaultAssociationsConfiguration
-            if (-not $cur) { Write-Host '  No default-associations policy is set.'; return }
-            if (-not (Confirm-Change "Remove .pdf from $cur (policy removed if nothing else is left), remove bDisablePDFHandlerSwitching.")) { return }
-            if (Test-Path $cur) {
-                $bk = Join-Path (Get-OutDir 'Adobe') "DefaultAppAssoc-backup_$(Get-Stamp).xml"; Copy-Item $cur $bk -Force
-                $x = [xml](Get-Content $cur -Raw); $root = $x.SelectSingleNode('/DefaultAssociations')
-                foreach ($old in @($root.SelectNodes("Association[@Identifier='.pdf']"))) { [void]$root.RemoveChild($old) }
-                if ($root.SelectNodes('Association').Count -eq 0) { Remove-ItemProperty $pol -Name DefaultAssociationsConfiguration -Force; Write-Host '  No associations left - policy removed.' }
-                else { $x.Save($cur); Write-Host "  .pdf removed; other associations in $cur kept." }
-                Write-Host "  Backup: $bk" -ForegroundColor DarkGray
-            }
-            foreach ($p in $lk) { Remove-ItemProperty -Path $p -Name bDisablePDFHandlerSwitching -ErrorAction SilentlyContinue }
-            Write-Host '  Done (takes effect at next logon).' -ForegroundColor Green
-        }
-        '5' {
-            $pr = Get-Process Acrobat, AcroRd32, AcroCEF, AdobeCollabSync -IncludeUserName -ErrorAction SilentlyContinue
-            if (-not $pr) { Write-Host '  No Acrobat processes running.' -ForegroundColor Green; return }
-            $pr | Select-Object Name, Id, SessionId, UserName | Format-Table -AutoSize | Out-String | Write-Host
-            Write-Host '  Ask those users to close Acrobat, or log them off:  logoff <SessionId>' -ForegroundColor DarkGray
-        }
-    }
-}
-
 function Invoke-RemoveBloatware {
     Write-Title '[!] Remove bloatware (OEM + consumer Microsoft Store apps)'
     Write-Host '  Removes installed + provisioned AppX packages for common consumer/OEM apps (Bing, Xbox, games, OEM trials...).'
@@ -1565,134 +1335,6 @@ function Invoke-SmtpTest {
             }
         }
     }
-}
-
-function Invoke-QuickAccessCleanup {
-    Write-Title '[!] File Explorer Quick Access - remove stale / stuck entries (per user)'
-    Write-Host "  Runs for: $env:USERNAME  ($env:APPDATA)" -ForegroundColor DarkGray
-    Write-Host '  Quick Access is per user - run the toolkit AS the affected user. Pins to a dead mapped drive or' -ForegroundColor DarkGray
-    Write-Host '  retired share often cannot be unpinned in Explorer and make it hang while the path times out.' -ForegroundColor DarkGray
-
-    $qaFile  = Join-Path $env:APPDATA 'Microsoft\Windows\Recent\AutomaticDestinations\f01b4d95cf55d32a.automaticDestinations-ms'
-    $recent  = Join-Path $env:APPDATA 'Microsoft\Windows\Recent'
-    $shell   = New-Object -ComObject Shell.Application
-    $wsh     = New-Object -ComObject WScript.Shell
-    $liveDrv = @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { $_.Name.ToUpper() })
-
-    # Reachability without hanging: drive-letter paths check the drive exists; UNC paths are not probed
-    $state = {
-        param([string]$p)
-        if ([string]::IsNullOrWhiteSpace($p) -or $p -like 'shell:*' -or $p -like '::*') { return 'virtual' }
-        if ($p -match '^([A-Za-z]):') {
-            if ($liveDrv -notcontains $Matches[1].ToUpper()) { return 'DRIVE MISSING' }
-            if (Test-Path -LiteralPath $p) { return 'ok' } else { return 'NOT FOUND' }
-        }
-        if ($p -like '\\*') { return 'UNC (not tested)' }
-        return '?'
-    }
-
-    $load = {
-        $ns = $shell.Namespace('shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}')
-        $i = 0
-        @(if ($ns) { foreach ($it in $ns.Items()) {
-            $i++
-            $pin = $null; try { $pin = [bool]$it.ExtendedProperty('System.Home.IsPinned') } catch { }
-            [pscustomobject]@{ No = $i; Name = $it.Name; Pinned = $pin; State = (& $state $it.Path); Path = $it.Path; Item = $it }
-        } })
-    }
-
-    $items = & $load
-    if (-not $items) { Write-Host '  Quick Access returned no items (or the shell namespace is unavailable in this session).' -ForegroundColor Yellow }
-    else { $items | Select-Object No, Name, Pinned, State, Path | Format-Table -AutoSize | Out-String -Width 220 | Write-Host }
-    $stale = @($items | Where-Object { $_.State -in 'DRIVE MISSING','NOT FOUND' })
-    if ($stale) { Write-Host "  $($stale.Count) entr$(if ($stale.Count -eq 1) {'y'} else {'ies'}) point at a missing drive / path." -ForegroundColor Yellow }
-    if ($items -and -not ($items | Where-Object { $null -ne $_.Pinned })) { Write-Host '  Note: this Windows build does not expose the pinned flag - option 2 will re-pin every folder entry you keep.' -ForegroundColor DarkGray }
-
-    Write-Host ''
-    Write-Host '  1. Unpin / remove specific entries by number (tries the Explorer verbs - often fails on dead paths)'
-    Write-Host '  2. RESET Quick Access, then re-pin the folders you keep (reliable; drops the chosen entries + frequent/recent list)'
-    Write-Host '  3. Delete Recent-file shortcuts that point at a drive letter or path prefix'
-    $choice = "$(Read-Default 'Choose 1-3 (blank = done)' '')"
-    if (-not $choice) { return }
-
-    # Which entries to drop: numbers ("3,7"), a path prefix ("W:\" or "\\oldserver\share"), or STALE
-    $pickDrop = {
-        $sel = "$(Read-Default 'Entries to remove: numbers (e.g. 3,7), a path prefix (e.g. W:\ or \\server\share), or STALE for every missing drive/path' 'STALE')"
-        if (-not $sel) { return @() }
-        if ($sel -ieq 'STALE') { return $stale }
-        if ($sel -match '^[\d,\s;]+$') { $nums = @($sel -split '[,;\s]+' | Where-Object { $_ } | ForEach-Object { [int]$_ }); return @($items | Where-Object { $nums -contains $_.No }) }
-        return @($items | Where-Object { $_.Path -and $_.Path.StartsWith($sel, [StringComparison]::OrdinalIgnoreCase) })
-    }
-
-    switch ($choice) {
-        '1' {
-            $drop = & $pickDrop
-            if (-not $drop) { Write-Host '  Nothing matched.' -ForegroundColor Yellow; return }
-            $drop | Select-Object No, Name, Path | Format-Table -AutoSize | Out-String -Width 220 | Write-Host
-            if (-not (Confirm-Change "Unpin / remove the $($drop.Count) Quick Access entr$(if ($drop.Count -eq 1) {'y'} else {'ies'}) listed above.")) { return }
-            foreach ($d in $drop) {
-                $verbs = @($d.Item.Verbs() | Where-Object { ($_.Name -replace '&','') -match 'Unpin from Quick access|Remove from Quick access|Unpin from Home|Remove from Home' })
-                if ($verbs) { $verbs | ForEach-Object { try { $_.DoIt() } catch { } } }
-                else { try { $d.Item.InvokeVerb('unpinfromhome') } catch { }; try { $d.Item.InvokeVerb('remove') } catch { } }
-            }
-            Start-Sleep -Seconds 2
-            $left = @(& $load | Where-Object { $p = $_.Path; $drop | Where-Object { $_.Path -eq $p } })
-            if ($left) {
-                Write-Host "  $($left.Count) entr$(if ($left.Count -eq 1) {'y is'} else {'ies are'}) still there - Explorer will not unpin a path it cannot resolve." -ForegroundColor Yellow
-                Write-Host '  Run this option again and pick 2 (reset + re-pin) - that always works.' -ForegroundColor Yellow
-            } else { Write-Host '  Removed. Press F5 in Explorer if it still shows.' -ForegroundColor Green }
-        }
-        '2' {
-            $drop = & $pickDrop
-            if (-not $drop) { Write-Host '  Nothing matched - nothing to remove.' -ForegroundColor Yellow; return }
-            $dropPaths = @($drop | ForEach-Object { $_.Path })
-            $pinFlag = [bool]($items | Where-Object { $null -ne $_.Pinned })
-            $keep = @($items | Where-Object {
-                $_.Path -and ($dropPaths -notcontains $_.Path) -and $_.State -notin 'DRIVE MISSING','NOT FOUND' -and
-                $(if ($pinFlag) { $_.Pinned } else { $_.State -eq 'virtual' -or (Test-Path -LiteralPath $_.Path -PathType Container) })
-            })
-            Write-Host "`n  Will REMOVE:" -ForegroundColor Yellow
-            $drop | Select-Object Name, Path | Format-Table -AutoSize | Out-String -Width 220 | Write-Host
-            Write-Host '  Will RE-PIN afterwards:' -ForegroundColor Green
-            if ($keep) { $keep | Select-Object Name, Path | Format-Table -AutoSize | Out-String -Width 220 | Write-Host } else { Write-Host '    (nothing)' }
-            if (-not (Confirm-Change 'Restart Explorer, delete this user''s Quick Access pin/frequent-folder list (backed up first), and re-pin the folders listed above.')) { return }
-
-            $dir = Get-OutDir 'QuickAccess'; $stamp = Get-Stamp
-            $keep | Select-Object Name, Path | Export-Csv (Join-Path $dir "QuickAccess_repin_$stamp.csv") -NoTypeInformation
-            if (Test-Path -LiteralPath $qaFile) { Copy-Item -LiteralPath $qaFile -Destination (Join-Path $dir "f01b4d95cf55d32a.automaticDestinations-ms_$stamp.bak") -Force }
-            Write-Host "  Backup + re-pin list saved to $dir" -ForegroundColor DarkGray
-
-            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-            Remove-Item -LiteralPath $qaFile -Force -ErrorAction SilentlyContinue
-            if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
-            Start-Sleep -Seconds 5
-
-            $shell2 = New-Object -ComObject Shell.Application
-            foreach ($k in $keep) {
-                $f = $null; try { $f = $shell2.Namespace($k.Path) } catch { }
-                if ($f) { try { $f.Self.InvokeVerb('pintohome'); Write-Host "  Re-pinned  $($k.Path)" -ForegroundColor Green } catch { Write-Host "  Could not re-pin $($k.Path)" -ForegroundColor Yellow } }
-                else { Write-Host "  Could not open $($k.Path) - re-pin by hand" -ForegroundColor Yellow }
-            }
-            Write-Host '  Done. If Explorer restarted elevated, sign out/in (or restart Explorer from Task Manager) for a normal shell.' -ForegroundColor DarkGray
-            Write-Host '  To undo: copy the .bak file back over the original (Explorer closed) - path shown above.' -ForegroundColor DarkGray
-        }
-        '3' {
-            $prefix = "$(Read-Default 'Remove Recent shortcuts whose target starts with (e.g. W:\ or \\oldserver\share)' '')"
-            if (-not $prefix) { return }
-            $lnks = @(Get-ChildItem -LiteralPath $recent -Filter *.lnk -File -ErrorAction SilentlyContinue | ForEach-Object {
-                $t = $null; try { $t = $wsh.CreateShortcut($_.FullName).TargetPath } catch { }
-                if ($t -and $t.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { [pscustomobject]@{ Shortcut = $_.Name; Target = $t; Full = $_.FullName } }
-            })
-            if (-not $lnks) { Write-Host "  No Recent shortcuts point at $prefix - a stuck entry is then a pinned/frequent folder: use option 2." -ForegroundColor Yellow; return }
-            $lnks | Select-Object Shortcut, Target | Format-Table -AutoSize | Out-String -Width 220 | Write-Host
-            if (Confirm-Change "Delete these $($lnks.Count) Recent-file shortcut(s) (the files themselves are not touched).") {
-                $lnks | ForEach-Object { Remove-Item -LiteralPath $_.Full -Force -ErrorAction SilentlyContinue }
-                Write-Host '  Deleted.' -ForegroundColor Green
-            }
-        }
-    }
-    Write-Host '  Tip: if a mapped drive is retired for good, also remove it: net use X: /delete' -ForegroundColor DarkGray
 }
 
 function Invoke-ZipBrowserRepair {
@@ -3181,145 +2823,6 @@ function Invoke-ADHealth {
     Write-Host "  Full output saved under $dir" -ForegroundColor Green
 }
 
-function Invoke-DcDnsStaleRecords {
-    Write-Title 'AD DNS - stale / unreachable domain controller records (domain A, gc, DomainDnsZones, SRV)'
-    Write-Host '  Finds DNS records that send clients to a DC address that no longer exists. Typical symptoms:' -ForegroundColor Gray
-    Write-Host '  GP errors 1058/1129 (cannot read \\domain\SysVol), slow logons, Explorer/Outlook hangs, Netlogon 5719.' -ForegroundColor Gray
-    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
-    if (-not $cs.PartOfDomain) { Write-Host '  This machine is not domain-joined - nothing to check.' -ForegroundColor Red; return }
-    $domain = $cs.Domain
-    $forest = try { [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain().Forest.Name } catch { $domain }
-    $dir = Get-OutDir 'ADHealth'; $stamp = Get-Stamp
-
-    # ---- Domain controllers and their real IPs
-    Write-Sub "Domain controllers for $domain"
-    $dcNames = @((nltest /dclist:$domain 2>$null) | ForEach-Object { if ($_ -match '^\s+([A-Za-z0-9\-_]+(\.[A-Za-z0-9\-_]+)+)\s') { $Matches[1] } } | Select-Object -Unique)
-    if (-not $dcNames) { Write-Host '  Could not list DCs (nltest /dclist failed).' -ForegroundColor Red; return }
-    $dcIps = @{}
-    $localDns = [bool](Get-Service -Name DNS -ErrorAction SilentlyContinue)
-    foreach ($dcName in $dcNames) {
-        $ips = @(); $how = ''
-        $short = $dcName.Split('.')[0]
-        if ($short -ieq $env:COMPUTERNAME) {
-            $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object { $_.IPAddress }); $how = 'local adapters'
-        } else {
-            try {
-                $ips = @(Get-CimInstance Win32_NetworkAdapterConfiguration -ComputerName $dcName -Filter 'IPEnabled=TRUE' -OperationTimeoutSec 15 -ErrorAction Stop |
-                    ForEach-Object { $_.IPAddress } | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' -and $_ -notlike '169.254.*' }); $how = 'remote adapters (CIM)'
-            } catch { }
-            if (-not $ips) { $ips = @(Resolve-DnsName $dcName -Type A -DnsOnly -ErrorAction SilentlyContinue | Where-Object IPAddress | ForEach-Object { $_.IPAddress }); $how = 'DNS host record (CIM unavailable)' }
-        }
-        $dcIps[$dcName.ToLower()] = $ips
-        Write-Host ("  {0,-40} {1,-32} [{2}]" -f $dcName, ($ips -join ', '), $how)
-    }
-    $validIps = @($dcIps.Values | ForEach-Object { $_ } | Select-Object -Unique)
-
-    # ---- Records to check
-    $names = @(
-        @{ Zone = $domain;            Host = '@';              Fqdn = $domain;                     What = 'Domain name (\\domain\SysVol, GP)' }
-        @{ Zone = $domain;            Host = 'DomainDnsZones'; Fqdn = "DomainDnsZones.$domain";    What = 'DomainDnsZones partition' }
-        @{ Zone = $forest;            Host = 'ForestDnsZones'; Fqdn = "ForestDnsZones.$forest";    What = 'ForestDnsZones partition' }
-        @{ Zone = "_msdcs.$forest";   Host = 'gc';             Fqdn = "gc._msdcs.$forest";         What = 'Global catalog (logon, Outlook GAL)' }
-    )
-    $dnsServer = if ($localDns) { $env:COMPUTERNAME } else { ($dcNames | Select-Object -First 1) }
-    $useServerApi = $localDns -and (Get-Module -ListAvailable -Name DnsServer)
-    if (-not $useServerApi) {
-        Write-Host "`n  DnsServer module/role not on this machine - read-only check via DNS queries. Run this option ON a DC to see timestamps and remove records." -ForegroundColor DarkYellow
-        $dnsServer = Read-Default 'DNS server to query' (($validIps | Select-Object -First 1))
-    }
-
-    Write-Sub "Checking records on $dnsServer (each address tested on LDAP 389)"
-    $rows = foreach ($n in $names) {
-        $recs = @()
-        if ($useServerApi) {
-            $zoneName = $n.Zone; $hostName = $n.Host
-            if (-not (Get-DnsServerZone -Name $zoneName -ErrorAction SilentlyContinue)) {   # _msdcs stored inside the forest zone instead of its own zone
-                if ($n.Host -eq 'gc') { $zoneName = $forest; $hostName = 'gc._msdcs' } else { continue }
-            }
-            $recs = @(Get-DnsServerResourceRecord -ZoneName $zoneName -Name $hostName -RRType A -ErrorAction SilentlyContinue |
-                ForEach-Object { [pscustomobject]@{ Zone = $zoneName; HostName = $hostName; IP = $_.RecordData.IPv4Address.IPAddressToString; Timestamp = $_.Timestamp; Obj = $_ } })
-        } else {
-            $recs = @(Resolve-DnsName $n.Fqdn -Type A -Server $dnsServer -DnsOnly -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' -and $_.Section -eq 'Answer' } |
-                ForEach-Object { [pscustomobject]@{ Zone = $n.Zone; HostName = $n.Host; IP = $_.IPAddress; Timestamp = $null; Obj = $null } })
-        }
-        foreach ($r in $recs) {
-            $isDc = $r.IP -in $validIps
-            $ldap = Test-TcpPort $r.IP 389 2000
-            $status = if ($isDc -and $ldap) { 'OK' } elseif (-not $isDc -and -not $ldap) { 'STALE' } elseif (-not $isDc) { 'NOT-A-DC (responds)' } else { 'DC-UNREACHABLE' }
-            [pscustomobject]@{
-                Status    = $status
-                Record    = $n.Fqdn
-                Used_for  = $n.What
-                IP        = $r.IP
-                Timestamp = $(if ($useServerApi) { if ($r.Timestamp) { $r.Timestamp } else { 'static' } } else { 'n/a' })
-                LDAP389   = $ldap
-                Zone      = $r.Zone
-                HostName  = $r.HostName
-                _Obj      = $r.Obj
-            }
-        }
-    }
-    $rows = @($rows)
-    if (-not $rows) { Write-Host '  No records returned - check the DNS server name.' -ForegroundColor Red; return }
-    foreach ($r in $rows) {
-        $c = switch -Wildcard ($r.Status) { 'OK' { 'Green' } 'STALE' { 'Red' } default { 'Yellow' } }
-        Write-Host ("  {0,-20} {1,-38} {2,-16} {3}" -f $r.Status, $r.Record, $r.IP, $r.Timestamp) -ForegroundColor $c
-    }
-    $csv = Join-Path $dir "DcDnsRecords_$stamp.csv"
-    $rows | Select-Object Status, Record, Used_for, IP, Timestamp, LDAP389, Zone, HostName | Export-Csv $csv -NoTypeInformation
-
-    # ---- SRV records pointing at hosts that are not current DCs (report only)
-    Write-Sub 'DC locator SRV records (targets that are not current DCs)'
-    $srvBad = foreach ($s in "_ldap._tcp.dc._msdcs.$domain", "_kerberos._tcp.dc._msdcs.$domain", "_ldap._tcp.$domain", "_kerberos._tcp.$domain", "_gc._tcp.$forest") {
-        Resolve-DnsName $s -Type SRV -Server $(if ($useServerApi) { '127.0.0.1' } else { $dnsServer }) -DnsOnly -ErrorAction SilentlyContinue |
-            Where-Object { $_.Type -eq 'SRV' -and $_.NameTarget -and ($_.NameTarget.ToLower().TrimEnd('.') -notin $dcIps.Keys) } |
-            ForEach-Object { [pscustomobject]@{ SRV = $s; Target = $_.NameTarget } }
-    }
-    if ($srvBad) { $srvBad | Format-Table -AutoSize; Write-Host '  These name a DC that no longer exists - do AD metadata cleanup for it (ntdsutil / ADUC Domain Controllers OU), then delete its SRV/A records.' -ForegroundColor Yellow }
-    else { Write-Host '  All SRV targets are current DCs.' -ForegroundColor Green }
-
-    if ($useServerApi) {
-        Write-Sub 'Aging / scavenging (stale records are normally removed automatically)'
-        $scv = Get-DnsServerScavenging -ErrorAction SilentlyContinue
-        Write-Host ("  Server scavenging: {0}   interval: {1}   last run: {2}" -f $(if ($scv.ScavengingState) { 'ON' } else { 'OFF' }), $scv.ScavengingInterval, $scv.LastScavengeTime)
-        foreach ($z in @($domain, "_msdcs.$forest") | Select-Object -Unique) {
-            $ag = Get-DnsServerZoneAging -Name $z -ErrorAction SilentlyContinue
-            if ($ag) { Write-Host ("  Zone {0,-36} aging: {1}" -f $z, $(if ($ag.AgingEnabled) { 'ON' } else { 'OFF' })) }
-        }
-    }
-
-    $stale = @($rows | Where-Object { $_.Status -eq 'STALE' })
-    if (-not $stale) { Write-Host "`n  No stale DC records found.  CSV: $csv" -ForegroundColor Green; return }
-    Write-Host "`n  $($stale.Count) stale record(s): not a DC address and nothing answers on LDAP. Clients that pick them wait for a timeout." -ForegroundColor Red
-    if (-not $useServerApi) { Write-Host "  Run this option on a DC to remove them.  CSV: $csv" -ForegroundColor Yellow; return }
-
-    if (Confirm-Change ("Delete $($stale.Count) stale DNS record(s): " + (($stale | ForEach-Object { "$($_.Record) -> $($_.IP)" }) -join '; '))) {
-        foreach ($s in $stale) {
-            try { Remove-DnsServerResourceRecord -ZoneName $s.Zone -InputObject $s._Obj -Force -ErrorAction Stop; Write-Host "  Removed $($s.Record) -> $($s.IP)" -ForegroundColor Green }
-            catch { Write-Host "  Failed $($s.Record) -> $($s.IP): $($_.Exception.Message)" -ForegroundColor Red }
-        }
-        Clear-DnsServerCache -Force -ErrorAction SilentlyContinue
-        if (Get-Command repadmin.exe -ErrorAction SilentlyContinue) { Write-Host '  Replicating (repadmin /syncall /AdeP)...' -ForegroundColor Gray; repadmin /syncall /AdeP 2>&1 | Out-Null; Start-Sleep 15 }
-        Write-Sub "What each DC now answers for $domain (other DCs can lag a few minutes - rerun this option on any DC still showing the stale IP)"
-        foreach ($dcName in $dcNames) {
-            $ans = @(Resolve-DnsName $domain -Type A -Server $dcName -DnsOnly -ErrorAction SilentlyContinue | Where-Object IPAddress | ForEach-Object { $_.IPAddress })
-            $bad = @($ans | Where-Object { $_ -in $stale.IP })
-            Write-Host ("  {0,-40} {1}" -f $dcName, ($ans -join ', ')) -ForegroundColor $(if ($bad) { 'Red' } else { 'Green' })
-        }
-        Write-Host '  On affected clients: ipconfig /flushdns  then  gpupdate /force' -ForegroundColor Gray
-    }
-
-    $agingOff = @(@($domain, "_msdcs.$forest") | Select-Object -Unique | Where-Object { $a = Get-DnsServerZoneAging -Name $_ -ErrorAction SilentlyContinue; $a -and -not $a.AgingEnabled })
-    if ($agingOff -and (Read-YesNo 'Enable aging (7+7 days) on these zones and scavenging on THIS DNS server so this cannot build up again?' $false)) {
-        if (Confirm-Change "Enable aging on $($agingOff -join ', ') and scavenging every 7 days on $env:COMPUTERNAME (static records are never scavenged; enable on ONE DC only)") {
-            foreach ($z in $agingOff) { Set-DnsServerZoneAging -Name $z -Aging $true -NoRefreshInterval 7.00:00:00 -RefreshInterval 7.00:00:00 -ErrorAction SilentlyContinue }
-            Set-DnsServerScavenging -ScavengingState $true -ScavengingInterval 7.00:00:00 -ErrorAction SilentlyContinue
-            Write-Host '  Aging and scavenging enabled.' -ForegroundColor Green
-        }
-    }
-    Write-Host "  CSV: $csv" -ForegroundColor Green
-}
-
 function Invoke-BackupVssHealth {
     Write-Title 'Backup / VSS health (VSS writers, shadow copies, Windows Server Backup)'
     Write-Sub 'VSS writers (any not "Stable / No error" break backups)'
@@ -4399,12 +3902,12 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Pending reboot - detailed (CBS, WU, file renames, rename/join, ConfigMgr)';     Action = { Invoke-PendingReboot } }
     @{ Test='safe'; Text = 'Device join / Entra ID / Workplace join / PIN status (dsregcmd)';               Action = { Invoke-DeviceJoinStatus } }
     @{ Test='safe'; Text = 'Patch & reboot history report (HTML)';                                          Action = { Invoke-PatchReport } }
+    @{ Test='safe'; Text = 'Patch status summary (last install / last failure / pending reboot / uptime)';  Action = { Invoke-PatchStatusSummary } }
     @{               Text = '[!] Enable crash dumps (Automatic memory dump)';                                Action = { Invoke-EnableCrashDump } }
     @{ Section = 'WINDOWS UPDATE / UPGRADE / REPAIR' }
     @{ Test='slow'; Text = 'Windows Update - list available updates + history (optional install)';        Action = { Invoke-WindowsUpdateList } }
     @{               Text = '[!] Reset Windows Update components (Windows 10/11)';                           Action = { Invoke-WUReset } }
     @{               Text = '[!] Repair Windows Update (Windows Server 2016+)';                              Action = { Invoke-WURepairServer } }
-    @{               Text = '[!] Stop / pause / disable / restore Windows Update';                     Action = { Invoke-WUControl } }
     @{               Text = '[!] System file repair (DISM RestoreHealth + SFC)';                             Action = { Invoke-SfcDism } }
     @{ Test='safe'; Text = 'Windows 11 upgrade troubleshooter (status, SetupDiag, logs...)';                Action = { Invoke-Win11Troubleshooter } }
     @{ Test='net';  Text = 'Microsoft SetupDiag - why did an upgrade fail? (downloads from Microsoft)';     Action = { Invoke-SetupDiag } }
@@ -4426,7 +3929,6 @@ $Script:Menu = @(
     @{               Text = 'Wi-Fi live monitor (signal / roams / channel changes / drops / lag over time)';    Action = { Invoke-WifiMonitor } }
     @{ Test='safe'; Text = 'Network connections & listening ports by process';                              Action = { Invoke-TcpConnections } }
     @{ Test='safe'; Text = 'SMTP / scan-to-email relay test + SPF/DMARC/MX lookup';                         Action = { Invoke-SmtpTest } }
-    @{               Text = 'SMTP relay / plus-address test - full SMTP conversation (copier, port 25, no auth)'; Action = { Invoke-SmtpRelayRaw } }
     @{               Text = 'Email DNS auth check: SPF / DKIM / DMARC / MX + change history & alerts';   Action = { Invoke-EmailAuthDnsCheck } }
     @{               Text = '[!] Network quick fixes (flush DNS / renew / Winsock + TCP/IP reset)';          Action = { Invoke-NetworkReset } }
     @{ Test='safe'; Text = 'DHCP Event 1059 / DC authorization diagnostics';                                Action = { Invoke-Dhcp1059 } }
@@ -4449,7 +3951,6 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'SQL Server connectivity diagnostics (error 1225/26/40) + optional fix';        Action = { Invoke-SQLConnectivity } }
     @{ Test='slow'; Text = 'Windows server audit (roles, shares, software, IIS, SMTP) HTML';                Action = { Invoke-ServerAudit } }
     @{ Test='safe'; Text = 'Active Directory / DC health (dcdiag, repadmin, FSMO, SYSVOL/DFSR)';            Action = { Invoke-ADHealth } }
-    @{ Test='safe'; Text = 'AD DNS - stale / unreachable DC records (domain A, gc, DomainDnsZones, SRV) + cleanup'; Action = { Invoke-DcDnsStaleRecords } }
     @{ Test='safe'; Text = 'Group Policy audit (HTML + CSV)';                                               Action = { Invoke-GPOAudit } }
     @{ Test='safe'; Text = 'Group Policy results for this machine (gpresult HTML + GP errors)';             Action = { Invoke-GPResult } }
     @{ Test='slow'; Text = 'AD users - true last logon (all DCs)';                                          Action = { Invoke-ADLastLogon } }
@@ -4474,8 +3975,6 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Install provenance for a program (when/how/by whom)';                           Action = { Invoke-InstallProvenance } }
     @{ Test='safe'; Text = '.NET / Node.js / Java / Python / VC++ runtime versions';                         Action = { Invoke-DotNetVersion } }
     @{ Test='safe'; Text = 'Citrix Workspace app - install state';                                          Action = { Invoke-CitrixState } }
-    @{ Test='safe'; Text = 'Adobe Acrobat / Reader - version, Server 2016 SetThreadDescription check, update lock, PDF default'; Action = { Invoke-AdobeAcrobatStatus } }
-    @{               Text = '[!] Adobe Acrobat / Reader - freeze / unfreeze updates, set default PDF app for all users'; Action = { Invoke-AdobeAcrobatFix } }
     @{ Test='safe'; Text = 'Time sync (w32time) check / resync';                                            Action = { Invoke-TimeSync } }
     @{ Section = 'QUICK FIXES' }
     @{               Text = '[!] Print spooler reset (clear stuck jobs)';                                    Action = { Invoke-SpoolerReset } }
@@ -4484,7 +3983,6 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'OneDrive will not start / sync - diagnostics (policy block, installs, startup, logs)'; Action = { Invoke-OneDriveDiag } }
     @{               Text = '[!] OneDrive reset';                                                            Action = { Invoke-OneDriveReset } }
     @{               Text = '[!] Repair .zip association / reset default browser (per user)';               Action = { Invoke-ZipBrowserRepair } }
-    @{               Text = '[!] File Explorer Quick Access - remove stale / stuck pins (dead mapped drive, old share)'; Action = { Invoke-QuickAccessCleanup } }
     @{               Text = '[!] Remove bloatware (OEM + consumer Store apps)';                              Action = { Invoke-RemoveBloatware } }
     @{               Text = '[!] Power settings - never sleep / hibernate';                                  Action = { Invoke-PowerSettings } }
     @{ Test='safe'; Text = 'Check scanner (Panini etc.) hangs / not detected - diagnostics + optional USB power fix'; Action = { Invoke-CheckScannerDiag } }
@@ -10440,6 +9938,174 @@ try { Stop-Transcript | Out-Null } catch { }
 Write-Host ""
 Write-Host "Done. Report written to: $ReportPath" -ForegroundColor Green
 Write-Host "Folder: $OutDir" -ForegroundColor Green
+'@
+
+# ======================= Get-PatchReport.ps1 =======================
+$Script:Payloads['Get-PatchReport'] = @'
+<#
+.SYNOPSIS
+    Windows patch status of this machine: last successful and last failed update installs, pending reboot,
+    last boot / uptime. Built to run from an RMM (N-central scheduled task) as SYSTEM, or by hand.
+
+.DESCRIPTION
+    Prepared by Sigma Data Systems Inc.
+
+    Universal - nothing client-specific. Works on Windows PowerShell 2.0 and later (Server 2008 R2 / 2012 included).
+    Reads, read-only:
+      - Windows Update history (the same agent N-central's patch management drives), so patches pushed by
+        N-central, WSUS or Windows Update all show up. Definition / Security Intelligence updates are counted
+        separately so the daily Defender update doesn't hide a failed monthly patch.
+      - installed hotfixes (Win32_QuickFixEngineering) as a second source for the newest install date
+      - pending reboot flags (Component Based Servicing, Windows Update, pending file renames, computer rename)
+      - last boot time, OS name and build, Windows Update service state
+    With -CheckMissing it also asks Windows Update for updates that are available but not installed (slower:
+    can take several minutes; leave it off when N-central's Patch Status service already covers that).
+
+    Output (stdout, so it shows in the RMM task's output):
+      line 1   PATCHRPT,{...one line of JSON...}   - read by the Sigma NOC patch collector
+      then     a short readable summary
+
+    Exit code 0 always (it is a report). Exit 1 only if the Windows Update history couldn't be read at all.
+
+.EXAMPLE
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Get-PatchReport.ps1
+.EXAMPLE
+    .\Get-PatchReport.ps1 -CheckMissing -Days 60
+#>
+[CmdletBinding()]
+param(
+    [int]$Days = 30,            # window for the installed / failed counts
+    [int]$HistoryMax = 400,     # newest Windows Update history entries to read
+    [switch]$CheckMissing
+)
+$ErrorActionPreference = 'SilentlyContinue'
+
+function JStr($v) {
+    if ($null -eq $v) { return 'null' }
+    if ($v -is [bool]) { if ($v) { return 'true' } else { return 'false' } }
+    if ($v -is [int] -or $v -is [long] -or $v -is [double]) { return ([string]$v).Replace(',', '.') }
+    $s = [string]$v
+    $s = $s.Replace('\', '\\').Replace('"', '\"').Replace("`r", ' ').Replace("`n", ' ').Replace("`t", ' ')
+    return '"' + $s + '"'
+}
+function JObj($h) {   # ordered list of name/value pairs -> JSON object (PowerShell 2.0 has no ConvertTo-Json)
+    $p = @(); foreach ($k in $h.Keys) { $v = $h[$k]; $p += (JStr $k) + ':' + $(if ($v -is [System.Collections.IDictionary]) { JObj $v } else { JStr $v }) }
+    return '{' + ($p -join ',') + '}'
+}
+function Iso($d) { if ($d) { try { return ([datetime]$d).ToString('yyyy-MM-ddTHH:mm:ss') } catch { } }; return $null }
+function KB([string]$t) { if ($t -match '(KB\d{6,8})') { return $Matches[1] }; return '' }
+$defRx = '(?i)definition|security intelligence|antimalware platform|malicious software removal|KB2267602|KB890830|KB4052623'
+$cuRx  = '(?i)cumulative update|monthly (security )?(quality )?rollup|security only'
+
+# ---------------------------------------------------------------- OS / boot
+$os = Get-WmiObject Win32_OperatingSystem
+$caption = "$($os.Caption)".Trim(); $build = "$($os.Version)"
+try { $ubr = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').UBR; if ($ubr) { $build = "$build.$ubr" } } catch { }
+$boot = $null; try { $boot = $os.ConvertToDateTime($os.LastBootUpTime) } catch { }
+$upDays = if ($boot) { [Math]::Round(((Get-Date) - $boot).TotalDays, 1) } else { $null }
+
+# ---------------------------------------------------------------- pending reboot
+$why = @()
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $why += 'CBS' }
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $why += 'Windows Update' }
+try { $pfr = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager').PendingFileRenameOperations; if ($pfr) { $why += 'File rename' } } catch { }
+try {
+    $a = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName').ComputerName
+    $b = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName').ComputerName
+    if ($a -and $b -and $a -ne $b) { $why += 'Rename' }
+} catch { }
+# "File rename" alone is common and often harmless; only CBS / WU / rename mean patches are waiting on a reboot
+$rebootPending = [bool]($why | Where-Object { $_ -ne 'File rename' })
+$rebootSince = $null
+if ($rebootPending) {   # roughly when: the newest successful install after the last boot
+    $rebootSince = 'unknown'
+}
+
+# ---------------------------------------------------------------- Windows Update history
+$histOk = $false; $hist = @()
+try {
+    $sess = New-Object -ComObject Microsoft.Update.Session
+    $srch = $sess.CreateUpdateSearcher()
+    $n = $srch.GetTotalHistoryCount()
+    if ($n -gt 0) {
+        $hist = @($srch.QueryHistory(0, [Math]::Min($n, $HistoryMax)) | Where-Object { $_.Operation -eq 1 -and $_.Title })   # installs only
+    }
+    $histOk = $true
+} catch { }
+# ResultCode: 1 in progress, 2 succeeded, 3 succeeded with errors, 4 failed, 5 aborted
+$rows = @($hist | ForEach-Object {
+    $d = $null; try { $d = ([datetime]$_.Date).ToLocalTime() } catch { }
+    New-Object PSObject -Property @{ Date = $d; Title = "$($_.Title)"; Code = [int]$_.ResultCode; HResult = $(if ($_.HResult) { '0x{0:X8}' -f [int]$_.HResult } else { '' }); Def = ("$($_.Title)" -match $defRx) }
+} | Where-Object { $_.Date } | Sort-Object Date -Descending)
+$real = @($rows | Where-Object { -not $_.Def })
+$okRows = @($real | Where-Object { $_.Code -eq 2 -or $_.Code -eq 3 })
+$failRows = @($real | Where-Object { $_.Code -eq 4 -or $_.Code -eq 5 })
+$lastOk = $okRows | Select-Object -First 1
+$lastFail = $failRows | Select-Object -First 1
+$lastCu = $okRows | Where-Object { $_.Title -match $cuRx } | Select-Object -First 1
+$lastDef = $rows | Where-Object { $_.Def -and ($_.Code -eq 2 -or $_.Code -eq 3) } | Select-Object -First 1
+$since = (Get-Date).AddDays(-$Days)
+$ok30 = @($okRows | Where-Object { $_.Date -ge $since }).Count
+$fail30 = @($failRows | Where-Object { $_.Date -ge $since }).Count
+# a failure counts as "still failing" only if the same update hasn't installed since
+$openFails = @()
+foreach ($f in @($failRows | Where-Object { $_.Date -ge $since })) {
+    $k = KB $f.Title; $key = if ($k) { $k } else { $f.Title }
+    $fixed = $okRows | Where-Object { $_.Date -gt $f.Date -and ((KB $_.Title) -eq $k -and $k -or $_.Title -eq $f.Title) } | Select-Object -First 1
+    if (-not $fixed -and -not ($openFails | Where-Object { $_.Key -eq $key })) { $openFails += New-Object PSObject -Property @{ Key = $key; Row = $f } }
+}
+if ($rebootPending -and $lastOk -and $boot -and $lastOk.Date -gt $boot) { $rebootSince = Iso $lastOk.Date }
+
+# ---------------------------------------------------------------- hotfixes (second source)
+$hfDate = $null; $hfId = ''
+try {
+    foreach ($h in @(Get-WmiObject Win32_QuickFixEngineering)) {
+        $d = $null
+        try { if ($h.InstalledOn) { $d = [datetime]$h.InstalledOn } } catch { }
+        if (-not $d -and "$($h.psbase.Properties['InstalledOn'].Value)" -match '^[0-9A-Fa-f]{16}$') { try { $d = [datetime]::FromFileTime([Convert]::ToInt64($h.psbase.Properties['InstalledOn'].Value, 16)) } catch { } }
+        if ($d -and (-not $hfDate -or $d -gt $hfDate)) { $hfDate = $d; $hfId = "$($h.HotFixID)" }
+    }
+} catch { }
+
+# ---------------------------------------------------------------- services / optional missing-update scan
+$wu = Get-WmiObject Win32_Service -Filter "Name='wuauserv'"
+$wuState = if ($wu) { "$($wu.State)/$($wu.StartMode)" } else { 'not found' }
+$missing = $null; $missingSec = $null; $missingErr = ''
+if ($CheckMissing) {
+    try {
+        $r = $srch.Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
+        $missing = @($r.Updates | Where-Object { "$($_.Title)" -notmatch $defRx }).Count
+        $missingSec = @($r.Updates | Where-Object { "$($_.Title)" -notmatch $defRx -and (@($_.Categories | ForEach-Object { $_.Name }) -match 'Security|Critical') }).Count
+    } catch { $missingErr = $_.Exception.Message }
+}
+
+# ---------------------------------------------------------------- output
+function U($r) { if (-not $r) { return $null }; $o = New-Object System.Collections.Specialized.OrderedDictionary; $o['Date'] = Iso $r.Date; $o['Title'] = $r.Title; $o['KB'] = KB $r.Title; if ($r.HResult) { $o['HResult'] = $r.HResult }; return $o }
+$j = New-Object System.Collections.Specialized.OrderedDictionary
+$j['V'] = 1; $j['Computer'] = $env:COMPUTERNAME; $j['Os'] = $caption; $j['Build'] = $build
+$j['LastBoot'] = Iso $boot; $j['UptimeDays'] = $upDays
+$j['RebootPending'] = $rebootPending; $j['RebootWhy'] = ($why -join ', '); $j['RebootSince'] = $rebootSince
+$j['HistoryOk'] = $histOk; $j['Days'] = $Days; $j['Ok'] = $ok30; $j['Failed'] = $fail30; $j['OpenFailed'] = @($openFails).Count
+$j['LastOk'] = U $lastOk; $j['LastFail'] = U $lastFail; $j['LastCu'] = U $lastCu; $j['LastDef'] = Iso $(if ($lastDef) { $lastDef.Date })
+$j['OpenFail'] = $(if (@($openFails).Count) { ((@($openFails) | Select-Object -First 3 | ForEach-Object { $k = KB $_.Row.Title; if ($k) { $k } else { $_.Row.Title.Substring(0, [Math]::Min(60, $_.Row.Title.Length)) } }) -join ', ') } else { '' })
+$j['Hotfix'] = Iso $hfDate; $j['HotfixId'] = $hfId; $j['Wu'] = $wuState
+if ($CheckMissing) { $j['Missing'] = $missing; $j['MissingSec'] = $missingSec; if ($missingErr) { $j['MissingErr'] = $missingErr } }
+$j['At'] = Iso (Get-Date); $j['Tz'] = $(try { [TimeZoneInfo]::Local.Id } catch { '' })
+foreach ($k in @($j.Keys)) { if ($null -eq $j[$k]) { $j.Remove($k) } }
+Write-Output ('PATCHRPT,' + (JObj $j))
+Write-Output ''
+Write-Output ("Computer      : {0}  ({1}, build {2})" -f $env:COMPUTERNAME, $caption, $build)
+Write-Output ("Last boot     : {0}{1}" -f $(if ($boot) { $boot.ToString('yyyy-MM-dd HH:mm') } else { 'unknown' }), $(if ($upDays -ne $null) { "  (up $upDays days)" } else { '' }))
+Write-Output ("Reboot pending: {0}" -f $(if ($rebootPending) { "YES ($($why -join ', '))" } elseif ($why) { "no (only: $($why -join ', '))" } else { 'no' }))
+if (-not $histOk) { Write-Output 'Update history: could not be read (Windows Update agent not available)' }
+Write-Output ("Last installed: {0}" -f $(if ($lastOk) { "$($lastOk.Date.ToString('yyyy-MM-dd HH:mm'))  $($lastOk.Title)" } else { 'none in history' }))
+Write-Output ("Last cumulative: {0}" -f $(if ($lastCu) { "$($lastCu.Date.ToString('yyyy-MM-dd'))  $($lastCu.Title)" } else { 'none in history' }))
+Write-Output ("Last failure  : {0}" -f $(if ($lastFail) { "$($lastFail.Date.ToString('yyyy-MM-dd HH:mm'))  $($lastFail.Title)  $($lastFail.HResult)" } else { 'none in history' }))
+Write-Output ("Last {0} days : {1} installed, {2} failed, {3} still failing{4}" -f $Days, $ok30, $fail30, @($openFails).Count, $(if (@($openFails).Count) { " ($($j['OpenFail']))" } else { '' }))
+if ($hfDate) { Write-Output ("Newest hotfix : {0}  {1}" -f $hfDate.ToString('yyyy-MM-dd'), $hfId) }
+Write-Output ("WU service    : {0}" -f $wuState)
+if ($CheckMissing) { Write-Output ("Missing       : {0}" -f $(if ($missingErr) { "scan failed: $missingErr" } else { "$missing available, $missingSec security/critical" })) }
+if ($histOk) { exit 0 } else { exit 1 }
 '@
 
 # ======================= Get-PatchAndRebootReport.ps1 =======================
@@ -23135,487 +22801,6 @@ try {
     Write-Out "`n  Stopped. Building summary..." 'Cyan'
     Write-Summary $LogPath
 }
-'@
-
-# ======================= Test-SmtpRelay.ps1 =======================
-$Script:Payloads['Test-SmtpRelay'] = @'
-<#
-.SYNOPSIS
-    SMTP Relay / Plus-Address Test - Sigma Data Systems Inc.
-
-.DESCRIPTION
-    Tests an Exchange Online connector-based (IP) relay exactly the way a copier/scanner
-    uses it: raw SMTP to the MX endpoint on port 25, NO authentication, optional STARTTLS.
-
-    - Resolves the recipient domain's MX (or uses the server you give it)
-    - Shows this site's public IP (must match the inbound connector) and the domain's SPF
-    - Walks the full SMTP conversation and prints every server response
-    - Sends a test message to the address you enter - supports plus addressing
-      (e.g. mailbox+tag@domain) for testing scan-routing setups
-    - Explains the most common failure codes
-    - Writes a log to C:\temp
-
-    No client-specific values are stored in this script.
-
-.EXAMPLE
-    .\Test-SmtpRelay.ps1
-    (prompts for everything)
-
-.EXAMPLE
-    .\Test-SmtpRelay.ps1 -To "mailbox+test@example.com" -From "scanner@example.com" -StartTls
-
-.NOTES
-    Prepared by Sigma Data Systems Inc.
-#>
-[CmdletBinding()]
-param(
-    [string]$To,
-    [string]$From,
-    [string]$SmtpServer,
-    [int]$Port = 25,
-    [switch]$StartTls,
-    [string]$OutputFolder = 'C:\temp'
-)
-
-$ErrorActionPreference = 'Stop'
-
-if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
-$logFile = Join-Path $OutputFolder ("SMTPRelayTest_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-Start-Transcript -Path $logFile -Force | Out-Null
-
-Write-Host ""
-Write-Host "=== SMTP Relay / Plus-Address Test ===" -ForegroundColor Cyan
-Write-Host "    Sigma Data Systems Inc." -ForegroundColor DarkCyan
-Write-Host ""
-
-# ---------- Inputs ----------
-if (-not $To) { $To = Read-Host "Recipient address to test (e.g. mailbox+test@domain.com)" }
-$To = $To.Trim()
-if ($To -notmatch '^[^@\s]+@[^@\s]+\.[^@\s]+$') { Write-Host "Invalid recipient address." -ForegroundColor Red; Stop-Transcript | Out-Null; return }
-$domain = $To.Split('@')[1]
-
-if (-not $From) {
-    $defaultFrom = "scanner@$domain"
-    $From = Read-Host "Sender address (Enter for $defaultFrom)"
-    if (-not $From) { $From = $defaultFrom }
-}
-$From = $From.Trim()
-
-if (-not $PSBoundParameters.ContainsKey('StartTls')) {
-    $ans = Read-Host "Use STARTTLS? (matches the device's 'Use Secure Connection' setting) [y/N]"
-    $StartTls = [bool]($ans -match '^[Yy]')
-}
-
-if ($To -match '\+') {
-    $local = $To.Split('@')[0]
-    Write-Host ("Plus address detected: mailbox '{0}', tag '{1}'" -f $local.Split('+')[0], $local.Split('+',2)[1]) -ForegroundColor Gray
-}
-
-# ---------- MX / server ----------
-if (-not $SmtpServer) {
-    try {
-        $mx = Resolve-DnsName -Name $domain -Type MX -ErrorAction Stop |
-              Where-Object { $_.Type -eq 'MX' } | Sort-Object Preference | Select-Object -First 1
-        $SmtpServer = $mx.NameExchange
-        Write-Host "MX for $domain : $SmtpServer" -ForegroundColor Gray
-    } catch {
-        $SmtpServer = ($domain -replace '\.', '-') + '.mail.protection.outlook.com'
-        Write-Host "MX lookup failed - falling back to $SmtpServer" -ForegroundColor Yellow
-    }
-}
-if ($SmtpServer -notlike '*.mail.protection.outlook.com') {
-    Write-Host "Note: $SmtpServer is not an Exchange Online endpoint (mail may route through a third-party gateway)." -ForegroundColor Yellow
-}
-
-# ---------- Public IP / SPF ----------
-$publicIp = $null
-try { $publicIp = (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 8).ToString().Trim() } catch { }
-if ($publicIp) { Write-Host "This site's public IP: $publicIp  (must match the inbound connector)" -ForegroundColor Gray }
-else { Write-Host "Could not determine public IP." -ForegroundColor Yellow }
-
-try {
-    $spf = (Resolve-DnsName -Name $domain -Type TXT -ErrorAction Stop |
-            Where-Object { $_.Strings -join '' -like 'v=spf1*' } | Select-Object -First 1).Strings -join ''
-    if ($spf) {
-        Write-Host "SPF: $spf" -ForegroundColor Gray
-        if ($publicIp -and $spf -notmatch [regex]::Escape($publicIp)) {
-            Write-Host "  (Public IP not listed literally in SPF - fine with a connector, but scans may be flagged if the connector isn't matching.)" -ForegroundColor DarkYellow
-        }
-    }
-} catch { }
-
-# ---------- SMTP helpers ----------
-function Read-SmtpResponse {
-    param($Reader)
-    $lines = @()
-    do {
-        $line = $Reader.ReadLine()
-        if ($null -eq $line) { throw "Connection closed by server." }
-        $lines += $line
-        Write-Host "  S: $line" -ForegroundColor DarkGray
-    } while ($line.Length -ge 4 -and $line[3] -eq '-')
-    [pscustomobject]@{ Code = [int]$lines[-1].Substring(0,3); Lines = $lines; Text = ($lines -join ' ') }
-}
-
-function Invoke-SmtpCommand {
-    param($Writer, $Reader, [string]$Command, [int[]]$Expect, [string]$Display)
-    if (-not $Display) { $Display = $Command }
-    Write-Host "  C: $Display" -ForegroundColor White
-    $Writer.WriteLine($Command)
-    $r = Read-SmtpResponse $Reader
-    if ($Expect -notcontains $r.Code) { throw [System.Exception]::new("SMTP|$($r.Code)|$($r.Text)") }
-    $r
-}
-
-function Show-Hint {
-    param([string]$Text)
-    Write-Host ""
-    Write-Host "Likely cause:" -ForegroundColor Yellow
-    switch -Regex ($Text) {
-        '5\.7\.64|TenantAttribution|Relay Access Denied' { Write-Host "  Exchange Online did not match this public IP to an inbound connector. Check the connector's IP list matches $publicIp."; break }
-        '5\.7\.1|5\.7\.606|5\.7\.708|5\.7\.750' { Write-Host "  Message rejected by policy (relay not permitted, IP reputation, or tenant send restriction). Check connector + message trace."; break }
-        '5\.1\.10|5\.1\.1|RecipientNotFound' { Write-Host "  Recipient not found. Check the mailbox exists. If using a plus address, check plus addressing is enabled: Get-OrganizationConfig | fl *PlusAddress*"; break }
-        '5\.7\.57|5\.7\.3' { Write-Host "  Server expected authentication - you may be hitting smtp.office365.com instead of the MX endpoint."; break }
-        '4\.\d\.\d' { Write-Host "  Temporary failure - retry; if it persists check message trace and service health."; break }
-        default { Write-Host "  See the server response above." }
-    }
-}
-
-# ---------- Conversation ----------
-$client = $null
-$ok = $false
-try {
-    Write-Host ""
-    Write-Host "Connecting to ${SmtpServer}:$Port ..." -ForegroundColor Cyan
-    $client = New-Object System.Net.Sockets.TcpClient
-    if (-not $client.ConnectAsync($SmtpServer, $Port).Wait(10000)) {
-        throw [System.Exception]::new("CONNECT|Timed out connecting to ${SmtpServer}:$Port")
-    }
-    $stream = $client.GetStream()
-    $stream.ReadTimeout = 20000; $stream.WriteTimeout = 20000
-
-    $enc = [System.Text.Encoding]::ASCII
-    $reader = New-Object System.IO.StreamReader($stream, $enc)
-    $writer = New-Object System.IO.StreamWriter($stream, $enc); $writer.NewLine = "`r`n"; $writer.AutoFlush = $true
-
-    $banner = Read-SmtpResponse $reader
-    if ($banner.Code -ne 220) { throw [System.Exception]::new("SMTP|$($banner.Code)|$($banner.Text)") }
-
-    $helo = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [System.Net.Dns]::GetHostName() }
-    $ehlo = Invoke-SmtpCommand $writer $reader "EHLO $helo" 250
-
-    if ($StartTls) {
-        if ($ehlo.Text -notmatch 'STARTTLS') { Write-Host "Server did not advertise STARTTLS." -ForegroundColor Yellow }
-        Invoke-SmtpCommand $writer $reader "STARTTLS" 220 | Out-Null
-        $ssl = New-Object System.Net.Security.SslStream($stream, $false)
-        $ssl.AuthenticateAsClient($SmtpServer, $null, [System.Security.Authentication.SslProtocols]::Tls12, $false)
-        Write-Host ("  TLS negotiated: {0} / {1}" -f $ssl.SslProtocol, $ssl.CipherAlgorithm) -ForegroundColor Green
-        $reader = New-Object System.IO.StreamReader($ssl, $enc)
-        $writer = New-Object System.IO.StreamWriter($ssl, $enc); $writer.NewLine = "`r`n"; $writer.AutoFlush = $true
-        Invoke-SmtpCommand $writer $reader "EHLO $helo" 250 | Out-Null
-    }
-
-    Invoke-SmtpCommand $writer $reader "MAIL FROM:<$From>" 250 | Out-Null
-    Invoke-SmtpCommand $writer $reader "RCPT TO:<$To>" 250,251 | Out-Null
-    Invoke-SmtpCommand $writer $reader "DATA" 354 | Out-Null
-
-    $now = Get-Date
-    $msgId = "<{0}@{1}>" -f ([guid]::NewGuid().ToString('N')), $From.Split('@')[1]
-    $subject = "SMTP Relay Test $($now.ToString('yyyy-MM-dd HH:mm:ss'))"
-    $message = @(
-        "From: <$From>"
-        "To: <$To>"
-        "Subject: $subject"
-        "Date: $($now.ToUniversalTime().ToString('r'))"
-        "Message-ID: $msgId"
-        "MIME-Version: 1.0"
-        "Content-Type: text/plain; charset=us-ascii"
-        ""
-        "SMTP relay test sent from $env:COMPUTERNAME."
-        "Server: ${SmtpServer}:$Port   STARTTLS: $StartTls"
-        "Public IP: $publicIp"
-        "Recipient: $To"
-        ""
-        "Prepared by Sigma Data Systems Inc."
-    ) -join "`r`n"
-    $writer.Write($message + "`r`n.`r`n")
-    Write-Host "  C: <message body sent>" -ForegroundColor White
-    $dataResp = Read-SmtpResponse $reader
-    if ($dataResp.Code -ne 250) { throw [System.Exception]::new("SMTP|$($dataResp.Code)|$($dataResp.Text)") }
-
-    try { Invoke-SmtpCommand $writer $reader "QUIT" 221 | Out-Null } catch { }
-    $ok = $true
-
-    Write-Host ""
-    Write-Host "RESULT: PASS - message accepted and queued." -ForegroundColor Green
-    Write-Host "  Subject:    $subject"
-    Write-Host "  Message-ID: $msgId"
-    Write-Host ""
-    Write-Host "Next:" -ForegroundColor Cyan
-    Write-Host "  1. Confirm it landed in the target mailbox."
-    if ($To -match '\+') { Write-Host "  2. Open it and check the To: line still shows $To (that's what the routing flow reads)." }
-    Write-Host "  3. If it doesn't arrive: Exchange admin center > Mail flow > Message trace, search by subject above."
-}
-catch {
-    $msg = $_.Exception.Message
-    if ($_.Exception.InnerException) { $msg = $_.Exception.InnerException.Message }
-    Write-Host ""
-    if ($msg -like 'SMTP|*') {
-        $parts = $msg.Split('|', 3)
-        Write-Host "RESULT: FAIL - server returned $($parts[1])" -ForegroundColor Red
-        Write-Host "  $($parts[2])"
-        Show-Hint $parts[2]
-    } elseif ($msg -like 'CONNECT|*' -or $msg -match 'actively refused|did not properly respond|No such host|timed out') {
-        Write-Host "RESULT: FAIL - could not connect to ${SmtpServer}:$Port" -ForegroundColor Red
-        Write-Host "  $($msg -replace '^CONNECT\|','')"
-        Write-Host ""
-        Write-Host "Likely cause:" -ForegroundColor Yellow
-        Write-Host "  Outbound port $Port blocked by the ISP or firewall, or DNS can't resolve the server."
-    } else {
-        Write-Host "RESULT: FAIL - $msg" -ForegroundColor Red
-        if ($StartTls) { Write-Host "  (If this failed during TLS, re-run without STARTTLS to compare.)" -ForegroundColor Yellow }
-    }
-}
-finally {
-    if ($client) { $client.Close() }
-    Write-Host ""
-    Write-Host "Log saved: $logFile" -ForegroundColor Gray
-    Stop-Transcript | Out-Null
-}
-'@
-
-# ======================= Kill-WindowsUpdate.ps1 =======================
-$Script:Payloads['Kill-WindowsUpdate'] = @'
-#Requires -RunAsAdministrator
-<#
-.SYNOPSIS
-    Stop, pause, disable, or restore Windows Update on the local machine.
-
-.DESCRIPTION
-    Sigma Data Systems Inc. - universal remediation script (no client-specific values).
-
-    Modes:
-      Stop     (default) Kill in-progress update activity right now: stops update
-               services and kills update worker processes. Nothing is persisted;
-               Windows will resume on its normal schedule / next reboot.
-      Pause    Uses the built-in Windows Update pause (same as Settings > Pause),
-               1-35 days. Survives reboots, expires on its own.
-      Disable  Hard block: Stop + WU policy pointed at a dead local server, internet WU
-               locations blocked, Settings page locked, wuauserv/UsoSvc disabled with
-               auto-restart cleared, WaaSMedicSvc disabled (when permitted), update tasks
-               disabled. Original WU policy is backed up to %ProgramData%\SDSI first.
-               Persists until Restore. WARNING: blocks N-central Patch Management too -
-               also exclude the device from patching in N-central.
-      Restore  Reverses Pause and Disable, sets services back to Windows defaults.
-      Status   Shows current service, policy, pause, and pending-reboot state.
-
-.EXAMPLE
-    .\Kill-WindowsUpdate.ps1                     # kill it right now
-    .\Kill-WindowsUpdate.ps1 -Mode Pause -PauseDays 14
-    .\Kill-WindowsUpdate.ps1 -Mode Disable
-    .\Kill-WindowsUpdate.ps1 -Mode Restore
-#>
-[CmdletBinding()]
-param(
-    [ValidateSet('Stop','Pause','Disable','Restore','Status')]
-    [string]$Mode = 'Stop',
-
-    [ValidateRange(1,35)]
-    [int]$PauseDays = 7
-)
-
-$ErrorActionPreference = 'Continue'
-
-$UpdateServices  = 'wuauserv','UsoSvc','bits','dosvc'
-$UpdateProcesses = 'wuauclt','usoclient','MoUsoCoreWorker','TiWorker',
-                   'WaaSMedicAgent','MusNotification','MusNotificationUx',
-                   'SIHClient','UpdateAssistant','Windows10UpgraderApp'
-$PolicyKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
-$UxKey       = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
-$PauseValues = 'PauseUpdatesStartTime','PauseUpdatesExpiryTime',
-               'PauseFeatureUpdatesStartTime','PauseFeatureUpdatesEndTime',
-               'PauseQualityUpdatesStartTime','PauseQualityUpdatesEndTime'
-$TaskPaths   = '\Microsoft\Windows\UpdateOrchestrator\','\Microsoft\Windows\WindowsUpdate\','\Microsoft\Windows\WaaSMedic\'
-$WUPolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
-$BackupDir   = Join-Path $env:ProgramData 'SDSI'
-$BackupFile  = Join-Path $BackupDir 'WUPolicyBackup.reg'
-
-function Write-Step($msg, $color = 'Cyan') { Write-Host "[*] $msg" -ForegroundColor $color }
-
-function Stop-ServiceWithTimeout([string]$Name, [int]$TimeoutSec = 15) {
-    $s = Get-Service -Name $Name -ErrorAction SilentlyContinue
-    if (-not $s -or $s.Status -eq 'Stopped') { return }
-
-    # Non-blocking stop request (Stop-Service can wait forever on a busy wuauserv)
-    sc.exe stop $Name | Out-Null
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Service $Name).Status -ne 'Stopped' -and (Get-Date) -lt $deadline) {
-        Start-Sleep -Milliseconds 500
-    }
-
-    if ((Get-Service $Name).Status -ne 'Stopped') {
-        $svcPid = (Get-CimInstance Win32_Service -Filter "Name='$Name'").ProcessId
-        if ($svcPid -gt 0) {
-            # Only kill the host if this service is alone in it (don't take out shared svchosts)
-            $shared = @(Get-CimInstance Win32_Service -Filter "ProcessId=$svcPid")
-            if ($shared.Count -eq 1) {
-                Write-Host "    $Name hung - killing host PID $svcPid" -ForegroundColor Yellow
-                taskkill /PID $svcPid /F | Out-Null
-                Start-Sleep -Seconds 1
-            } else {
-                Write-Host "    $Name hung but shares PID $svcPid with $($shared.Count - 1) other service(s) - left running" -ForegroundColor Yellow
-            }
-        }
-    }
-    Write-Host "    $Name -> $((Get-Service $Name).Status)"
-}
-
-function Stop-UpdateActivity {
-    # Kill workers first - this is usually what keeps wuauserv from stopping
-    Write-Step "Killing update worker processes..."
-    foreach ($p in $UpdateProcesses + 'TrustedInstaller') {
-        Get-Process -Name $p -ErrorAction SilentlyContinue | ForEach-Object {
-            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
-            Write-Host "    killed $($_.Name) (PID $($_.Id))"
-        }
-    }
-    Write-Step "Stopping update services (15s timeout each)..."
-    foreach ($svc in $UpdateServices) { Stop-ServiceWithTimeout -Name $svc }
-}
-
-function Set-UpdatePause([int]$Days) {
-    if (-not (Test-Path $UxKey)) { New-Item -Path $UxKey -Force | Out-Null }
-    $start = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    $end   = (Get-Date).AddDays($Days).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    foreach ($n in 'PauseUpdatesStartTime','PauseFeatureUpdatesStartTime','PauseQualityUpdatesStartTime') {
-        Set-ItemProperty -Path $UxKey -Name $n -Value $start -Type String
-    }
-    foreach ($n in 'PauseUpdatesExpiryTime','PauseFeatureUpdatesEndTime','PauseQualityUpdatesEndTime') {
-        Set-ItemProperty -Path $UxKey -Name $n -Value $end -Type String
-    }
-    Write-Step "Updates paused until $((Get-Date).AddDays($Days).ToString('yyyy-MM-dd HH:mm'))" 'Green'
-}
-
-function Set-UpdateTasks([bool]$Enable) {
-    $TaskPaths | ForEach-Object { Get-ScheduledTask -TaskPath $_ -ErrorAction SilentlyContinue } | ForEach-Object {
-        try {
-            if ($Enable) { Enable-ScheduledTask  -InputObject $_ -ErrorAction Stop | Out-Null }
-            else         { Disable-ScheduledTask -InputObject $_ -ErrorAction Stop | Out-Null }
-            Write-Host "    $($_.TaskName) -> $(if($Enable){'Enabled'}else{'Disabled'})"
-        } catch {
-            Write-Host "    $($_.TaskName) -> protected by OS, skipped" -ForegroundColor DarkGray
-        }
-    }
-}
-
-function Show-Status {
-    Write-Step "Services"
-    Get-Service -Name ($UpdateServices + 'WaaSMedicSvc') -ErrorAction SilentlyContinue |
-        Select-Object Name, Status, StartType | Format-Table -AutoSize
-
-    Write-Step "Policy (NoAutoUpdate)"
-    $na = (Get-ItemProperty -Path $PolicyKey -Name NoAutoUpdate -ErrorAction SilentlyContinue).NoAutoUpdate
-    Write-Host "    NoAutoUpdate = $(if ($null -eq $na) {'not set'} else {$na})"
-    $wus = (Get-ItemProperty -Path $WUPolicyKey -Name WUServer -ErrorAction SilentlyContinue).WUServer
-    $use = (Get-ItemProperty -Path $PolicyKey -Name UseWUServer -ErrorAction SilentlyContinue).UseWUServer
-    Write-Host "    WUServer     = $(if ($wus) {$wus} else {'not set'})  (UseWUServer=$(if ($null -eq $use) {'not set'} else {$use}))"
-    Write-Host "    Hard block   = $(if ($wus -like '*127.0.0.1*' -and $use -eq 1) {'ACTIVE'} else {'off'})"
-
-    Write-Step "Pause"
-    $exp = (Get-ItemProperty -Path $UxKey -Name PauseUpdatesExpiryTime -ErrorAction SilentlyContinue).PauseUpdatesExpiryTime
-    Write-Host "    Paused until = $(if ($exp) {([datetime]$exp).ToLocalTime()} else {'not paused'})"
-
-    Write-Step "Pending reboot"
-    $pending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
-               (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
-    Write-Host "    Reboot pending = $pending"
-}
-
-switch ($Mode) {
-    'Stop' {
-        Stop-UpdateActivity
-        Write-Step "Done. Not persistent - Windows Update will resume on schedule/reboot." 'Green'
-    }
-    'Pause' {
-        Stop-UpdateActivity
-        Set-UpdatePause -Days $PauseDays
-    }
-    'Disable' {
-        Stop-UpdateActivity
-
-        # Back up existing WU policy (RMM/WSUS/GPO values) once, so Restore can put it back exactly
-        if (-not (Test-Path $BackupDir)) { New-Item -Path $BackupDir -ItemType Directory -Force | Out-Null }
-        if (-not (Test-Path $BackupFile)) {
-            if (Test-Path $WUPolicyKey) {
-                reg.exe export 'HKLM\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' $BackupFile /y | Out-Null
-                Write-Step "Backed up existing Windows Update policy to $BackupFile"
-            } else {
-                Set-Content -Path $BackupFile -Value 'NONE' -Encoding ASCII
-            }
-        }
-
-        Write-Step "Applying hard-block policies..."
-        foreach ($k in $WUPolicyKey, $PolicyKey) { if (-not (Test-Path $k)) { New-Item -Path $k -Force | Out-Null } }
-        # Point the update client at a dead local server so nothing (Windows, RMM, user) can download
-        Set-ItemProperty -Path $WUPolicyKey -Name WUServer       -Value 'http://127.0.0.1:8530' -Type String
-        Set-ItemProperty -Path $WUPolicyKey -Name WUStatusServer -Value 'http://127.0.0.1:8530' -Type String
-        Set-ItemProperty -Path $WUPolicyKey -Name DoNotConnectToWindowsUpdateInternetLocations -Value 1 -Type DWord
-        Set-ItemProperty -Path $WUPolicyKey -Name DisableWindowsUpdateAccess -Value 1 -Type DWord
-        Set-ItemProperty -Path $WUPolicyKey -Name SetDisableUXWUAccess -Value 1 -Type DWord
-        Set-ItemProperty -Path $PolicyKey   -Name UseWUServer  -Value 1 -Type DWord
-        Set-ItemProperty -Path $PolicyKey   -Name NoAutoUpdate -Value 1 -Type DWord
-        Write-Host "    WUServer -> 127.0.0.1 (dead), internet WU locations blocked, Settings page locked"
-
-        Write-Step "Disabling services and their auto-restart..."
-        foreach ($svc in 'wuauserv','UsoSvc') {
-            sc.exe config  $svc start= disabled | Out-Null
-            sc.exe failure $svc reset= 0 actions= '""' | Out-Null
-            Write-Host "    $svc -> $((Get-Service $svc).StartType), recovery actions cleared"
-        }
-        # WaaSMedicSvc ("Windows Update Medic") re-enables wuauserv; its key is OS-protected.
-        # Usually succeeds when run as SYSTEM (N-central), may be denied as a normal admin.
-        try {
-            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc' -Name Start -Value 4 -Type DWord -ErrorAction Stop
-            Write-Host "    WaaSMedicSvc -> Disabled"
-        } catch {
-            Write-Host "    WaaSMedicSvc -> protected, could not disable (policy block above still holds)" -ForegroundColor Yellow
-        }
-
-        Write-Step "Disabling update scheduled tasks..."
-        Set-UpdateTasks -Enable $false
-
-        Write-Step "Windows Update disabled. Run -Mode Restore to undo." 'Yellow'
-        Write-Host "    Also exclude this device from patching in your RMM, or its patch scans will alert/fail." -ForegroundColor DarkGray
-    }
-    'Restore' {
-        Write-Step "Removing hard-block policy..."
-        foreach ($n in 'WUServer','WUStatusServer','DoNotConnectToWindowsUpdateInternetLocations','DisableWindowsUpdateAccess','SetDisableUXWUAccess') {
-            Remove-ItemProperty -Path $WUPolicyKey -Name $n -ErrorAction SilentlyContinue
-        }
-        foreach ($n in 'UseWUServer','NoAutoUpdate') { Remove-ItemProperty -Path $PolicyKey -Name $n -ErrorAction SilentlyContinue }
-        if ((Test-Path $BackupFile) -and ((Get-Content $BackupFile -TotalCount 1) -ne 'NONE')) {
-            reg.exe import $BackupFile 2>$null
-            Write-Step "Re-imported original Windows Update policy from backup"
-        }
-        Remove-Item $BackupFile -Force -ErrorAction SilentlyContinue
-        foreach ($n in $PauseValues) { Remove-ItemProperty -Path $UxKey -Name $n -ErrorAction SilentlyContinue }
-        try { Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc' -Name Start -Value 3 -Type DWord -ErrorAction Stop } catch {}
-        sc.exe failure wuauserv reset= 86400 actions= restart/60000/restart/60000// | Out-Null
-        Write-Step "Restoring service defaults..."
-        sc.exe config wuauserv start= demand      | Out-Null
-        sc.exe config UsoSvc   start= delayed-auto | Out-Null
-        sc.exe config bits     start= demand      | Out-Null
-        sc.exe config dosvc    start= delayed-auto | Out-Null
-        Start-Service UsoSvc, wuauserv -ErrorAction SilentlyContinue
-        Write-Step "Re-enabling UpdateOrchestrator tasks..."
-        Set-UpdateTasks -Enable $true
-        Write-Step "Windows Update restored." 'Green'
-    }
-    'Status' { }
-}
-
-Write-Host ""
-Show-Status
 '@
 #endregion
 
