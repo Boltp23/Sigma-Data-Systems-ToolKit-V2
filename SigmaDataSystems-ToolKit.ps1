@@ -10032,11 +10032,26 @@ try {
     }
     $histOk = $true
 } catch { }
+# Fallback / supplement: the System event log (WindowsUpdateClient 19 = installed, 20 = failed) - works when the
+# Windows Update COM API is unavailable to SYSTEM or the history database is empty/corrupt
+$evRows = @()
+try {
+    $evRows = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WindowsUpdateClient'; Id = 19, 20; StartTime = (Get-Date).AddDays(-180) } -ErrorAction Stop | ForEach-Object {
+        # 19: updateTitle, ...   20: errorCode, updateTitle, ...
+        $t = ''; $hr = ''
+        try { if ($_.Id -eq 20) { $t = "$($_.Properties[1].Value)"; $hr = '0x{0:X8}' -f [int64]$_.Properties[0].Value } else { $t = "$($_.Properties[0].Value)" } } catch { }
+        if (-not $t) { $t = ("$($_.Message)" -replace '^.*?:\s*', '') }
+        New-Object PSObject -Property @{ Date = $_.TimeCreated; Title = $t; Code = $(if ($_.Id -eq 19) { 2 } else { 4 }); HResult = $hr; Def = ($t -match $defRx) }
+    })
+} catch { }
 # ResultCode: 1 in progress, 2 succeeded, 3 succeeded with errors, 4 failed, 5 aborted
 $rows = @($hist | ForEach-Object {
     $d = $null; try { $d = ([datetime]$_.Date).ToLocalTime() } catch { }
     New-Object PSObject -Property @{ Date = $d; Title = "$($_.Title)"; Code = [int]$_.ResultCode; HResult = $(if ($_.HResult) { '0x{0:X8}' -f [int]$_.HResult } else { '' }); Def = ("$($_.Title)" -match $defRx) }
-} | Where-Object { $_.Date } | Sort-Object Date -Descending)
+} | Where-Object { $_.Date })
+if (-not $rows.Count -and $evRows.Count) { $rows = $evRows; $src = 'event log' } elseif ($rows.Count) { $src = 'Windows Update' } else { $src = 'none' }
+$rows = @($rows | Sort-Object Date -Descending)
+if ($rows.Count) { $histOk = $true }
 $real = @($rows | Where-Object { -not $_.Def })
 $okRows = @($real | Where-Object { $_.Code -eq 2 -or $_.Code -eq 3 })
 $failRows = @($real | Where-Object { $_.Code -eq 4 -or $_.Code -eq 5 })
@@ -10080,19 +10095,22 @@ if ($CheckMissing) {
 }
 
 # ---------------------------------------------------------------- output
-function U($r) { if (-not $r) { return $null }; $o = New-Object System.Collections.Specialized.OrderedDictionary; $o['Date'] = Iso $r.Date; $o['Title'] = $r.Title; $o['KB'] = KB $r.Title; if ($r.HResult) { $o['HResult'] = $r.HResult }; return $o }
+# Kept short on purpose: RMM task output can be cut off, and a cut-off line can't be read
+function Short([string]$t, [int]$n) { $t = ($t -replace '\s*\(KB\d+\)', '' -replace '\s+', ' ').Trim(); if ($t.Length -gt $n) { $t.Substring(0, $n) } else { $t } }
+function U($r, [int]$n = 50) { if (-not $r) { return $null }; $o = New-Object System.Collections.Specialized.OrderedDictionary; $o['Date'] = Iso $r.Date; $o['KB'] = KB $r.Title; if ($n) { $o['Title'] = Short $r.Title $n }; if ($r.HResult) { $o['HResult'] = $r.HResult }; return $o }
 $j = New-Object System.Collections.Specialized.OrderedDictionary
-$j['V'] = 1; $j['Computer'] = $env:COMPUTERNAME; $j['Os'] = $caption; $j['Build'] = $build
+$j['V'] = 2; $j['Os'] = ($caption -replace '^Microsoft\s+', ''); $j['Build'] = $build; $j['Src'] = $src
 $j['LastBoot'] = Iso $boot; $j['UptimeDays'] = $upDays
-$j['RebootPending'] = $rebootPending; $j['RebootWhy'] = ($why -join ', '); $j['RebootSince'] = $rebootSince
+$j['RebootPending'] = $rebootPending; if ($why) { $j['RebootWhy'] = ($why -join ', ') }; if ($rebootSince -and $rebootSince -ne 'unknown') { $j['RebootSince'] = $rebootSince }
 $j['HistoryOk'] = $histOk; $j['Days'] = $Days; $j['Ok'] = $ok30; $j['Failed'] = $fail30; $j['OpenFailed'] = @($openFails).Count
-$j['LastOk'] = U $lastOk; $j['LastFail'] = U $lastFail; $j['LastCu'] = U $lastCu; $j['LastDef'] = Iso $(if ($lastDef) { $lastDef.Date })
+$j['LastOk'] = U $lastOk 50; $j['LastFail'] = U $lastFail 40; $j['LastCu'] = U $lastCu 0; $j['LastDef'] = Iso $(if ($lastDef) { $lastDef.Date })
 $j['OpenFail'] = $(if (@($openFails).Count) { ((@($openFails) | Select-Object -First 3 | ForEach-Object { $k = KB $_.Row.Title; if ($k) { $k } else { $_.Row.Title.Substring(0, [Math]::Min(60, $_.Row.Title.Length)) } }) -join ', ') } else { '' })
-$j['Hotfix'] = Iso $hfDate; $j['HotfixId'] = $hfId; $j['Wu'] = $wuState
+$j['Hotfix'] = Iso $hfDate; $j['HotfixId'] = $hfId; $j['Wu'] = $wuState -replace '^Running/', 'Run/' -replace '^Stopped/', 'Stop/'
 if ($CheckMissing) { $j['Missing'] = $missing; $j['MissingSec'] = $missingSec; if ($missingErr) { $j['MissingErr'] = $missingErr } }
-$j['At'] = Iso (Get-Date); $j['Tz'] = $(try { [TimeZoneInfo]::Local.Id } catch { '' })
+$j['At'] = Iso (Get-Date)
 foreach ($k in @($j.Keys)) { if ($null -eq $j[$k]) { $j.Remove($k) } }
-Write-Output ('PATCHRPT,' + (JObj $j))
+$line = 'PATCHRPT,' + (JObj $j)
+Write-Output $line
 Write-Output ''
 Write-Output ("Computer      : {0}  ({1}, build {2})" -f $env:COMPUTERNAME, $caption, $build)
 Write-Output ("Last boot     : {0}{1}" -f $(if ($boot) { $boot.ToString('yyyy-MM-dd HH:mm') } else { 'unknown' }), $(if ($upDays -ne $null) { "  (up $upDays days)" } else { '' }))
@@ -10105,6 +10123,9 @@ Write-Output ("Last {0} days : {1} installed, {2} failed, {3} still failing{4}" 
 if ($hfDate) { Write-Output ("Newest hotfix : {0}  {1}" -f $hfDate.ToString('yyyy-MM-dd'), $hfId) }
 Write-Output ("WU service    : {0}" -f $wuState)
 if ($CheckMissing) { Write-Output ("Missing       : {0}" -f $(if ($missingErr) { "scan failed: $missingErr" } else { "$missing available, $missingSec security/critical" })) }
+Write-Output ("History source: {0}" -f $src)
+Write-Output ''
+Write-Output $line   # again at the end, in case the RMM keeps only the end of long output
 if ($histOk) { exit 0 } else { exit 1 }
 '@
 
