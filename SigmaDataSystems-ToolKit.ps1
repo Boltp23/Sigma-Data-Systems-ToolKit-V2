@@ -33,6 +33,9 @@
     report to C:\temp\SelfTest. Add -IncludeSlow and/or -IncludeDownloads for full coverage.
 
 .NOTES
+    v2.0.1 - adds: RAM audit + RAM optimizer / business-safe debloat (Optimize-WindowsMemory: real memory
+    pressure, agent stack, bloat, Widgets/Copilot/Recall, Edge/Chrome memory policies; preview + undo).
+    Fixes: Office install (ODT) crashed on workstations (Get-WindowsFeature is Server-only).
     v2.0 - adds: internet drop monitor (PingInfo-style, LAN / gateway / WAN-ISP diagnosis), section menu, self-test, security posture, hardware/SMART, reliability, perf,
     boot performance, pending-reboot detail, Windows Update list/install, SFC/DISM, AD/DC health,
     backup/VSS health, shares/open files, advanced network (MTU/tracert/proxy/Wi-Fi), server roles,
@@ -64,7 +67,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$Script:ToolkitVersion = '2.0'
+$Script:ToolkitVersion = '2.0.1'
 $Script:Auto = [bool]$SelfTest
 $Script:LastToolExit = $null
 $Script:OutRoot  = $OutputRoot
@@ -1162,6 +1165,54 @@ function Invoke-RemoveBloatware {
     if (Confirm-Change 'Remove bloatware AppX packages for all users and from the provisioning image.') {
         Invoke-Tool 'Remove-Bloatware' ([ordered]@{ OutputPath = (Get-OutDir 'Bloatware') }) | Out-Null
     }
+}
+
+function Invoke-RamAudit {
+    Write-Title 'RAM audit - where the memory goes, agent stack, bloat, recommendations (read-only)'
+    Write-Host '  Samples real memory pressure (hard faults, commit, pools), groups memory by app and agent'
+    Write-Host '  (AV/EDR, RMM, VPN, backup, OEM, Teams/browsers), lists bloat and gives prioritised fixes.'
+    $secs = Read-Int 'Seconds to sample paging activity' 10
+    Invoke-Tool 'Optimize-WindowsMemory' ([ordered]@{ Mode = 'Audit'; OutputPath = (Get-OutDir 'Memory'); SampleSeconds = $secs }) | Out-Null
+}
+
+function Invoke-RamOptimizer {
+    Write-Title '[!] RAM optimizer / business-safe debloat (Windows 10/11)'
+    Write-Host '  Each category is optional. A restore point + undo file are created first; registry changes can be'
+    Write-Host '  reverted with the "undo" option. Teams, OneNote, Outlook, Quick Assist, Store, Dell Command | Update,'
+    Write-Host '  page file, SysMain, Defender and Memory Integrity are never touched.' -ForegroundColor DarkGray
+    if (Read-YesNo 'Run the read-only RAM audit first (recommended)?' $true) {
+        Invoke-Tool 'Optimize-WindowsMemory' ([ordered]@{ Mode = 'Audit'; OutputPath = (Get-OutDir 'Memory'); SampleSeconds = 10 }) | Out-Null
+    }
+    $catalog = [ordered]@{
+        ConsumerApps       = @($true,  'Remove consumer Store apps (Bing, Xbox app, Clipchamp, Solitaire, games, social) - all users + new users')
+        OemApps            = @($true,  'Remove OEM consumer utilities (Dell Optimizer / consumer SupportAssist, HP JumpStarts / myHP, Lenovo consumer Vantage)')
+        BackgroundFeatures = @($true,  'Turn off Widgets, Copilot, Recall, AI service auto-start, Phone Link, Game DVR')
+        BrowserMemory      = @($true,  'Edge sleeping tabs + no startup boost / background; Chrome Memory Saver + no background mode')
+        Suggestions        = @($true,  'Stop silent suggested-app installs and OEM companion-app downloads')
+        VisualEffects      = @($false, 'Animations + transparency off for signed-in users (small gain - mainly 8 GB PCs)')
+        SvcHostGrouping    = @($false, 'ADVANCED: fewer svchost.exe processes (~100-300 MB, reboot, less service isolation)')
+    }
+    Write-Host ''
+    $cats = @()
+    foreach ($k in $catalog.Keys) {
+        if (Read-YesNo ("  {0}: {1}?" -f $k, $catalog[$k][1]) $catalog[$k][0]) { $cats += $k }
+    }
+    if (-not $cats.Count) { Write-Host '  Nothing selected.' -ForegroundColor DarkGray; return }
+    $preview = Read-YesNo 'Preview only (show what would change, change nothing)?' $false
+    if (-not $preview -and -not (Confirm-Change "Apply RAM optimizer categories: $($cats -join ', ').")) { return }
+    Invoke-Tool 'Optimize-WindowsMemory' ([ordered]@{ Mode = 'Apply'; Categories = $cats; Force = $true; Preview = $preview; OutputPath = (Get-OutDir 'Memory') }) | Out-Null
+}
+
+function Invoke-RamOptimizerUndo {
+    Write-Title '[!] RAM optimizer - undo registry changes'
+    $dir = Get-OutDir 'Memory'
+    $files = @(Get-ChildItem -LiteralPath $dir -Filter 'Optimize-WindowsMemory_Undo_*.json' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    if (-not $files.Count) { Write-Host "  No undo files in $dir." -ForegroundColor Yellow; return }
+    for ($i = 0; $i -lt [math]::Min(10, $files.Count); $i++) { Write-Host ("  {0}. {1}  ({2})" -f ($i + 1), $files[$i].Name, $files[$i].LastWriteTime) }
+    $pick = Read-Int 'Undo file number' 1
+    if ($pick -lt 1 -or $pick -gt $files.Count) { Write-Host '  Invalid choice.' -ForegroundColor Red; return }
+    if (-not (Confirm-Change "Restore every registry value recorded in $($files[$pick - 1].Name).")) { return }
+    Invoke-Tool 'Optimize-WindowsMemory' ([ordered]@{ Mode = 'Undo'; UndoFile = $files[$pick - 1].FullName; OutputPath = $dir }) | Out-Null
 }
 
 function Invoke-PowerSettings {
@@ -2715,7 +2766,9 @@ function Invoke-OfficeInstall {
     $chIn = "$(Read-Default 'Update channel: C = Current, M = Monthly Enterprise, S = Semi-Annual' 'C')".ToUpper()
     $chan = switch ($chIn) { 'M' { 'MonthlyEnterprise' } 'S' { 'SemiAnnual' } default { 'Current' } }
     $exclude = Read-List 'Apps to EXCLUDE (Groove,Lync,Bing,Publisher,Access,OneNote,Teams,OneDrive)' 'Groove,Lync,Bing'
-    $isRds = (Get-WindowsFeature -Name RDS-RD-Server -ErrorAction SilentlyContinue).Installed
+    # Get-WindowsFeature only exists on Windows Server - on workstations it is not a cmdlet at all
+    $isRds = $false
+    if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) { $isRds = [bool](Get-WindowsFeature -Name RDS-RD-Server -ErrorAction SilentlyContinue).Installed }
     $shared = Read-YesNo 'Shared Computer Activation (REQUIRED on RDS/terminal servers)?' ([bool]$isRds)
     $removeOld = Read-YesNo 'Remove existing Office first (OEM preinstalls, other languages, MSI Office)?' $true
     if (-not (Confirm-Change "Install $prod ($bits-bit, $chan channel) - downloads ~3 GB from Microsoft.")) { return }
@@ -3895,6 +3948,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Crash / BSOD / unexpected reboot report (HTML)';                                Action = { Invoke-CrashReport } }
     @{ Test='safe'; Text = 'Display / GPU crash diagnostics (TDR, nvlddmkm, WHEA)';                         Action = { Invoke-DisplayCrash } }
     @{ Test='safe'; Text = 'Memory usage diagnostics';                                                      Action = { Invoke-MemoryDiag } }
+    @{ Test='safe'; Text = 'RAM audit - where memory goes, agent stack, bloat, prioritised fixes (HTML)';    Action = { Invoke-RamAudit } }
     @{ Test='safe'; Text = 'Reliability history (Reliability Monitor data, stability index)';               Action = { Invoke-ReliabilityHistory } }
     @{ Test='safe'; Text = 'Performance snapshot (CPU / RAM / disk latency / network, 30 sec)';             Action = { Invoke-PerfSnapshot } }
     @{ Test='safe'; Text = 'Boot / logon performance (what slows startup)';                                 Action = { Invoke-BootPerformance } }
@@ -3983,7 +4037,9 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'OneDrive will not start / sync - diagnostics (policy block, installs, startup, logs)'; Action = { Invoke-OneDriveDiag } }
     @{               Text = '[!] OneDrive reset';                                                            Action = { Invoke-OneDriveReset } }
     @{               Text = '[!] Repair .zip association / reset default browser (per user)';               Action = { Invoke-ZipBrowserRepair } }
-    @{               Text = '[!] Remove bloatware (OEM + consumer Store apps)';                              Action = { Invoke-RemoveBloatware } }
+    @{               Text = '[!] RAM optimizer / business-safe debloat (pick categories, preview, undo-able)'; Action = { Invoke-RamOptimizer } }
+    @{               Text = '[!] RAM optimizer - undo registry changes';                                     Action = { Invoke-RamOptimizerUndo } }
+    @{               Text = '[!] Remove bloatware - legacy list (also removes Teams/OneNote/Dell Command Update)'; Action = { Invoke-RemoveBloatware } }
     @{               Text = '[!] Power settings - never sleep / hibernate';                                  Action = { Invoke-PowerSettings } }
     @{ Test='safe'; Text = 'Check scanner (Panini etc.) hangs / not detected - diagnostics + optional USB power fix'; Action = { Invoke-CheckScannerDiag } }
     @{ Section = 'SOFTWARE DEPLOYMENT (downloads to C:\temp\Tools)' }
@@ -8813,7 +8869,7 @@ Write-Line "Generated: $startTime"
 
 # ---------------------------------------------------------------------------
 Write-Section "Hyper-V role check"
-$hyperVFeature = Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue
+$hyperVFeature = if (Get-Command Get-WindowsFeature -ErrorAction SilentlyContinue) { Get-WindowsFeature -Name Hyper-V -ErrorAction SilentlyContinue } else { $null }
 if (-not (Get-Module -ListAvailable -Name Hyper-V)) {
     Write-Line "Hyper-V PowerShell module not found on this machine. Are you running this on the Hyper-V HOST, not inside a guest VM?"
     Add-Finding "Hyper-V module missing - script may be running on the wrong machine."
@@ -18981,6 +19037,901 @@ if ($errors -gt 0) {
     Write-Log "Exiting with code 0 (no errors)."
     exit 0
 }
+'@
+
+# ======================= Optimize-WindowsMemory.ps1 =======================
+$Script:Payloads['Optimize-WindowsMemory'] = @'
+<#
+.SYNOPSIS
+    Optimize-WindowsMemory.ps1 - Windows 10/11 RAM usage audit + business-safe debloat.
+
+.DESCRIPTION
+    Prepared by Sigma Data Systems Inc. - https://sigmadatainc.com/
+
+    Universal: nothing here is specific to a client, user or machine.
+
+    -Mode Audit  (default, READ-ONLY)
+        Explains where the RAM is really going and writes an HTML report + CSVs:
+          * real memory pressure (committed vs limit, hard faults/sec sampled live,
+            paged / non-paged pool -> driver leak check, standby cache)
+          * "brand-new PC still busy" check (Windows Update, Defender first scan,
+            search indexing, Store updates in the first days after setup)
+          * top applications by private memory, grouped and categorised
+          * the agent stack (AV/EDR, RMM, remote control, VPN/DNS, backup, OEM)
+            with total memory per agent and duplicate-AV detection
+          * svchost service groups, startup items, bloat that is installed
+          * state of Widgets / Copilot / Recall / Edge + Chrome memory policies
+          * a prioritised list of recommendations
+
+    -Mode Apply  (CHANGES THE MACHINE - each category is opt-in)
+        ConsumerApps       Remove consumer Store apps (Bing*, Xbox app, Clipchamp,
+                           Solitaire, games, TikTok, Spotify...) for all users and
+                           from the provisioning image. Exact package names only.
+        OemApps            Remove OEM consumer utilities (Dell Optimizer / SupportAssist
+                           consumer / Digital Delivery, HP JumpStarts / myHP / Touchpoint
+                           Analytics, Lenovo consumer Vantage...). Win32 apps are only
+                           removed when they have an MSI or quiet uninstaller.
+        BackgroundFeatures Policies: Widgets off, Copilot off, Recall off, AI service
+                           (WSAIFabricSvc) manual, Phone Link off, Game DVR off;
+                           removes the consumer Copilot app.
+        BrowserMemory      Edge: sleeping tabs on (30 min), startup boost off, keep
+                           running in background off. Chrome: Memory Saver on
+                           (balanced), keep running in background off.
+        Suggestions        No silent "suggested app" installs / consumer content,
+                           no OEM companion-app auto-download for devices.
+        VisualEffects      (opt-in) Animations + transparency off for loaded user
+                           profiles. Small gain - mainly for 8 GB machines.
+        SvcHostGrouping    (opt-in, ADVANCED) Raise SvcHostSplitThresholdInKB to the
+                           installed RAM so services share fewer svchost.exe
+                           processes. Saves ~100-300 MB; trade-off: one failing
+                           service can take others in its group down. Reboot needed.
+
+        Every registry change is recorded in an undo manifest (JSON) and a restore
+        point is attempted first. App removals are logged with their package names
+        (reinstall from the Microsoft Store / winget if ever needed).
+
+    -Mode Undo
+        Puts back every registry value from an undo manifest (latest one in
+        -OutputPath if -UndoFile isn't given).
+
+    NEVER touched (deliberately): page file, SysMain, memory compression, VBS /
+    Memory Integrity, Defender, Windows Update, Teams, OneNote, Outlook,
+    Quick Assist, Sticky Notes, To Do, Calculator, Photos, Paint, Snipping Tool,
+    Notepad, Terminal, Store, Media Player, Company Portal, Microsoft 365 app,
+    Power Automate, Dell Command | Update, Lenovo System Update / Commercial
+    Vantage, HP Image Assistant / Wolf Security, Xbox Identity Provider / TCUI.
+
+    Ideas drawn from (reviewed, not copied or downloaded at run time):
+      Raphire/Win11Debloat, ChrisTitusTech/winutil, SysAdminDoc/Debloat-Win11,
+      Microsoft Edge / Chrome / Windows policy documentation.
+
+.PARAMETER Mode           Audit (default) | Apply | Undo
+.PARAMETER Categories     Apply only: ConsumerApps, OemApps, BackgroundFeatures,
+                          BrowserMemory, Suggestions, VisualEffects, SvcHostGrouping,
+                          'Recommended' (= first five) or 'All'.
+.PARAMETER Force          Apply without prompting (RMM / unattended).
+.PARAMETER Preview        Apply/Undo in preview: shows what would change, changes nothing.
+.PARAMETER OutputPath     Report / manifest folder (default C:\temp\Memory).
+.PARAMETER SampleSeconds  Seconds to sample paging activity in the audit (default 10).
+
+.EXAMPLE
+    .\Optimize-WindowsMemory.ps1
+    Read-only audit + HTML report.
+.EXAMPLE
+    .\Optimize-WindowsMemory.ps1 -Mode Apply -Categories Recommended -Force
+    Unattended (RMM) - applies the five recommended categories.
+.EXAMPLE
+    .\Optimize-WindowsMemory.ps1 -Mode Undo
+    Reverts the registry changes from the most recent run.
+
+.NOTES
+    Windows PowerShell 5.1+. Apply / Undo need Administrator (runs fine as SYSTEM).
+    Exit codes: 0 = OK, 1 = finished with errors, 2 = needs elevation.
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('Audit', 'Apply', 'Undo')]
+    [string]$Mode = 'Audit',
+    [string[]]$Categories = @(),
+    [switch]$Force,
+    [switch]$Preview,
+    [string]$OutputPath = 'C:\temp\Memory',
+    [string]$UndoFile,
+    [switch]$NoRestorePoint,
+    [ValidateRange(3, 120)]
+    [int]$SampleSeconds = 10
+)
+
+$ErrorActionPreference = 'Continue'
+$Script:Stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
+$Script:Errors  = 0
+$Script:Changes = New-Object System.Collections.Generic.List[object]
+$Script:Removed = New-Object System.Collections.Generic.List[object]
+
+if (-not (Test-Path -LiteralPath $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
+$Script:LogFile = Join-Path $OutputPath "Optimize-WindowsMemory_$($Mode)_$($Script:Stamp).log"
+
+#region ------------------------------------------------------------ helpers
+
+function Write-Log {
+    param([string]$Message, [ValidateSet('INFO', 'OK', 'WARN', 'ERROR', 'HEAD')][string]$Level = 'INFO')
+    $line = '[{0}] [{1}] {2}' -f (Get-Date -Format 'HH:mm:ss'), $Level, $Message
+    Add-Content -LiteralPath $Script:LogFile -Value $line -Encoding UTF8
+    $color = switch ($Level) { 'OK' { 'Green' } 'WARN' { 'Yellow' } 'ERROR' { 'Red' } 'HEAD' { 'Cyan' } default { 'Gray' } }
+    Write-Host $line -ForegroundColor $color
+    if ($Level -eq 'ERROR') { $Script:Errors++ }
+}
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-Interactive {
+    try { return ([Environment]::UserInteractive -and $Host.Name -eq 'ConsoleHost' -and -not [Console]::IsInputRedirected) } catch { return $false }
+}
+
+function Get-MB([double]$Bytes) { [math]::Round($Bytes / 1MB, 0) }
+function Get-GB([double]$Bytes) { [math]::Round($Bytes / 1GB, 1) }
+function HtmlEnc([string]$s) { [System.Net.WebUtility]::HtmlEncode($s) }
+
+# Loaded user hives (logged-on / recently used profiles). Works as SYSTEM (RMM) and interactively.
+function Get-UserHives {
+    $out = @()
+    $profiles = @{}
+    Get-ChildItem 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue | ForEach-Object {
+        $p = (Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+        if ($p) { $profiles[$_.PSChildName] = Split-Path $p -Leaf }
+    }
+    Get-ChildItem 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSChildName -match '^S-1-(5-21|12-1)-[\d-]+$' } | ForEach-Object {
+            $sid = $_.PSChildName
+            $name = if ($profiles.ContainsKey($sid)) { $profiles[$sid] } else { $sid }
+            $out += [pscustomobject]@{ SID = $sid; User = $name; Root = "Registry::HKEY_USERS\$sid" }
+        }
+    return $out
+}
+
+# Registry write that records the previous state in the undo manifest
+function Set-RegTracked {
+    param(
+        [Parameter(Mandatory)][string]$Path,     # Registry::HKEY_... form
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)]$Value,
+        [ValidateSet('DWord', 'String', 'QWord')][string]$Type = 'DWord',
+        [string]$Category = '',
+        [string]$Why = ''
+    )
+    $existed = $false; $old = $null; $oldType = $null
+    if (Test-Path -LiteralPath $Path) {
+        $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+        if ($item -and ($item.GetValueNames() -contains $Name)) {
+            $existed = $true
+            $old = $item.GetValue($Name, $null, 'DoNotExpandEnvironmentNames')
+            $oldType = $item.GetValueKind($Name).ToString()
+        }
+    }
+    if ($existed -and "$old" -eq "$Value") {
+        Write-Log "  = $Path\$Name already $Value"
+        return
+    }
+    if ($Preview) { Write-Log "  PREVIEW set $Path\$Name = $Value ($Type)  [$Why]"; return }
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
+        New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $Type -Force -ErrorAction Stop | Out-Null
+        $Script:Changes.Add([pscustomobject]@{
+            Kind = 'Registry'; Category = $Category; Path = $Path; Name = $Name
+            Existed = $existed; OldValue = $old; OldType = $oldType; NewValue = $Value; NewType = $Type; Why = $Why
+        })
+        Write-Log "  + $Path\$Name = $Value  [$Why]" 'OK'
+    } catch {
+        Write-Log "  Failed to set $Path\$Name : $($_.Exception.Message)" 'ERROR'
+    }
+}
+
+function Save-Manifest {
+    if ($Preview -or ($Script:Changes.Count -eq 0 -and $Script:Removed.Count -eq 0)) { return $null }
+    $file = Join-Path $OutputPath "Optimize-WindowsMemory_Undo_$($Script:Stamp).json"
+    $obj = [ordered]@{
+        Tool = 'Optimize-WindowsMemory'; Created = (Get-Date).ToString('s'); Computer = $env:COMPUTERNAME
+        Registry = @($Script:Changes); RemovedApps = @($Script:Removed)
+    }
+    $obj | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $file -Encoding UTF8
+    Write-Log "Undo manifest: $file" 'OK'
+    return $file
+}
+
+#endregion
+
+#region ----------------------------------------------------------- catalogs
+
+# Consumer Microsoft Store apps - exact package names. Business apps are deliberately NOT here.
+$Script:ConsumerApps = @(
+    'Clipchamp.Clipchamp', 'Microsoft.3DBuilder', 'Microsoft.549981C3F5F10', 'Microsoft.BingFinance',
+    'Microsoft.BingFoodAndDrink', 'Microsoft.BingHealthAndFitness', 'Microsoft.BingNews', 'Microsoft.BingSports',
+    'Microsoft.BingTranslator', 'Microsoft.BingTravel', 'Microsoft.BingWeather', 'Microsoft.News',
+    'Microsoft.Getstarted', 'Microsoft.Messaging', 'Microsoft.Microsoft3DViewer', 'Microsoft.MicrosoftSolitaireCollection',
+    'Microsoft.MixedReality.Portal', 'Microsoft.NetworkSpeedTest', 'Microsoft.Office.Sway', 'Microsoft.OneConnect',
+    'Microsoft.Print3D', 'Microsoft.SkypeApp', 'Microsoft.Windows.DevHome', 'Microsoft.WindowsFeedbackHub',
+    'Microsoft.WindowsMaps', 'Microsoft.XboxApp', 'Microsoft.GamingApp', 'Microsoft.XboxGamingOverlay',
+    'Microsoft.XboxGameOverlay', 'Microsoft.XboxSpeechToTextOverlay', 'Microsoft.ZuneVideo',
+    'MicrosoftCorporationII.MicrosoftFamily', 'Microsoft.MicrosoftJournal', 'Microsoft.PCManager',
+    # third-party consumer apps / games
+    'ACGMediaPlayer', 'ActiproSoftwareLLC', 'AdobeSystemsIncorporated.AdobePhotoshopExpress', 'Amazon.com.Amazon',
+    'AmazonVideo.PrimeVideo', 'Asphalt8Airborne', 'AutodeskSketchBook', 'CaesarsSlotsFreeCasino', 'COOKINGFEVER',
+    'CyberLinkMediaSuiteEssentials', 'DisneyMagicKingdoms', 'Disney.37853FC22B2CE', 'DrawboardPDF',
+    'Duolingo-LearnLanguagesforFree', 'FACEBOOK.FACEBOOK', 'FarmVille2CountryEscape', 'Flipboard', 'HiddenCity',
+    'HULULLC.HULUPLUS', 'iHeartRadio', 'Facebook.Instagram', 'king.com.BubbleWitch3Saga', 'king.com.CandyCrushSaga',
+    'king.com.CandyCrushSodaSaga', 'LinkedInforWindows', 'MarchofEmpires', '4DF9E0F8.Netflix', 'NYTCrossword',
+    'OneCalendar', 'PandoraMediaInc', 'PhototasticCollage', 'PicsArt-PhotoStudio', 'PolarrPhotoEditorAcademicEdition',
+    'flaregamesGmbH.RoyalRevolt', 'Sidia.LiveWallpaper', 'SlingTV', 'SpotifyAB.SpotifyMusic', 'BytedancePte.Ltd.TikTok',
+    'TuneInRadio', 'WinZipUniversal', '9E2F88E3.Twitter', 'Shazam', 'XINGAG.XING', '5A894077.McAfeeSecurity',
+    'B9ECED6F.ASUSPCAssistant', 'Facebook.317180B0BB486'
+)
+
+# OEM consumer utilities (Store packages) - exact names. Business update/management tools are NOT here.
+$Script:OemAppx = @(
+    'DellInc.DellSupportAssistforPCs', 'DellInc.DellDigitalDelivery', 'DellInc.DellMobileConnect', 'DellInc.DellOptimizer',
+    'DellInc.PartnerPromo', 'DellInc.DellCustomerConnect', 'DellInc.MyDell',
+    'AD2F1837.HPJumpStarts', 'AD2F1837.myHP', 'AD2F1837.HPWelcome', 'AD2F1837.HPRegistration', 'AD2F1837.HPPrivacySettings',
+    'AD2F1837.HPAIExperienceCenter', 'AD2F1837.HPConnectedMusic', 'AD2F1837.HPConnectedPhotopoweredbySnapfish',
+    'AD2F1837.HPQuickDrop', 'AD2F1837.HPEasyClean', 'AD2F1837.HPWorkWell', 'AD2F1837.HPSupportAssistant',
+    'AD2F1837.HPDesktopSupportUtilities', 'AD2F1837.HPQuickTouch', 'AD2F1837.HPFileViewer',
+    'E046963F.LenovoCompanion', 'E0469640.LenovoUtility', 'E046963F.LenovoSettingsforEnterprise',
+    'LGElectronics.LGMonitorApp', 'B9ECED6F.ArmouryCrate', 'AcerIncorporated.AcerCareCenterS', 'AcerIncorporated.QuickAccess'
+)
+
+# OEM / trial Win32 programs (exact DisplayName or -like pattern). Only removed with MSI or quiet uninstaller.
+$Script:OemWin32 = @(
+    'Dell Optimizer', 'Dell Optimizer Service', 'Dell Optimizer Core', 'Dell Digital Delivery', 'Dell Digital Delivery Services',
+    'Dell SupportAssist', 'Dell SupportAssist Remediation', 'Dell SupportAssist OS Recovery Plugin for Dell Update',
+    'Dell Customer Connect', 'Dell Update for Windows 10', 'Dell Update for Windows Universal',
+    'HP Connection Optimizer', 'HP Documentation', 'HP Support Assistant', 'HP JumpStart Bridge', 'HP JumpStart Launch',
+    'HP System Default Settings', 'HP Notifications', 'HP Touchpoint Analytics Client', 'HP Insights Analytics',
+    'Lenovo Now', 'Lenovo Welcome', 'Lenovo Smart Appearance',
+    'ExpressVPN', 'WildTangent Games App*', 'Booking.com*', 'Dropbox Promotion*', 'Dropbox 25 GB', 'Amazon Alexa'
+)
+
+# Never removed even if a pattern above would match
+$Script:KeepPatterns = @(
+    'Dell Command*', 'Dell SupportAssist for Business*', 'Dell Power Manager*', 'Dell Peripheral Manager*', 'Dell Pair*',
+    'Dell Trusted Device*', 'Dell Display Manager*', 'HP Image Assistant*', 'HP Wolf*', 'HP Sure*', 'HP Hotkey*',
+    'Lenovo System Update*', 'Lenovo Commercial Vantage*', 'Lenovo Vantage Service*', '*Thunderbolt*', '*Audio*', '*Driver*'
+)
+
+# Trial antivirus that should be removed with the vendor tool (reported, never auto-removed)
+$Script:TrialAvPatterns = @('McAfee*', 'Norton*', 'Avast*', 'AVG *', 'Avira*', 'Kaspersky*', 'Total AV*', 'TotalAV*')
+
+# Process -> agent / category map for the audit
+$Script:AgentMap = @(
+    @{ G = 'Security'; N = 'Microsoft Defender';       R = '^(MsMpEng|MpDefenderCoreService|NisSrv|MsSense|SenseIR|SenseNdr|SenseCncProxy|SecurityHealthService)$' }
+    @{ G = 'Security'; N = 'SentinelOne';              R = '^Sentinel(Agent|ServiceHost|StaticEngine|StaticEngineScanner|UI|HelperService|MemoryScanner)' }
+    @{ G = 'Security'; N = 'CrowdStrike Falcon';       R = '^CSFalcon' }
+    @{ G = 'Security'; N = 'Sophos';                   R = '^(Sophos|SSPService|McsAgent|McsClient|SEDService|hmpalert)' }
+    @{ G = 'Security'; N = 'Bitdefender / N-able AV Defender'; R = '^(bdservicehost|EPSecurityService|EPProtectedService|EPIntegrationService|EPUpdateService|bdagent|bdredline)' }
+    @{ G = 'Security'; N = 'Webroot';                  R = '^WRSA' }
+    @{ G = 'Security'; N = 'Malwarebytes';             R = '^(MBAMService|mbamtray|MBCloudEA|Malwarebytes)' }
+    @{ G = 'Security'; N = 'Huntress';                 R = '^(HuntressAgent|HuntressRio|HuntressUpdater)' }
+    @{ G = 'Security'; N = 'ThreatLocker';             R = '^ThreatLocker' }
+    @{ G = 'Security'; N = 'McAfee (trial?)';          R = '^(mcshield|mfemms|mfevtps|ModuleCoreService|McUICnt|mcapexe|MMSSHOST|mfefire|McCSPServiceHost)' }
+    @{ G = 'Security'; N = 'Norton (trial?)';          R = '^(NortonSecurity|NortonUI|nsWscSvc|Norton)' }
+    @{ G = 'Security'; N = 'ESET';                     R = '^(ekrn|egui|eguiProxy)$' }
+    @{ G = 'Security'; N = 'Kaspersky';                R = '^(avp|avpui)$' }
+    @{ G = 'Security'; N = 'Blumira';                  R = '^(rphcp|Blumira)' }
+    @{ G = 'RMM / remote'; N = 'N-able N-central agent'; R = '^(agent|AgentMaint|MspPlatform|PME\.Agent|ApplicationLogCollector|NableUpdateService|FileCacheServiceAgent|RequestHandlerAgent|SolarWinds.MSP.*|Nable.*)$' }
+    @{ G = 'RMM / remote'; N = 'N-able Take Control';  R = '^BASup' }
+    @{ G = 'RMM / remote'; N = 'Datto RMM';            R = '^(AEMAgent|CagService|Datto)' }
+    @{ G = 'RMM / remote'; N = 'ConnectWise';          R = '^(LTSVC|LTSvcMon|LTTray|ScreenConnect)' }
+    @{ G = 'RMM / remote'; N = 'NinjaOne';             R = '^Ninja' }
+    @{ G = 'RMM / remote'; N = 'Kaseya';               R = '^(AgentMon|KaUsrTsk|KaseyaD)' }
+    @{ G = 'RMM / remote'; N = 'Splashtop';            R = '^(SRService|SRManager|SRAgent|SRFeature|Strwinclt)' }
+    @{ G = 'RMM / remote'; N = 'TeamViewer';           R = '^TeamViewer' }
+    @{ G = 'RMM / remote'; N = 'AnyDesk';              R = '^AnyDesk' }
+    @{ G = 'Network / VPN / DNS'; N = 'Zscaler';       R = '^ZSA' }
+    @{ G = 'Network / VPN / DNS'; N = 'Cisco Secure Client / Umbrella'; R = '^(vpnagent|csc_ui|acumbrellaagent|ERCService|aciseagent)' }
+    @{ G = 'Network / VPN / DNS'; N = 'FortiClient';   R = '^(FortiClient|FCDBLog|fortitray|FortiSettings|FortiESNAC|FortiTray|fcappdb|FCHelper)$' }
+    @{ G = 'Network / VPN / DNS'; N = 'GlobalProtect'; R = '^PanGP' }
+    @{ G = 'Network / VPN / DNS'; N = 'DNSFilter';     R = '^(DNSFilter|DNS Agent)' }
+    @{ G = 'Backup'; N = 'Backup agent';              R = '^(Veeam|CarboniteService|Acronis|mms|DattoBackup|Axcient|xcAgent|BackupFP|ProcessController|CBService)' }
+    @{ G = 'OEM'; N = 'Dell Optimizer';               R = '^DellOptimizer' }
+    @{ G = 'OEM'; N = 'Dell SupportAssist / TechHub'; R = '^(SupportAssist|Dell\.TechHub|DellTechHub|Dell\.CoreServices|Dell\.UCA|ServiceShell)' }
+    @{ G = 'OEM'; N = 'Dell Command | Update (keep)'; R = '^(DellClientManagementService|DCU)' }
+    @{ G = 'OEM'; N = 'HP utilities';                 R = '^(HPTouchpointAnalyticsClient|HPAudioSwitch|HPJumpStart|HPCommRecovery|HPSupportSolutionsFrameworkService|hpqwmiex|HPAnalytics|HPNetworkCommunicator|AppHelperCap|DiagsCap|SysInfoCap|TouchpointAnalyticsClientService|NetworkCap)' }
+    @{ G = 'OEM'; N = 'Lenovo Vantage / ImController'; R = '^(LenovoVantage|ImController|LNBITSSvc|Lenovo)' }
+    @{ G = 'Collaboration'; N = 'Microsoft Teams (new)'; R = '^(ms-teams|msteams|MSTeams)$' }
+    @{ G = 'Collaboration'; N = 'Microsoft Teams (classic)'; R = '^Teams$' }
+    @{ G = 'Collaboration'; N = 'Outlook (new)';      R = '^olk$' }
+    @{ G = 'Collaboration'; N = 'Outlook (classic)';  R = '^OUTLOOK$' }
+    @{ G = 'Collaboration'; N = 'OneDrive';           R = '^(OneDrive|FileCoAuth|OneDrive\.Sync\.Service)$' }
+    @{ G = 'Collaboration'; N = 'Zoom';               R = '^Zoom' }
+    @{ G = 'Collaboration'; N = 'Slack';              R = '^slack$' }
+    @{ G = 'Collaboration'; N = 'Dropbox';            R = '^Dropbox' }
+    @{ G = 'Browser'; N = 'Microsoft Edge';           R = '^msedge$' }
+    @{ G = 'Browser'; N = 'Google Chrome';            R = '^chrome$' }
+    @{ G = 'Browser'; N = 'Firefox';                  R = '^firefox$' }
+    @{ G = 'Browser'; N = 'Brave';                    R = '^brave$' }
+    @{ G = 'WebView2 (New Teams / New Outlook / Widgets / apps)'; N = 'Edge WebView2'; R = '^msedgewebview2$' }
+    @{ G = 'Windows extras'; N = 'Widgets';           R = '^(Widgets|WidgetService|WidgetBoard)$' }
+    @{ G = 'Windows extras'; N = 'Copilot / AI';      R = '^(Copilot|Microsoft\.Copilot|WSAIFabricSvc|AIXHost)$' }
+    @{ G = 'Windows extras'; N = 'Phone Link';        R = '^(PhoneExperienceHost|YourPhone|CrossDeviceService|CrossDeviceResume)$' }
+    @{ G = 'Windows extras'; N = 'Xbox / Game Bar';   R = '^(GameBar|GameBarFTServer|XboxPcApp|XboxPcAppFT|gamingservices|gamingservicesnet)$' }
+    @{ G = 'Windows first-run work'; N = 'Windows Update / servicing'; R = '^(TiWorker|TrustedInstaller|MoUsoCoreWorker|wuauclt|UsoClient|WaaSMedicAgent|setuphost|SetupPrep)$' }
+    @{ G = 'Windows first-run work'; N = 'Search indexer'; R = '^(SearchIndexer|SearchProtocolHost|SearchFilterHost)$' }
+)
+
+function Get-AgentFor([string]$ProcName) {
+    foreach ($a in $Script:AgentMap) { if ($ProcName -match $a.R) { return $a } }
+    return $null
+}
+
+function Test-Keep([string]$DisplayName) {
+    foreach ($k in $Script:KeepPatterns) { if ($DisplayName -like $k) { return $true } }
+    return $false
+}
+
+function Get-UninstallEntries {
+    $roots = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+             'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    foreach ($r in $roots) {
+        Get-ChildItem -LiteralPath $r -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue
+            if ($p.DisplayName -and -not $p.SystemComponent) {
+                [pscustomobject]@{
+                    DisplayName = "$($p.DisplayName)".Trim(); Version = $p.DisplayVersion; Publisher = $p.Publisher
+                    UninstallString = $p.UninstallString; QuietUninstallString = $p.QuietUninstallString
+                    WindowsInstaller = [bool]$p.WindowsInstaller; KeyName = $_.PSChildName
+                }
+            }
+        }
+    }
+}
+
+function Find-OemWin32 {
+    $all = @(Get-UninstallEntries)
+    $hits = foreach ($e in $all) {
+        foreach ($pat in $Script:OemWin32) {
+            if ($e.DisplayName -like $pat -and -not (Test-Keep $e.DisplayName)) { $e; break }
+        }
+    }
+    $trial = foreach ($e in $all) {
+        foreach ($pat in $Script:TrialAvPatterns) { if ($e.DisplayName -like $pat) { $e; break } }
+    }
+    return [pscustomobject]@{ Oem = @($hits | Sort-Object DisplayName -Unique); TrialAv = @($trial | Sort-Object DisplayName -Unique) }
+}
+
+function Find-InstalledAppx([string[]]$Names) {
+    $installed = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+    $prov = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)
+    foreach ($n in $Names) {
+        $i = @($installed | Where-Object { $_.Name -eq $n })
+        $p = @($prov | Where-Object { $_.DisplayName -eq $n })
+        if ($i.Count -or $p.Count) {
+            [pscustomobject]@{ Name = $n; Installed = [bool]$i.Count; Provisioned = [bool]$p.Count; Version = ($i | Select-Object -First 1).Version }
+        }
+    }
+}
+
+#endregion
+
+#region -------------------------------------------------------------- audit
+
+function Get-MemorySample {
+    $o = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction SilentlyContinue
+    return $o
+}
+
+function Invoke-Audit {
+    Write-Log "Sigma Data Systems INC - Windows memory audit ($env:COMPUTERNAME)" 'HEAD'
+    $os = Get-CimInstance Win32_OperatingSystem
+    $cs = Get-CimInstance Win32_ComputerSystem
+    $cv = Get-ItemProperty 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+    $installedRamGB = [math]::Round(((Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue | Measure-Object Capacity -Sum).Sum) / 1GB, 1)
+    $uptime = (Get-Date) - $os.LastBootUpTime
+    $osAgeDays = [math]::Round(((Get-Date) - $os.InstallDate).TotalDays, 1)
+    $rec = New-Object System.Collections.Generic.List[object]
+    function Add-Rec([int]$Pri, [string]$Text) { $rec.Add([pscustomobject]@{ Priority = $Pri; Recommendation = $Text }) }
+
+    # ---- live sampling of memory pressure
+    Write-Log "Sampling paging activity for $SampleSeconds seconds..."
+    $samples = @()
+    for ($i = 0; $i -lt $SampleSeconds; $i++) { $s = Get-MemorySample; if ($s) { $samples += $s }; Start-Sleep -Seconds 1 }
+    $last = $samples | Select-Object -Last 1
+    if (-not $last) {
+        Write-Log 'Performance counters unavailable (perf counters disabled/corrupt? lodctr /R fixes it) - using basic figures.' 'WARN'
+        $last = [pscustomobject]@{ AvailableBytes = [double]$os.FreePhysicalMemory * 1KB; CommittedBytes = ([double]$os.TotalVirtualMemorySize - [double]$os.FreeVirtualMemory) * 1KB; CommitLimit = [double]$os.TotalVirtualMemorySize * 1KB; PoolNonpagedBytes = 0; PoolPagedBytes = 0; StandbyCacheNormalPriorityBytes = 0; StandbyCacheReserveBytes = 0; StandbyCacheCoreBytes = 0; ModifiedPageListBytes = 0; PageReadsPersec = 0; PagesInputPersec = 0 }
+        $samples = @($last)
+    }
+    $hardAvg = [math]::Round((($samples | Measure-Object PageReadsPersec -Average).Average), 1)
+    $hardMax = [math]::Round((($samples | Measure-Object PageReadsPersec -Maximum).Maximum), 0)
+    $pagesInAvg = [math]::Round((($samples | Measure-Object PagesInputPersec -Average).Average), 0)
+
+    $totalB   = [double]$cs.TotalPhysicalMemory
+    $availB   = [double]$last.AvailableBytes
+    $inUseB   = $totalB - $availB
+    $commitB  = [double]$last.CommittedBytes
+    $limitB   = [double]$last.CommitLimit
+    $npB      = [double]$last.PoolNonpagedBytes
+    $ppB      = [double]$last.PoolPagedBytes
+    $standbyB = [double]$last.StandbyCacheNormalPriorityBytes + [double]$last.StandbyCacheReserveBytes + [double]$last.StandbyCacheCoreBytes
+    $modB     = [double]$last.ModifiedPageListBytes
+    $compProc = Get-Process -Name 'Memory Compression' -ErrorAction SilentlyContinue
+    $compB    = if ($compProc) { [double]$compProc.WorkingSet64 } else { 0 }
+    $commitPct = if ($limitB) { [math]::Round($commitB / $limitB * 100, 0) } else { 0 }
+    $inUsePct  = [math]::Round($inUseB / $totalB * 100, 0)
+
+    $overview = [ordered]@{
+        'Computer'                   = $env:COMPUTERNAME
+        'Model'                      = "$($cs.Manufacturer) $($cs.Model)"
+        'Windows'                    = "$($os.Caption) $($cv.DisplayVersion) (build $($os.BuildNumber).$($cv.UBR))"
+        'Installed RAM'              = "$installedRamGB GB (usable $(Get-GB $totalB) GB)"
+        'In use (Task Manager)'      = "$(Get-GB $inUseB) GB ($inUsePct%)"
+        'Available'                  = "$(Get-GB $availB) GB  (includes $(Get-GB $standbyB) GB of standby cache that is given back on demand)"
+        'Committed / limit'          = "$(Get-GB $commitB) / $(Get-GB $limitB) GB ($commitPct%)"
+        'Compressed (Memory Compression)' = "$(Get-MB $compB) MB"
+        'Paged pool / Non-paged pool'= "$(Get-MB $ppB) MB / $(Get-MB $npB) MB"
+        'Modified list'              = "$(Get-MB $modB) MB"
+        'Hard faults (page reads/s)' = "avg $hardAvg, peak $hardMax over $SampleSeconds s (pages in/s avg $pagesInAvg)"
+        'Uptime'                     = '{0:%d}d {0:hh}h {0:mm}m' -f $uptime
+        'Windows installed'          = "$($os.InstallDate) ($osAgeDays days ago)"
+    }
+
+    # ---- verdict on pressure
+    $pressure = 'OK'
+    if ($hardAvg -gt 300 -and ($availB / $totalB) -lt 0.10) { $pressure = 'HIGH' }
+    elseif ($commitPct -ge 85 -or (($availB / $totalB) -lt 0.10)) { $pressure = 'ELEVATED' }
+    $overview['Memory pressure verdict'] = $pressure
+    switch ($pressure) {
+        'HIGH'     { Add-Rec 1 "Real memory pressure: under 10% available AND ~$hardAvg hard faults/s. The PC is paging to disk - reduce the workload below or move this user to 32 GB." }
+        'ELEVATED' { Add-Rec 2 "Commit charge at $commitPct% of the limit / low available memory. Not paging heavily yet, but close the biggest consumers below or plan for more RAM." }
+        default    { Add-Rec 9 "No real memory pressure right now: hard faults avg $hardAvg/s and $(Get-GB $availB) GB available. A high 'In use %' alone is normal - Windows keeps caches in RAM on purpose." }
+    }
+    if ($npB -gt 1GB) { Add-Rec 1 "Non-paged pool is $(Get-MB $npB) MB (normal is 200-600 MB): a driver is likely leaking memory. Update network/Wi-Fi, audio, VPN and security drivers from the OEM; RAMMap / poolmon show the pool tag." }
+    elseif ($npB -gt 700MB) { Add-Rec 3 "Non-paged pool is $(Get-MB $npB) MB - slightly high. Watch it; if it keeps growing with uptime it is a driver leak." }
+    if ($ppB -gt 1.5GB) { Add-Rec 3 "Paged pool is $(Get-MB $ppB) MB - often caused by indexing, security agents or registry-heavy software. RAMMap shows the breakdown." }
+
+    # ---- processes grouped by app
+    Write-Log 'Collecting process memory...'
+    $procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne 0 -and $_.Id -ne 4 })
+    $cpuNow = @{}
+    try {
+        Get-CimInstance Win32_PerfFormattedData_PerfProc_Process -ErrorAction SilentlyContinue |
+            ForEach-Object { $cpuNow["$($_.IDProcess)"] = [int]$_.PercentProcessorTime }
+    } catch { }
+    $byName = $procs | Group-Object ProcessName | ForEach-Object {
+        $priv = ($_.Group | Measure-Object PrivateMemorySize64 -Sum).Sum
+        $ws   = ($_.Group | Measure-Object WorkingSet64 -Sum).Sum
+        $cpu  = 0; foreach ($g in $_.Group) { if ($cpuNow.ContainsKey("$($g.Id)")) { $cpu += $cpuNow["$($g.Id)"] } }
+        $ag = Get-AgentFor $_.Name
+        [pscustomobject]@{
+            Application = $_.Name; Processes = $_.Count
+            PrivateMB = Get-MB $priv; WorkingSetMB = Get-MB $ws; CpuPctNow = $cpu
+            Group = if ($ag) { $ag.G } else { '' }; Agent = if ($ag) { $ag.N } else { '' }
+        }
+    } | Sort-Object PrivateMB -Descending
+    $topApps = @($byName | Select-Object -First 25)
+
+    # ---- agent stack
+    $agents = $byName | Where-Object { $_.Agent } | Group-Object Agent | ForEach-Object {
+        [pscustomobject]@{
+            Group = ($_.Group | Select-Object -First 1).Group; Agent = $_.Name
+            Processes = ($_.Group | Measure-Object Processes -Sum).Sum
+            PrivateMB = ($_.Group | Measure-Object PrivateMB -Sum).Sum
+            WorkingSetMB = ($_.Group | Measure-Object WorkingSetMB -Sum).Sum
+            CpuPctNow = ($_.Group | Measure-Object CpuPctNow -Sum).Sum
+        }
+    } | Sort-Object Group, @{ E = 'PrivateMB'; Descending = $true }
+    $agents = @($agents)
+    $groupTotals = $agents | Group-Object Group | ForEach-Object {
+        [pscustomobject]@{ Group = $_.Name; Agents = ($_.Group.Agent -join ', '); PrivateMB = ($_.Group | Measure-Object PrivateMB -Sum).Sum }
+    } | Sort-Object PrivateMB -Descending
+
+    # ---- security engine overlap
+    $secAgents = @($agents | Where-Object { $_.Group -eq 'Security' -and $_.Agent -ne 'Microsoft Defender' -and $_.Agent -notmatch 'Huntress|Blumira|ThreatLocker' })
+    $mp = $null; try { $mp = Get-MpComputerStatus -ErrorAction Stop } catch { }
+    $defMode = if ($mp) { "$($mp.AMRunningMode)" } else { 'unknown' }
+    $overview['Defender running mode'] = $defMode
+    if ($secAgents.Count -ge 2) { Add-Rec 1 "More than one third-party antivirus engine is running ($($secAgents.Agent -join ', ')). Two real-time scanners double RAM/CPU use and can conflict - remove the one you don't manage (trial McAfee/Norton especially)." }
+    if ($secAgents.Count -ge 1 -and $defMode -eq 'Normal') { Add-Rec 2 "Defender is in ACTIVE mode alongside $($secAgents[0].Agent). Normally Defender should drop to Passive/disabled when a third-party AV registers - check the third-party agent's health / registration." }
+    $trialAv = @($agents | Where-Object { $_.Agent -match 'trial' })
+    if ($trialAv.Count) { Add-Rec 1 "Trial antivirus running: $($trialAv.Agent -join ', '). Remove it with the vendor removal tool (McAfee MCPR / Norton Remove and Reinstall)." }
+
+    # ---- first-run / busy check
+    $busy = @($byName | Where-Object { $_.Group -eq 'Windows first-run work' -and ($_.CpuPctNow -gt 0 -or $_.PrivateMB -gt 150) })
+    $mpScan = if ($mp) { $mp.FullScanAge -gt 3650 -or $mp.QuickScanAge -gt 3650 } else { $false }
+    $pending = (Test-Path 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+               (Test-Path 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+    $overview['Reboot pending'] = $pending
+    if ($osAgeDays -lt 3 -or $busy.Count -or $pending) {
+        $why = @()
+        if ($osAgeDays -lt 3) { $why += "Windows was set up $osAgeDays day(s) ago" }
+        if ($busy.Count) { $why += "busy now: $(($busy | ForEach-Object { $_.Application }) -join ', ')" }
+        if ($pending) { $why += 'a reboot is pending' }
+        Add-Rec 2 "This PC is still doing first-run / update work ($($why -join '; ')). Let Windows Update, Defender and indexing finish, reboot twice, then re-run this audit before judging RAM use."
+    }
+
+    # ---- browsers / collaboration
+    $browserMB = ($byName | Where-Object { $_.Group -eq 'Browser' } | Measure-Object PrivateMB -Sum).Sum
+    $wvMB      = ($byName | Where-Object { $_.Application -eq 'msedgewebview2' } | Measure-Object PrivateMB -Sum).Sum
+    $teamsMB   = ($byName | Where-Object { $_.Agent -like 'Microsoft Teams*' } | Measure-Object PrivateMB -Sum).Sum
+    if ($browserMB -gt 2500) { Add-Rec 2 "Browsers are using $browserMB MB. Apply the BrowserMemory category (Edge sleeping tabs / Chrome Memory Saver, no background mode)." }
+    if ($teamsMB -gt 1000) { Add-Rec 3 "Teams is using $teamsMB MB. If this user doesn't live in Teams, turn off 'Auto-start Teams' in Teams settings." }
+    if ($wvMB -gt 1200) { Add-Rec 3 "Edge WebView2 is using $wvMB MB - it hosts New Teams, New Outlook, Widgets and many OEM apps. Removing Widgets / OEM apps and using classic Outlook (where allowed) reduces it." }
+
+    # ---- svchost
+    $svcRows = @()
+    try {
+        $svcByPid = Get-CimInstance Win32_Service -Filter "State='Running'" -ErrorAction Stop | Group-Object ProcessId
+        foreach ($g in $svcByPid) {
+            $p = $procs | Where-Object { $_.Id -eq [int]$g.Name -and $_.ProcessName -eq 'svchost' }
+            if ($p) { $svcRows += [pscustomobject]@{ PID = $p.Id; PrivateMB = Get-MB $p.PrivateMemorySize64; Services = (($g.Group.Name | Sort-Object) -join ', ') } }
+        }
+    } catch { }
+    $svcRows = @($svcRows | Sort-Object PrivateMB -Descending)
+    $svchostCount = @($procs | Where-Object { $_.ProcessName -eq 'svchost' }).Count
+    $splitKB = (Get-ItemProperty 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control' -Name SvcHostSplitThresholdInKB -ErrorAction SilentlyContinue).SvcHostSplitThresholdInKB
+    $overview['svchost.exe processes'] = "$svchostCount (SvcHostSplitThresholdInKB = $(if ($splitKB) { $splitKB } else { 'default 3670016' }))"
+
+    # ---- startup items
+    $startup = @()
+    try {
+        $startup = @(Get-CimInstance Win32_StartupCommand -ErrorAction Stop | Select-Object Name, Command, Location, User)
+    } catch { }
+    $hives = @(Get-UserHives)
+    foreach ($h in $hives) {
+        $approved = "$($h.Root)\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+        $item = Get-Item -LiteralPath $approved -ErrorAction SilentlyContinue
+        if ($item) {
+            foreach ($v in $item.GetValueNames()) {
+                $b = $item.GetValue($v)
+                if ($b -is [byte[]] -and $b.Length -gt 0 -and ($b[0] -band 1)) {
+                    $startup += [pscustomobject]@{ Name = $v; Command = '(disabled by user in Task Manager)'; Location = 'StartupApproved'; User = $h.User }
+                }
+            }
+        }
+    }
+    if (@($startup | Where-Object { $_.Command -notlike '(disabled*' }).Count -gt 12) { Add-Rec 3 "There are $(@($startup).Count) startup entries. Review them (Task Manager > Startup apps) - typical extras: OEM utilities, Adobe/Java updaters, Zoom, Spotify, printer software." }
+
+    # ---- bloat present
+    $consumer = @(Find-InstalledAppx $Script:ConsumerApps)
+    $oemAppx  = @(Find-InstalledAppx $Script:OemAppx)
+    $w32      = Find-OemWin32
+    $copilot  = @(Find-InstalledAppx @('Microsoft.Copilot', 'Microsoft.Windows.AIHub'))
+    if ($consumer.Count) { Add-Rec 4 "$($consumer.Count) consumer Store apps are installed/provisioned (e.g. $(($consumer | Select-Object -First 5).Name -join ', ')). Apply ConsumerApps." }
+    if ($oemAppx.Count -or $w32.Oem.Count) { Add-Rec 3 "OEM consumer utilities found ($((@($oemAppx.Name) + @($w32.Oem.DisplayName) | Select-Object -First 6) -join ', ')). Apply OemApps (Dell Command | Update and business tools are kept)." }
+    if ($w32.TrialAv.Count) { Add-Rec 1 "Trial antivirus installed: $($w32.TrialAv.DisplayName -join ', '). Remove with the vendor removal tool." }
+
+    # ---- feature / policy state
+    function RegVal($p, $n) { (Get-ItemProperty -LiteralPath $p -Name $n -ErrorAction SilentlyContinue).$n }
+    $edgeP = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Edge'
+    $chrP  = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Google\Chrome'
+    $mm = $null; try { $mm = Get-MMAgent -ErrorAction Stop } catch { }
+    $dg = $null; try { $dg = Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard -ClassName Win32_DeviceGuard -ErrorAction Stop } catch { }
+    $pfAuto = $cs.AutomaticManagedPagefile
+    $sysmain = Get-Service SysMain -ErrorAction SilentlyContinue
+    $aiSvc = Get-CimInstance Win32_Service -Filter "Name='WSAIFabricSvc'" -ErrorAction SilentlyContinue
+    $features = @(
+        [pscustomobject]@{ Setting = 'Widgets policy (Dsh\AllowNewsAndInterests)'; Value = "$(RegVal 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests')"; Target = '0' }
+        [pscustomobject]@{ Setting = 'Copilot (TurnOffWindowsCopilot)'; Value = "$(RegVal 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot')"; Target = '1' }
+        [pscustomobject]@{ Setting = 'Recall (AllowRecallEnablement)'; Value = "$(RegVal 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' 'AllowRecallEnablement')"; Target = '0' }
+        [pscustomobject]@{ Setting = 'AI service WSAIFabricSvc start mode'; Value = $(if ($aiSvc) { "$($aiSvc.StartMode) / $($aiSvc.State)" } else { 'not present' }); Target = 'Manual' }
+        [pscustomobject]@{ Setting = 'Phone Link (EnableMmx)'; Value = "$(RegVal 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\System' 'EnableMmx')"; Target = '0' }
+        [pscustomobject]@{ Setting = 'Edge SleepingTabsEnabled'; Value = "$(RegVal $edgeP 'SleepingTabsEnabled')"; Target = '1' }
+        [pscustomobject]@{ Setting = 'Edge SleepingTabsTimeout (s)'; Value = "$(RegVal $edgeP 'SleepingTabsTimeout')"; Target = '1800' }
+        [pscustomobject]@{ Setting = 'Edge StartupBoostEnabled'; Value = "$(RegVal $edgeP 'StartupBoostEnabled')"; Target = '0' }
+        [pscustomobject]@{ Setting = 'Edge BackgroundModeEnabled'; Value = "$(RegVal $edgeP 'BackgroundModeEnabled')"; Target = '0' }
+        [pscustomobject]@{ Setting = 'Chrome HighEfficiencyModeEnabled (Memory Saver)'; Value = "$(RegVal $chrP 'HighEfficiencyModeEnabled')"; Target = '1' }
+        [pscustomobject]@{ Setting = 'Chrome MemorySaverModeSavings'; Value = "$(RegVal $chrP 'MemorySaverModeSavings')"; Target = '1' }
+        [pscustomobject]@{ Setting = 'Chrome BackgroundModeEnabled'; Value = "$(RegVal $chrP 'BackgroundModeEnabled')"; Target = '0' }
+        [pscustomobject]@{ Setting = 'Consumer features (DisableWindowsConsumerFeatures)'; Value = "$(RegVal 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsConsumerFeatures')"; Target = '1' }
+        [pscustomobject]@{ Setting = 'Page file'; Value = $(if ($pfAuto) { 'System managed' } else { 'Manual' }); Target = 'System managed (leave)' }
+        [pscustomobject]@{ Setting = 'Memory compression / page combining'; Value = $(if ($mm) { "$($mm.MemoryCompression) / $($mm.PageCombining)" } else { 'unknown' }); Target = 'leave as is' }
+        [pscustomobject]@{ Setting = 'SysMain'; Value = $(if ($sysmain) { "$($sysmain.StartType) / $($sysmain.Status)" } else { 'not present' }); Target = 'leave as is' }
+        [pscustomobject]@{ Setting = 'VBS / Memory Integrity running'; Value = $(if ($dg) { "VBS status $($dg.VirtualizationBasedSecurityStatus); services $(($dg.SecurityServicesRunning) -join ',')" } else { 'unknown' }); Target = 'leave ON (security)' }
+    )
+    $notSet = @($features | Where-Object { $_.Setting -like 'Edge*' -or $_.Setting -like 'Chrome*' } | Where-Object { $_.Value -ne $_.Target })
+    if ($notSet.Count -and $browserMB -gt 800) { Add-Rec 3 "Browser memory policies are not set ($($notSet.Count) of 7). Apply BrowserMemory - or push the same settings from GPO / Intune for the whole client." }
+    $wdg = @($byName | Where-Object { $_.Agent -eq 'Widgets' -or $_.Agent -eq 'Copilot / AI' -or $_.Agent -eq 'Phone Link' })
+    if ($wdg.Count) { Add-Rec 4 "Widgets / Copilot / Phone Link are running ($((($wdg | Measure-Object PrivateMB -Sum).Sum)) MB). Apply BackgroundFeatures if the business doesn't use them." }
+    if (-not $pfAuto) { Add-Rec 3 'Page file is manually sized. Set it back to "Automatically manage" - a fixed or disabled page file causes out-of-memory crashes when commit spikes.' }
+    if ($installedRamGB -le 8.5) { Add-Rec 2 "Only $installedRamGB GB installed - Windows 11 + Teams + a browser is tight on 8 GB. Apply VisualEffects too, and plan 16 GB minimum." }
+    $domainJoined = [bool]$cs.PartOfDomain
+    $mdm = Test-Path 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Enrollments\*\DMClient'
+    if ($domainJoined -or $mdm) { Add-Rec 5 "Device is $(if ($domainJoined) { 'domain joined' } else { '' })$(if ($domainJoined -and $mdm) { ' and ' })$(if ($mdm) { 'MDM/Intune enrolled' }). Policies applied locally can be overwritten by GPO/Intune - for a whole client, set them centrally." }
+
+    # ---- output
+    $base = Join-Path $OutputPath "MemoryAudit_$($env:COMPUTERNAME)_$($Script:Stamp)"
+    $topApps  | Export-Csv "$base`_TopApps.csv" -NoTypeInformation -Encoding UTF8
+    $agents   | Export-Csv "$base`_Agents.csv" -NoTypeInformation -Encoding UTF8
+    $startup  | Export-Csv "$base`_Startup.csv" -NoTypeInformation -Encoding UTF8
+    @($consumer + $oemAppx + $copilot) | Export-Csv "$base`_StoreBloat.csv" -NoTypeInformation -Encoding UTF8
+    $recSorted = @($rec | Sort-Object Priority)
+
+    Write-Host ''
+    Write-Log 'MEMORY OVERVIEW' 'HEAD'
+    foreach ($k in $overview.Keys) { Write-Host ('  {0,-34} {1}' -f $k, $overview[$k]) }
+    Write-Host ''
+    Write-Log 'TOP 12 APPLICATIONS (private memory)' 'HEAD'
+    $topApps | Select-Object -First 12 Application, Processes, PrivateMB, WorkingSetMB, Agent | Format-Table -AutoSize | Out-Host
+    Write-Log 'AGENT STACK' 'HEAD'
+    $groupTotals | Format-Table -AutoSize -Wrap | Out-Host
+    Write-Log 'RECOMMENDATIONS (1 = most important)' 'HEAD'
+    foreach ($r in $recSorted) { Write-Host ("  [{0}] {1}" -f $r.Priority, $r.Recommendation) -ForegroundColor $(if ($r.Priority -le 2) { 'Yellow' } else { 'Gray' }) }
+
+    # HTML
+    $css = 'body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1b1b1b}h1{color:#0b4f8a;margin-bottom:0}h2{color:#0b4f8a;border-bottom:2px solid #0b4f8a;padding-bottom:4px;margin-top:28px}' +
+           '.sub{color:#555;margin-top:2px}table{border-collapse:collapse;margin:8px 0;font-size:13px}th,td{border:1px solid #ccc;padding:4px 8px;text-align:left;vertical-align:top}' +
+           'th{background:#eef3f8}.p1{background:#fde2e1}.p2{background:#fff3cd}.v-HIGH{color:#b00020;font-weight:bold}.v-ELEVATED{color:#9a6700;font-weight:bold}.v-OK{color:#1a7f37;font-weight:bold}'
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<!DOCTYPE html><html><head><meta charset='utf-8'><title>Memory audit - $(HtmlEnc $env:COMPUTERNAME)</title><style>$css</style></head><body>")
+    [void]$sb.Append("<h1>Windows memory audit - $(HtmlEnc $env:COMPUTERNAME)</h1><div class='sub'>Prepared by Sigma Data Systems Inc. &middot; $(Get-Date -Format 'yyyy-MM-dd HH:mm')</div>")
+    [void]$sb.Append('<h2>Recommendations</h2><table><tr><th>Priority</th><th>Recommendation</th></tr>')
+    foreach ($r in $recSorted) { $cls = if ($r.Priority -eq 1) { 'p1' } elseif ($r.Priority -eq 2) { 'p2' } else { '' }; [void]$sb.Append("<tr class='$cls'><td>$($r.Priority)</td><td>$(HtmlEnc $r.Recommendation)</td></tr>") }
+    [void]$sb.Append('</table><h2>Memory overview</h2><table>')
+    foreach ($k in $overview.Keys) {
+        $v = HtmlEnc "$($overview[$k])"
+        if ($k -eq 'Memory pressure verdict') { $v = "<span class='v-$($overview[$k])'>$v</span>" }
+        [void]$sb.Append("<tr><th>$(HtmlEnc $k)</th><td>$v</td></tr>")
+    }
+    [void]$sb.Append('</table><p class="sub">"In use" counts everything not immediately free. Real shortage = low Available <b>and</b> sustained hard faults (page reads/s in the hundreds) <b>or</b> commit near the limit.</p>')
+    $frag = { param($rows, $props) if (@($rows).Count) { (@($rows) | Select-Object $props | ConvertTo-Html -Fragment) -join '' } else { '<p class="sub">None.</p>' } }
+    [void]$sb.Append('<h2>Agent stack (security, RMM, VPN, backup, OEM, collaboration)</h2>' + (& $frag $groupTotals @('Group', 'Agents', 'PrivateMB')) + (& $frag $agents @('Group', 'Agent', 'Processes', 'PrivateMB', 'WorkingSetMB', 'CpuPctNow')))
+    [void]$sb.Append('<h2>Top 25 applications by private memory</h2>' + (& $frag $topApps @('Application', 'Processes', 'PrivateMB', 'WorkingSetMB', 'CpuPctNow', 'Group', 'Agent')))
+    [void]$sb.Append('<h2>Largest svchost service groups</h2>' + (& $frag ($svcRows | Select-Object -First 15) @('PID', 'PrivateMB', 'Services')))
+    [void]$sb.Append('<h2>Startup items</h2>' + (& $frag $startup @('Name', 'Command', 'Location', 'User')))
+    [void]$sb.Append('<h2>Consumer / OEM Store apps present</h2>' + (& $frag @($consumer + $oemAppx + $copilot) @('Name', 'Installed', 'Provisioned', 'Version')))
+    [void]$sb.Append('<h2>OEM / trial desktop programs present</h2>' + (& $frag @($w32.Oem + $w32.TrialAv) @('DisplayName', 'Version', 'Publisher', 'WindowsInstaller')))
+    [void]$sb.Append('<h2>Feature and policy state</h2>' + (& $frag $features @('Setting', 'Value', 'Target')))
+    [void]$sb.Append('<h2>Deliberately not changed by this tool</h2><p>Page file, SysMain, memory compression, VBS / Memory Integrity, Defender, Windows Update, Teams, OneNote, Outlook, Quick Assist, Sticky Notes, To Do, Calculator, Photos, Paint, Snipping Tool, Notepad, Terminal, Store, Media Player, Company Portal, Microsoft 365 app, Power Automate, Dell Command | Update, Lenovo System Update / Commercial Vantage, HP Image Assistant / Wolf Security.</p>')
+    [void]$sb.Append('</body></html>')
+    $html = "$base.html"
+    [System.IO.File]::WriteAllText($html, $sb.ToString(), (New-Object System.Text.UTF8Encoding($true)))
+    Write-Host ''
+    Write-Log "HTML report: $html" 'OK'
+    Write-Log "CSVs:        $base`_*.csv" 'OK'
+    return $recSorted
+}
+
+#endregion
+
+#region -------------------------------------------------------------- apply
+
+function Remove-AppxList([string[]]$Names, [string]$Category) {
+    $installed = @(Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)
+    $prov = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)
+    $n = 0
+    foreach ($name in $Names) {
+        $pk = @($installed | Where-Object { $_.Name -eq $name })
+        $pp = @($prov | Where-Object { $_.DisplayName -eq $name })
+        if (-not $pk.Count -and -not $pp.Count) { continue }
+        if ($Preview) { Write-Log "  PREVIEW remove app $name (installed=$([bool]$pk.Count) provisioned=$([bool]$pp.Count))"; continue }
+        if ($name -match 'Widget|WebExperience') { Get-Process *Widget* -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+        foreach ($p in $pk) {
+            try {
+                Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop
+                Write-Log "  - removed $($p.Name) $($p.Version)" 'OK'; $n++
+                $Script:Removed.Add([pscustomobject]@{ Category = $Category; Type = 'Appx'; Name = $p.Name; Version = "$($p.Version)" })
+            } catch {
+                try { Remove-AppxPackage -Package $p.PackageFullName -ErrorAction Stop; Write-Log "  - removed $($p.Name) (current user only)" 'WARN'; $n++ }
+                catch { Write-Log "  Could not remove $($p.Name): $($_.Exception.Message)" 'ERROR' }
+            }
+        }
+        foreach ($q in $pp) {
+            try {
+                Remove-AppxProvisionedPackage -Online -PackageName $q.PackageName -ErrorAction Stop | Out-Null
+                Write-Log "  - de-provisioned $($q.DisplayName) (won't install for new users)" 'OK'
+                $Script:Removed.Add([pscustomobject]@{ Category = $Category; Type = 'Provisioned'; Name = $q.DisplayName; Version = "$($q.Version)" })
+            } catch { Write-Log "  Could not de-provision $($q.DisplayName): $($_.Exception.Message)" 'ERROR' }
+        }
+    }
+    if ($n -eq 0 -and -not $Preview) { Write-Log '  Nothing from this list is installed.' }
+}
+
+function Remove-OemWin32 {
+    $found = Find-OemWin32
+    foreach ($t in $found.TrialAv) { Write-Log "  Trial AV found: $($t.DisplayName) - remove with the vendor removal tool (not automated)." 'WARN' }
+    if (-not $found.Oem.Count) { Write-Log '  No OEM desktop utilities from the list are installed.'; return }
+    foreach ($e in $found.Oem) {
+        $cmd = $null; $argList = $null
+        $guid = $null
+        if ("$($e.UninstallString)" -match '\{[0-9A-Fa-f\-]{36}\}') { $guid = $Matches[0] }
+        elseif ($e.KeyName -match '^\{[0-9A-Fa-f\-]{36}\}$') { $guid = $e.KeyName }
+        if ($e.WindowsInstaller -and $guid) { $cmd = "$env:SystemRoot\System32\msiexec.exe"; $argList = "/x $guid /qn /norestart" }
+        elseif ($e.QuietUninstallString) {
+            $q = "$($e.QuietUninstallString)".Trim()
+            if ($q -match '^"([^"]+)"\s*(.*)$') { $cmd = $Matches[1]; $argList = $Matches[2] }
+            elseif ($q -match '^(\S+\.exe)\s*(.*)$') { $cmd = $Matches[1]; $argList = $Matches[2] }
+        }
+        if (-not $cmd) { Write-Log "  $($e.DisplayName): no MSI / quiet uninstaller - remove manually (Settings > Apps)." 'WARN'; continue }
+        if ($Preview) { Write-Log "  PREVIEW uninstall $($e.DisplayName): $cmd $argList"; continue }
+        try {
+            Write-Log "  Uninstalling $($e.DisplayName) $($e.Version)..."
+            $startArgs = @{ FilePath = $cmd; PassThru = $true; WindowStyle = 'Hidden'; ErrorAction = 'Stop' }
+            if ($argList) { $startArgs.ArgumentList = $argList }
+            $p = Start-Process @startArgs
+            if (-not $p.WaitForExit(900000)) { Write-Log "  $($e.DisplayName): uninstaller still running after 15 min - left running." 'WARN'; continue }
+            if ($p.ExitCode -in 0, 1605, 1614, 3010, 1641) {
+                Write-Log "  - removed $($e.DisplayName) (exit $($p.ExitCode))" 'OK'
+                $Script:Removed.Add([pscustomobject]@{ Category = 'OemApps'; Type = 'Win32'; Name = $e.DisplayName; Version = "$($e.Version)" })
+            } else { Write-Log "  $($e.DisplayName): uninstaller exit code $($p.ExitCode)" 'ERROR' }
+        } catch { Write-Log "  $($e.DisplayName): $($_.Exception.Message)" 'ERROR' }
+    }
+}
+
+$Script:CategoryInfo = [ordered]@{
+    ConsumerApps       = 'Remove consumer Store apps (Bing, Xbox app, Clipchamp, Solitaire, games, social) for all users + new users'
+    OemApps            = 'Remove OEM consumer utilities (Dell Optimizer/SupportAssist consumer, HP JumpStarts/myHP, Lenovo consumer Vantage...)'
+    BackgroundFeatures = 'Turn off Widgets, Copilot, Recall, AI service auto-start, Phone Link, Game DVR (policies) + remove consumer Copilot app'
+    BrowserMemory      = 'Edge sleeping tabs (30 min) + no startup boost/background; Chrome Memory Saver + no background mode'
+    Suggestions        = 'Stop silent suggested-app installs, consumer content and OEM device companion-app downloads'
+    VisualEffects      = '(opt-in) Animations and transparency off for loaded user profiles - small gain, mostly for 8 GB PCs'
+    SvcHostGrouping    = '(opt-in, ADVANCED) Fewer svchost.exe processes (SvcHostSplitThresholdInKB = RAM). ~100-300 MB, reboot, less isolation'
+}
+
+function Invoke-Category([string]$Cat) {
+    Write-Log "== $Cat : $($Script:CategoryInfo[$Cat])" 'HEAD'
+    $HKLMPol = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies'
+    switch ($Cat) {
+        'ConsumerApps' { Remove-AppxList $Script:ConsumerApps 'ConsumerApps' }
+        'OemApps' { Remove-AppxList $Script:OemAppx 'OemApps'; Remove-OemWin32 }
+        'BackgroundFeatures' {
+            Set-RegTracked "$HKLMPol\Microsoft\Dsh" 'AllowNewsAndInterests' 0 -Category $Cat -Why 'Widgets off'
+            Set-RegTracked "$HKLMPol\Microsoft\Windows\WindowsCopilot" 'TurnOffWindowsCopilot' 1 -Category $Cat -Why 'Windows Copilot off'
+            Set-RegTracked "$HKLMPol\Microsoft\Windows\WindowsAI" 'AllowRecallEnablement' 0 -Category $Cat -Why 'Recall off'
+            Set-RegTracked "$HKLMPol\Microsoft\Windows\WindowsAI" 'DisableAIDataAnalysis' 1 -Category $Cat -Why 'Recall snapshots off'
+            Set-RegTracked "$HKLMPol\Microsoft\Windows\WindowsAI" 'TurnOffSavingSnapshots' 1 -Category $Cat -Why 'Recall snapshots off'
+            Set-RegTracked "$HKLMPol\Microsoft\Windows\System" 'EnableMmx' 0 -Category $Cat -Why 'Phone Link (phone-PC linking) off'
+            Set-RegTracked "$HKLMPol\Microsoft\Windows\GameDVR" 'AllowGameDVR' 0 -Category $Cat -Why 'Game DVR / background recording off'
+            if (Test-Path 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WSAIFabricSvc') {
+                Set-RegTracked 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\WSAIFabricSvc' 'Start' 3 -Category $Cat -Why 'AI service: Manual instead of Automatic'
+            }
+            Remove-AppxList @('Microsoft.Copilot', 'Microsoft.Windows.AIHub') $Cat
+            if (-not $Preview) { Get-Process Widgets, WidgetService -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
+        }
+        'BrowserMemory' {
+            $e = "$HKLMPol\Microsoft\Edge"; $c = "$HKLMPol\Google\Chrome"
+            Set-RegTracked $e 'SleepingTabsEnabled' 1 -Category $Cat -Why 'Edge: sleep inactive tabs'
+            Set-RegTracked $e 'SleepingTabsTimeout' 1800 -Category $Cat -Why 'Edge: after 30 minutes'
+            Set-RegTracked $e 'StartupBoostEnabled' 0 -Category $Cat -Why 'Edge: no preloaded processes at sign-in'
+            Set-RegTracked $e 'BackgroundModeEnabled' 0 -Category $Cat -Why 'Edge: close fully when the window closes'
+            Set-RegTracked $c 'HighEfficiencyModeEnabled' 1 -Category $Cat -Why 'Chrome: Memory Saver on'
+            Set-RegTracked $c 'MemorySaverModeSavings' 1 -Category $Cat -Why 'Chrome: Memory Saver balanced'
+            Set-RegTracked $c 'BackgroundModeEnabled' 0 -Category $Cat -Why 'Chrome: close fully when the window closes'
+            Write-Log '  Browsers pick this up on next launch (edge://policy / chrome://policy shows it).'
+        }
+        'Suggestions' {
+            Set-RegTracked "$HKLMPol\Microsoft\Windows\CloudContent" 'DisableWindowsConsumerFeatures' 1 -Category $Cat -Why 'No suggested-app installs (Ent/Edu honour it fully)'
+            Set-RegTracked "$HKLMPol\Microsoft\Windows\CloudContent" 'DisableConsumerAccountStateContent' 1 -Category $Cat -Why 'No consumer account content'
+            Set-RegTracked "$HKLMPol\Microsoft\Windows\Device Metadata" 'PreventDeviceMetadataFromNetwork' 1 -Category $Cat -Why 'No OEM companion apps when devices are plugged in'
+            foreach ($h in (Get-UserHives)) {
+                $cdm = "$($h.Root)\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+                Set-RegTracked $cdm 'SilentInstalledAppsEnabled' 0 -Category $Cat -Why "No silent app installs ($($h.User))"
+                Set-RegTracked $cdm 'SystemPaneSuggestionsEnabled' 0 -Category $Cat -Why "No Start suggestions ($($h.User))"
+                Set-RegTracked $cdm 'SubscribedContent-338388Enabled' 0 -Category $Cat -Why "No Start suggestions ($($h.User))"
+                Set-RegTracked $cdm 'SubscribedContent-338389Enabled' 0 -Category $Cat -Why "No tips/tricks ($($h.User))"
+            }
+        }
+        'VisualEffects' {
+            $hs = @(Get-UserHives)
+            if (-not $hs.Count) { Write-Log '  No loaded user profiles - sign the user in and run again.' 'WARN' }
+            foreach ($h in $hs) {
+                Set-RegTracked "$($h.Root)\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" 'VisualFXSetting' 3 -Category $Cat -Why "Custom visual effects ($($h.User))"
+                Set-RegTracked "$($h.Root)\Control Panel\Desktop\WindowMetrics" 'MinAnimate' '0' -Type String -Category $Cat -Why "No minimise/maximise animation ($($h.User))"
+                Set-RegTracked "$($h.Root)\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced" 'TaskbarAnimations' 0 -Category $Cat -Why "No taskbar animation ($($h.User))"
+                Set-RegTracked "$($h.Root)\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" 'EnableTransparency' 0 -Category $Cat -Why "No transparency ($($h.User))"
+                Set-RegTracked "$($h.Root)\Control Panel\Desktop" 'FontSmoothing' '2' -Type String -Category $Cat -Why "Keep ClearType font smoothing ($($h.User))"
+            }
+            Write-Log '  Takes effect at next sign-in.'
+        }
+        'SvcHostGrouping' {
+            $kb = [int64]((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1KB)
+            if ($kb -gt [int]::MaxValue) { Write-Log '  RAM too large for this setting - skipped.' 'WARN'; break }
+            Set-RegTracked 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control' 'SvcHostSplitThresholdInKB' ([int]$kb) -Category $Cat -Why "Group services into fewer svchost.exe ($kb KB)"
+            Write-Log '  Reboot required. Undo restores the previous value.' 'WARN'
+        }
+    }
+}
+
+function Invoke-Apply {
+    if (-not (Test-IsAdmin)) { Write-Log 'Apply needs an elevated PowerShell (Administrator or SYSTEM).' 'ERROR'; exit 2 }
+    $valid = @($Script:CategoryInfo.Keys)
+    $sel = @()
+    foreach ($c in $Categories) {
+        foreach ($part in ("$c" -split '[,; ]+' | Where-Object { $_ })) {
+            if ($part -eq 'All') { $sel += $valid }
+            elseif ($part -eq 'Recommended') { $sel += 'ConsumerApps', 'OemApps', 'BackgroundFeatures', 'BrowserMemory', 'Suggestions' }
+            elseif ($valid -contains $part) { $sel += $part }
+            else { Write-Log "Unknown category '$part' - valid: $($valid -join ', '), Recommended, All" 'WARN' }
+        }
+    }
+    $sel = @($valid | Where-Object { $sel -contains $_ })   # keep catalog order, de-dupe
+    if (-not $sel.Count) {
+        if ($Force -or -not (Test-Interactive)) { Write-Log 'No -Categories given. Nothing to do.' 'WARN'; return }
+        Write-Host "`nPick what to apply (Y/N for each). Default = recommended ones.`n" -ForegroundColor Cyan
+        foreach ($k in $valid) {
+            $def = if ($k -in 'VisualEffects', 'SvcHostGrouping') { 'N' } else { 'Y' }
+            $a = Read-Host ("  {0,-18} {1}  [{2}]" -f $k, $Script:CategoryInfo[$k], $def)
+            if (-not $a) { $a = $def }
+            if ($a -match '^[Yy]') { $sel += $k }
+        }
+    }
+    if (-not $sel.Count) { Write-Log 'Nothing selected.'; return }
+    Write-Log "Applying: $($sel -join ', ')$(if ($Preview) { '  (PREVIEW - nothing is changed)' })" 'HEAD'
+
+    if (-not $Force -and -not $Preview -and (Test-Interactive)) {
+        $go = Read-Host 'Proceed? (Y/N)'
+        if ($go -notmatch '^[Yy]') { Write-Log 'Cancelled.'; return }
+    }
+
+    if (-not $NoRestorePoint -and -not $Preview) {
+        $freqKey = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+        $oldFreq = (Get-ItemProperty -LiteralPath $freqKey -Name SystemRestorePointCreationFrequency -ErrorAction SilentlyContinue).SystemRestorePointCreationFrequency
+        try {
+            New-ItemProperty -LiteralPath $freqKey -Name SystemRestorePointCreationFrequency -Value 0 -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Checkpoint-Computer -Description 'SDSI ToolKit - before memory/debloat changes' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+            Write-Log 'Restore point created.' 'OK'
+        } catch { Write-Log "Restore point not created ($($_.Exception.Message)). System Protection may be off - continuing; the undo manifest still covers registry changes." 'WARN' }
+        finally {
+            if ($null -eq $oldFreq) { Remove-ItemProperty -LiteralPath $freqKey -Name SystemRestorePointCreationFrequency -ErrorAction SilentlyContinue }
+            else { New-ItemProperty -LiteralPath $freqKey -Name SystemRestorePointCreationFrequency -Value $oldFreq -PropertyType DWord -Force | Out-Null }
+        }
+    }
+
+    foreach ($c in $sel) { Invoke-Category $c }
+    $man = Save-Manifest
+    if (-not $Preview -and ($sel -contains 'ConsumerApps' -or $sel -contains 'OemApps' -or $sel -contains 'BackgroundFeatures')) {
+        Write-Log 'Restart or sign out/in to finish (Explorer, Widgets and Start pick up the changes then).'
+    }
+    Write-Log "Done: $($Script:Changes.Count) registry change(s), $($Script:Removed.Count) app removal(s), $($Script:Errors) error(s)." 'HEAD'
+    if ($man) { Write-Log "To revert the registry changes: -Mode Undo -UndoFile `"$man`"" }
+}
+
+#endregion
+
+#region --------------------------------------------------------------- undo
+
+function Invoke-Undo {
+    if (-not (Test-IsAdmin)) { Write-Log 'Undo needs an elevated PowerShell (Administrator or SYSTEM).' 'ERROR'; exit 2 }
+    $file = $UndoFile
+    if (-not $file) {
+        $file = Get-ChildItem -LiteralPath $OutputPath -Filter 'Optimize-WindowsMemory_Undo_*.json' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $file -or -not (Test-Path -LiteralPath $file)) { Write-Log "No undo manifest found in $OutputPath." 'ERROR'; return }
+    $m = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+    Write-Log "Reverting $(@($m.Registry).Count) registry change(s) from $file (created $($m.Created) on $($m.Computer))" 'HEAD'
+    $list = @($m.Registry); [array]::Reverse($list)
+    foreach ($r in $list) {
+        try {
+            if (-not $r.Existed) {
+                if ($Preview) { Write-Log "  PREVIEW remove $($r.Path)\$($r.Name)"; continue }
+                Remove-ItemProperty -LiteralPath $r.Path -Name $r.Name -ErrorAction Stop
+                Write-Log "  - removed $($r.Path)\$($r.Name) (did not exist before)" 'OK'
+            } else {
+                $type = switch ("$($r.OldType)") { 'String' { 'String' } 'ExpandString' { 'ExpandString' } 'QWord' { 'QWord' } 'Binary' { 'Binary' } 'MultiString' { 'MultiString' } default { 'DWord' } }
+                if ($Preview) { Write-Log "  PREVIEW restore $($r.Path)\$($r.Name) = $($r.OldValue)"; continue }
+                New-ItemProperty -LiteralPath $r.Path -Name $r.Name -Value $r.OldValue -PropertyType $type -Force -ErrorAction Stop | Out-Null
+                Write-Log "  = restored $($r.Path)\$($r.Name) = $($r.OldValue)" 'OK'
+            }
+        } catch { Write-Log "  $($r.Path)\$($r.Name): $($_.Exception.Message)" 'ERROR' }
+    }
+    $apps = @($m.RemovedApps)
+    if ($apps.Count) {
+        Write-Log "$($apps.Count) app removal(s) in that run can't be undone automatically. Reinstall any you need from the Microsoft Store or winget:" 'WARN'
+        $apps | ForEach-Object { Write-Log "    $($_.Type): $($_.Name) $($_.Version)" }
+    }
+    Write-Log 'Undo complete. Reboot to finish.' 'HEAD'
+}
+
+#endregion
+
+Write-Log "Optimize-WindowsMemory - Mode $Mode - Prepared by Sigma Data Systems Inc." 'HEAD'
+switch ($Mode) {
+    'Audit' { $null = Invoke-Audit }
+    'Apply' { Invoke-Apply }
+    'Undo'  { Invoke-Undo }
+}
+Write-Log "Log: $($Script:LogFile)"
+if ($Script:Errors -gt 0) { exit 1 } else { exit 0 }
 '@
 
 # ======================= Remove-MobileLeases.ps1 =======================
