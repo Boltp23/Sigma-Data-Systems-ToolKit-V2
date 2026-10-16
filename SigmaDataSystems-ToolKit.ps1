@@ -1215,6 +1215,14 @@ function Invoke-RamOptimizerUndo {
     Invoke-Tool 'Optimize-WindowsMemory' ([ordered]@{ Mode = 'Undo'; UndoFile = $files[$pick - 1].FullName; OutputPath = $dir }) | Out-Null
 }
 
+function Invoke-RestoreWidgets {
+    Write-Title '[!] Restore Widgets (after the RAM optimizer / debloat removed them)'
+    Write-Host '  Clears the Widgets-off policy where Windows allows it and reinstalls the Windows Web Experience Pack'
+    Write-Host '  from the Microsoft Store (winget). Run it as the signed-in user elevated - not as SYSTEM.' -ForegroundColor DarkGray
+    if (-not (Confirm-Change 'Reinstall Widgets (Windows Web Experience Pack) from the Microsoft Store and remove the Widgets-off policy.')) { return }
+    Invoke-Tool 'Optimize-WindowsMemory' ([ordered]@{ Mode = 'RestoreWidgets'; OutputPath = (Get-OutDir 'Memory') }) | Out-Null
+}
+
 function Invoke-PowerSettings {
     Write-Title '[!] Power settings - never sleep / hibernate / turn off display or disks'
     Write-Host '  Current active scheme:'; powercfg /getactivescheme
@@ -4039,6 +4047,7 @@ $Script:Menu = @(
     @{               Text = '[!] Repair .zip association / reset default browser (per user)';               Action = { Invoke-ZipBrowserRepair } }
     @{               Text = '[!] RAM optimizer / business-safe debloat (pick categories, preview, undo-able)'; Action = { Invoke-RamOptimizer } }
     @{               Text = '[!] RAM optimizer - undo registry changes';                                     Action = { Invoke-RamOptimizerUndo } }
+    @{               Text = '[!] Restore Widgets (reinstall Windows Web Experience Pack, clear Widgets-off policy)'; Action = { Invoke-RestoreWidgets } }
     @{               Text = '[!] Remove bloatware - legacy list (also removes Teams/OneNote/Dell Command Update)'; Action = { Invoke-RemoveBloatware } }
     @{               Text = '[!] Power settings - never sleep / hibernate';                                  Action = { Invoke-PowerSettings } }
     @{ Test='safe'; Text = 'Check scanner (Panini etc.) hangs / not detected - diagnostics + optional USB power fix'; Action = { Invoke-CheckScannerDiag } }
@@ -19090,6 +19099,12 @@ $Script:Payloads['Optimize-WindowsMemory'] = @'
         point is attempted first. App removals are logged with their package names
         (reinstall from the Microsoft Store / winget if ever needed).
 
+    -Mode RestoreWidgets
+        Brings Widgets back after they were removed: clears the Widgets-off policy
+        (where Windows allows it) and reinstalls the Windows Web Experience Pack
+        (+ Widgets Platform Runtime) from the Microsoft Store with winget, or opens
+        the Store page when winget can't be used (e.g. running as SYSTEM).
+
     -Mode Undo
         Puts back every registry value from an undo manifest (latest one in
         -OutputPath if -UndoFile isn't given).
@@ -19105,7 +19120,7 @@ $Script:Payloads['Optimize-WindowsMemory'] = @'
       Raphire/Win11Debloat, ChrisTitusTech/winutil, SysAdminDoc/Debloat-Win11,
       Microsoft Edge / Chrome / Windows policy documentation.
 
-.PARAMETER Mode           Audit (default) | Apply | Undo
+.PARAMETER Mode           Audit (default) | Apply | Undo | RestoreWidgets
 .PARAMETER Categories     Apply only: ConsumerApps, OemApps, BackgroundFeatures,
                           BrowserMemory, Suggestions, VisualEffects, SvcHostGrouping,
                           'Recommended' (= first five) or 'All'.
@@ -19130,7 +19145,7 @@ $Script:Payloads['Optimize-WindowsMemory'] = @'
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Audit', 'Apply', 'Undo')]
+    [ValidateSet('Audit', 'Apply', 'Undo', 'RestoreWidgets')]
     [string]$Mode = 'Audit',
     [string[]]$Categories = @(),
     [switch]$Force,
@@ -19202,8 +19217,11 @@ function Set-RegTracked {
         [Parameter(Mandatory)]$Value,
         [ValidateSet('DWord', 'String', 'QWord')][string]$Type = 'DWord',
         [string]$Category = '',
-        [string]$Why = ''
+        [string]$Why = '',
+        # Some policy keys are protected by Windows even from admins - log a warning instead of an error
+        [switch]$BestEffort
     )
+    $Script:LastRegOk = $true
     $existed = $false; $old = $null; $oldType = $null
     if (Test-Path -LiteralPath $Path) {
         $item = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
@@ -19227,20 +19245,33 @@ function Set-RegTracked {
         })
         Write-Log "  + $Path\$Name = $Value  [$Why]" 'OK'
     } catch {
-        Write-Log "  Failed to set $Path\$Name : $($_.Exception.Message)" 'ERROR'
+        $Script:LastRegOk = $false
+        if ($BestEffort) { Write-Log "  Windows blocked $Path\$Name ($($_.Exception.Message)) - using the fallback." 'WARN' }
+        else { Write-Log "  Failed to set $Path\$Name : $($_.Exception.Message)" 'ERROR' }
     }
 }
 
 function Save-Manifest {
     if ($Preview -or ($Script:Changes.Count -eq 0 -and $Script:Removed.Count -eq 0)) { return $null }
     $file = Join-Path $OutputPath "Optimize-WindowsMemory_Undo_$($Script:Stamp).json"
-    $obj = [ordered]@{
-        Tool = 'Optimize-WindowsMemory'; Created = (Get-Date).ToString('s'); Computer = $env:COMPUTERNAME
-        Registry = @($Script:Changes); RemovedApps = @($Script:Removed)
+    try {
+        # .ToArray() - wrapping a generic List in @() inside a hashtable literal throws
+        # "Argument types do not match" in Windows PowerShell 5.1
+        $obj = New-Object PSObject
+        $obj | Add-Member NoteProperty Tool 'Optimize-WindowsMemory'
+        $obj | Add-Member NoteProperty Created ((Get-Date).ToString('s'))
+        $obj | Add-Member NoteProperty Computer $env:COMPUTERNAME
+        $obj | Add-Member NoteProperty Registry ([object[]]$Script:Changes.ToArray())
+        $obj | Add-Member NoteProperty RemovedApps ([object[]]$Script:Removed.ToArray())
+        $json = ConvertTo-Json -InputObject $obj -Depth 6
+        if (-not $json -or $json -eq 'null') { throw 'manifest serialised as empty' }
+        Set-Content -LiteralPath $file -Value $json -Encoding UTF8 -ErrorAction Stop
+        Write-Log "Undo manifest: $file" 'OK'
+        return $file
+    } catch {
+        Write-Log "Could not write the undo manifest ($($_.Exception.Message)). Undo can still rebuild it from the log: -Mode Undo -UndoFile `"$($Script:LogFile)`"" 'ERROR'
+        return $null
     }
-    $obj | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $file -Encoding UTF8
-    Write-Log "Undo manifest: $file" 'OK'
-    return $file
 }
 
 #endregion
@@ -19722,7 +19753,14 @@ function Remove-AppxList([string[]]$Names, [string]$Category) {
                 Remove-AppxProvisionedPackage -Online -PackageName $q.PackageName -ErrorAction Stop | Out-Null
                 Write-Log "  - de-provisioned $($q.DisplayName) (won't install for new users)" 'OK'
                 $Script:Removed.Add([pscustomobject]@{ Category = $Category; Type = 'Provisioned'; Name = $q.DisplayName; Version = "$($q.Version)" })
-            } catch { Write-Log "  Could not de-provision $($q.DisplayName): $($_.Exception.Message)" 'ERROR' }
+            } catch {
+                # Remove-AppxPackage -AllUsers already de-provisions on current Windows 11 builds -> "cannot find the file"
+                $still = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | Where-Object { $_.PackageName -eq $q.PackageName })
+                if (-not $still.Count) {
+                    Write-Log "  - $($q.DisplayName) is no longer provisioned (removed with the all-users uninstall)" 'OK'
+                    $Script:Removed.Add([pscustomobject]@{ Category = $Category; Type = 'Provisioned'; Name = $q.DisplayName; Version = "$($q.Version)" })
+                } else { Write-Log "  Could not de-provision $($q.DisplayName): $($_.Exception.Message)" 'ERROR' }
+            }
         }
     }
     if ($n -eq 0 -and -not $Preview) { Write-Log '  Nothing from this list is installed.' }
@@ -19780,7 +19818,13 @@ function Invoke-Category([string]$Cat) {
         'ConsumerApps' { Remove-AppxList $Script:ConsumerApps 'ConsumerApps' }
         'OemApps' { Remove-AppxList $Script:OemAppx 'OemApps'; Remove-OemWin32 }
         'BackgroundFeatures' {
-            Set-RegTracked "$HKLMPol\Microsoft\Dsh" 'AllowNewsAndInterests' 0 -Category $Cat -Why 'Widgets off'
+            Set-RegTracked "$HKLMPol\Microsoft\Dsh" 'AllowNewsAndInterests' 0 -Category $Cat -Why 'Widgets off' -BestEffort
+            if (-not $Script:LastRegOk) {
+                # Current Windows 11 builds can protect the Dsh policy key even from admins (set it via GPO/Intune instead).
+                # Fallback used by Win11Debloat / WinUtil: remove the Widgets packages (reinstall: Store "Windows Web Experience Pack").
+                Write-Log '  Widgets policy is protected on this build - removing the Widgets packages instead (GPO / Intune can set the policy).' 'WARN'
+                Remove-AppxList @('MicrosoftWindows.Client.WebExperience', 'Microsoft.WidgetsPlatformRuntime') $Cat
+            }
             Set-RegTracked "$HKLMPol\Microsoft\Windows\WindowsCopilot" 'TurnOffWindowsCopilot' 1 -Category $Cat -Why 'Windows Copilot off'
             Set-RegTracked "$HKLMPol\Microsoft\Windows\WindowsAI" 'AllowRecallEnablement' 0 -Category $Cat -Why 'Recall off'
             Set-RegTracked "$HKLMPol\Microsoft\Windows\WindowsAI" 'DisableAIDataAnalysis' 1 -Category $Cat -Why 'Recall snapshots off'
@@ -19896,6 +19940,31 @@ function Invoke-Apply {
 
 #region --------------------------------------------------------------- undo
 
+# Rebuild undo entries from an Apply log ("[OK]   + <Path>\<Name> = <Value>  [why]" lines).
+# The log doesn't record previous values, so values are put back to the Windows default
+# (or removed, which is the default for policy values).
+function ConvertFrom-ApplyLog([string]$LogPath) {
+    $defaults = @(
+        @{ P = '\\Services\\[^\\]+$'; N = '^Start$'; V = 2; T = 'DWord' }
+        @{ P = '\\ContentDeliveryManager$'; N = '.'; V = 1; T = 'DWord' }
+        @{ P = '\\WindowMetrics$'; N = '^MinAnimate$'; V = '1'; T = 'String' }
+        @{ P = '\\Explorer\\Advanced$'; N = '^TaskbarAnimations$'; V = 1; T = 'DWord' }
+        @{ P = '\\Themes\\Personalize$'; N = '^EnableTransparency$'; V = 1; T = 'DWord' }
+        @{ P = '\\Control$'; N = '^SvcHostSplitThresholdInKB$'; V = 3670016; T = 'DWord' }
+    )
+    $entries = @()
+    foreach ($line in (Get-Content -LiteralPath $LogPath)) {
+        if ($line -notmatch '\[OK\]\s+\+ (Registry::.+)\\([^\\]+?) = (.*?)  \[') { continue }
+        $path = $Matches[1]; $name = $Matches[2]; $val = $Matches[3]
+        $e = [pscustomobject]@{ Kind = 'Registry'; Path = $path; Name = $name; Existed = $false; OldValue = $null; OldType = $null; NewValue = $val }
+        foreach ($d in $defaults) {
+            if ($path -match $d.P -and $name -match $d.N) { $e.Existed = $true; $e.OldValue = $d.V; $e.OldType = $d.T; break }
+        }
+        $entries += $e
+    }
+    return [pscustomobject]@{ Created = (Get-Item -LiteralPath $LogPath).LastWriteTime.ToString('s'); Computer = $env:COMPUTERNAME; Registry = $entries; RemovedApps = @() }
+}
+
 function Invoke-Undo {
     if (-not (Test-IsAdmin)) { Write-Log 'Undo needs an elevated PowerShell (Administrator or SYSTEM).' 'ERROR'; exit 2 }
     $file = $UndoFile
@@ -19904,7 +19973,15 @@ function Invoke-Undo {
             Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
     }
     if (-not $file -or -not (Test-Path -LiteralPath $file)) { Write-Log "No undo manifest found in $OutputPath." 'ERROR'; return }
-    $m = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+    $m = $null
+    if ($file -notlike '*.log') { try { $m = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json } catch { $m = $null } }
+    if (-not $m -or -not $m.Registry) {
+        # Empty / unreadable manifest (or a log was given): rebuild the change list from the Apply log of the same run
+        $log = if ($file -like '*.log') { $file } else { $file -replace 'Optimize-WindowsMemory_Undo_(\d{8}_\d{6})\.json$', 'Optimize-WindowsMemory_Apply_$1.log' }
+        if (-not (Test-Path -LiteralPath $log)) { Write-Log "Undo manifest is empty and the matching log ($log) was not found." 'ERROR'; return }
+        Write-Log "Undo manifest is empty - rebuilding the change list from $log (values go back to Windows defaults)." 'WARN'
+        $m = ConvertFrom-ApplyLog $log
+    }
     Write-Log "Reverting $(@($m.Registry).Count) registry change(s) from $file (created $($m.Created) on $($m.Computer))" 'HEAD'
     $list = @($m.Registry); [array]::Reverse($list)
     foreach ($r in $list) {
@@ -19929,6 +20006,64 @@ function Invoke-Undo {
     Write-Log 'Undo complete. Reboot to finish.' 'HEAD'
 }
 
+#region ---------------------------------------------------- restore widgets
+
+function Get-WingetPath {
+    $c = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($c) { return $c.Source }
+    $d = Get-ChildItem "$env:ProgramFiles\WindowsApps" -Filter 'Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe' -Directory -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1
+    if ($d -and (Test-Path (Join-Path $d.FullName 'winget.exe'))) { return (Join-Path $d.FullName 'winget.exe') }
+    return $null
+}
+
+function Invoke-RestoreWidgets {
+    if (-not (Test-IsAdmin)) { Write-Log 'RestoreWidgets needs an elevated PowerShell (Administrator).' 'ERROR'; exit 2 }
+    Write-Log 'Restoring Widgets' 'HEAD'
+    $storeId = '9MSSGKG348SP'   # Windows Web Experience Pack (Widgets)
+
+    # 1. Clear the Widgets-off policy if this tool (or anyone) set it
+    $dsh = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Dsh'
+    $cur = (Get-ItemProperty -LiteralPath $dsh -Name AllowNewsAndInterests -ErrorAction SilentlyContinue).AllowNewsAndInterests
+    if ($null -ne $cur -and "$cur" -eq '0') {
+        if ($Preview) { Write-Log "  PREVIEW remove $dsh\AllowNewsAndInterests (currently 0)" }
+        else {
+            try { Remove-ItemProperty -LiteralPath $dsh -Name AllowNewsAndInterests -ErrorAction Stop; Write-Log '  - Widgets-off policy removed' 'OK' }
+            catch { Write-Log "  Windows blocked removing the Widgets policy ($($_.Exception.Message)). If GPO/Intune sets 'Allow widgets = Disabled', change it there." 'WARN' }
+        }
+    } else { Write-Log '  No local Widgets-off policy set.' }
+    if (Test-Path 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\PolicyManager\current\device\NewsAndInterests') {
+        $mdmV = (Get-ItemProperty 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\PolicyManager\current\device\NewsAndInterests' -ErrorAction SilentlyContinue).AllowNewsAndInterests
+        if ("$mdmV" -eq '0') { Write-Log '  Intune/MDM policy "AllowNewsAndInterests = 0" is applied - Widgets stay hidden until it is changed in Intune.' 'WARN' }
+    }
+
+    # 2. Reinstall the packages
+    $have = @(Get-AppxPackage -AllUsers -Name 'MicrosoftWindows.Client.WebExperience' -ErrorAction SilentlyContinue)
+    if ($have.Count) { Write-Log "  Windows Web Experience Pack already installed ($($have[0].Version))." 'OK' }
+    else {
+        $wg = Get-WingetPath
+        $isSystem = ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
+        if ($Preview) { Write-Log "  PREVIEW winget install --id $storeId --source msstore" }
+        elseif ($wg -and -not $isSystem) {
+            Write-Log "  Installing Windows Web Experience Pack from the Microsoft Store (winget, ID $storeId)..."
+            $p = Start-Process -FilePath $wg -ArgumentList "install --id $storeId --source msstore --accept-package-agreements --accept-source-agreements --silent --disable-interactivity" -NoNewWindow -Wait -PassThru
+            if ($p.ExitCode -eq 0) { Write-Log '  - Windows Web Experience Pack installed' 'OK' }
+            else { Write-Log "  winget exit code $($p.ExitCode) - opening the Store page instead." 'WARN'; Start-Process "ms-windows-store://pdp/?ProductId=$storeId" -ErrorAction SilentlyContinue }
+        } else {
+            $why = if ($isSystem) { 'running as SYSTEM (Store installs need a signed-in user)' } else { 'winget (App Installer) is not available' }
+            Write-Log "  Can't install automatically: $why. Opening the Store page - click Get / Install: Windows Web Experience Pack." 'WARN'
+            if (-not $isSystem) { Start-Process "ms-windows-store://pdp/?ProductId=$storeId" -ErrorAction SilentlyContinue }
+        }
+    }
+    if (-not $Preview) {
+        Start-Sleep -Seconds 3
+        $web = @(Get-AppxPackage -AllUsers -Name 'MicrosoftWindows.Client.WebExperience' -ErrorAction SilentlyContinue)
+        $rt  = @(Get-AppxPackage -AllUsers -Name 'Microsoft.WidgetsPlatformRuntime' -ErrorAction SilentlyContinue)
+        Write-Log ("  Web Experience Pack: {0}   Widgets Platform Runtime: {1}" -f $(if ($web.Count) { $web[0].Version } else { 'missing' }), $(if ($rt.Count) { $rt[0].Version } else { 'missing (the Store adds it on first Widgets launch)' })) $(if ($web.Count) { 'OK' } else { 'WARN' })
+    }
+    Write-Log 'Then turn the button on: Settings > Personalization > Taskbar > Widgets (Windows protects that switch from scripts). Sign out/in if it does not appear.' 'HEAD'
+}
+
 #endregion
 
 Write-Log "Optimize-WindowsMemory - Mode $Mode - Prepared by Sigma Data Systems Inc." 'HEAD'
@@ -19936,6 +20071,7 @@ switch ($Mode) {
     'Audit' { $null = Invoke-Audit }
     'Apply' { Invoke-Apply }
     'Undo'  { Invoke-Undo }
+    'RestoreWidgets' { Invoke-RestoreWidgets }
 }
 Write-Log "Log: $($Script:LogFile)"
 if ($Script:Errors -gt 0) { exit 1 } else { exit 0 }
