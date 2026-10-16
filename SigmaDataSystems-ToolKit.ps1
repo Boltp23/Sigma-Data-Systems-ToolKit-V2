@@ -19147,6 +19147,8 @@ $Script:Stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
 $Script:Errors  = 0
 $Script:Changes = New-Object System.Collections.Generic.List[object]
 $Script:Removed = New-Object System.Collections.Generic.List[object]
+$Script:PreviewRegistry = 0
+$Script:PreviewApps = 0
 
 if (-not (Test-Path -LiteralPath $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
 $Script:LogFile = Join-Path $OutputPath "Optimize-WindowsMemory_$($Mode)_$($Script:Stamp).log"
@@ -19215,7 +19217,7 @@ function Set-RegTracked {
         Write-Log "  = $Path\$Name already $Value"
         return
     }
-    if ($Preview) { Write-Log "  PREVIEW set $Path\$Name = $Value ($Type)  [$Why]"; return }
+    if ($Preview) { $Script:PreviewRegistry++; Write-Log "  PREVIEW set $Path\$Name = $Value ($Type)  [$Why]"; return }
     try {
         if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
         New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $Type -Force -ErrorAction Stop | Out-Null
@@ -19703,7 +19705,7 @@ function Remove-AppxList([string[]]$Names, [string]$Category) {
         $pk = @($installed | Where-Object { $_.Name -eq $name })
         $pp = @($prov | Where-Object { $_.DisplayName -eq $name })
         if (-not $pk.Count -and -not $pp.Count) { continue }
-        if ($Preview) { Write-Log "  PREVIEW remove app $name (installed=$([bool]$pk.Count) provisioned=$([bool]$pp.Count))"; continue }
+        if ($Preview) { $Script:PreviewApps++; Write-Log "  PREVIEW remove app $name (installed=$([bool]$pk.Count) provisioned=$([bool]$pp.Count))"; continue }
         if ($name -match 'Widget|WebExperience') { Get-Process *Widget* -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue }
         foreach ($p in $pk) {
             try {
@@ -19741,8 +19743,12 @@ function Remove-OemWin32 {
             if ($q -match '^"([^"]+)"\s*(.*)$') { $cmd = $Matches[1]; $argList = $Matches[2] }
             elseif ($q -match '^(\S+\.exe)\s*(.*)$') { $cmd = $Matches[1]; $argList = $Matches[2] }
         }
+        if (-not $cmd -and $e.DisplayName -like 'Dell*Optimizer*' -and $e.UninstallString) {
+            # Dell Optimizer uses an InstallShield uninstaller with no QuietUninstallString - it accepts -silent
+            $cmd = "$env:SystemRoot\System32\cmd.exe"; $argList = "/c `"$($e.UninstallString) -silent`""
+        }
         if (-not $cmd) { Write-Log "  $($e.DisplayName): no MSI / quiet uninstaller - remove manually (Settings > Apps)." 'WARN'; continue }
-        if ($Preview) { Write-Log "  PREVIEW uninstall $($e.DisplayName): $cmd $argList"; continue }
+        if ($Preview) { $Script:PreviewApps++; Write-Log "  PREVIEW uninstall $($e.DisplayName): $cmd $argList"; continue }
         try {
             Write-Log "  Uninstalling $($e.DisplayName) $($e.Version)..."
             $startArgs = @{ FilePath = $cmd; PassThru = $true; WindowStyle = 'Hidden'; ErrorAction = 'Stop' }
@@ -19881,7 +19887,8 @@ function Invoke-Apply {
     if (-not $Preview -and ($sel -contains 'ConsumerApps' -or $sel -contains 'OemApps' -or $sel -contains 'BackgroundFeatures')) {
         Write-Log 'Restart or sign out/in to finish (Explorer, Widgets and Start pick up the changes then).'
     }
-    Write-Log "Done: $($Script:Changes.Count) registry change(s), $($Script:Removed.Count) app removal(s), $($Script:Errors) error(s)." 'HEAD'
+    if ($Preview) { Write-Log "Preview done: $($Script:PreviewRegistry) registry change(s) and $($Script:PreviewApps) app removal(s) WOULD be made. Nothing was changed - run again without Preview to apply." 'HEAD' }
+    else { Write-Log "Done: $($Script:Changes.Count) registry change(s), $($Script:Removed.Count) app removal(s), $($Script:Errors) error(s)." 'HEAD' }
     if ($man) { Write-Log "To revert the registry changes: -Mode Undo -UndoFile `"$man`"" }
 }
 
