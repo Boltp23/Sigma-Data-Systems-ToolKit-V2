@@ -984,6 +984,15 @@ function Invoke-IllegalNameCheck {
     }
 }
 
+function Invoke-SageDependencyScan {
+    Write-Title 'Pre-migration: find Sage 300 CRE / Timberline / Pervasive dependencies (read-only)'
+    Write-Host '  Flags Pervasive/Actian Zen databases, Timberline data files, Sage-named files/folders,'
+    Write-Host '  shortcuts that point at Sage, and Excel workbooks linked to Timberline via ODBC.'
+    $path = Read-Default 'Folder or UNC share to scan' ''
+    if (-not $path -or -not (Test-Path -LiteralPath $path)) { Write-Host '  Path not found.' -ForegroundColor Red; return }
+    Invoke-Tool 'Find-SageDependencies' ([ordered]@{ Path = $path; OutputFolder = (Get-OutDir 'SharePointMigration') }) | Out-Null
+}
+
 # ---------- SECURITY ----------------------------------------------------------------
 
 function Invoke-NCentralHunt {
@@ -4015,6 +4024,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Backup / VSS health (VSS writers, shadow storage, WSB, backup agents)';         Action = { Invoke-BackupVssHealth } }
     @{ Test='safe'; Text = 'Folder permissions (ACL) export';                                               Action = { Invoke-AclExport } }
     @{ Test='safe'; Text = 'SharePoint/OneDrive migration - bad names, long paths, QB/Access/PST blockers'; Action = { Invoke-IllegalNameCheck } }
+    @{ Test='safe'; Text = 'SharePoint/OneDrive migration - find Sage/Timberline/Pervasive dependencies';  Action = { Invoke-SageDependencyScan } }
     @{ Section = 'SECURITY / INCIDENT RESPONSE / RMM' }
     @{ Test='safe'; Text = 'Security posture (AV, firewall, BitLocker, TPM, SMBv1, admins, certs, activation)'; Action = { Invoke-SecurityPosture } }
     @{ Test='net';  Text = 'Sysinternals Autoruns - startup/persistence report (unsigned flagged)';         Action = { Invoke-AutorunsReport } }
@@ -24417,6 +24427,135 @@ try {
     Write-Out "`n  Stopped. Building summary..." 'Cyan'
     Write-Summary $LogPath
 }
+'@
+
+# ======================= Find-SageDependencies.ps1 =======================
+$Script:Payloads['Find-SageDependencies'] = @'
+<#
+.SYNOPSIS
+    Pre-migration check: finds Sage 300 CRE / Timberline (and Pervasive/Actian Zen) dependencies under a folder.
+
+.DESCRIPTION
+    Run before moving a file share to SharePoint/OneDrive. Flags anything that would break or that Sage needs:
+      - Pervasive/Actian Zen database dictionary/data files (FILE.DDF, FIELD.DDF, INDEX.DDF, *.MKD, *.BTR)
+      - Timberline-style data files (e.g. MASTER.JCM, CURRENT.JCT, *.APM, *.GLM, *.PRM ...)
+      - Files or folders with "Sage" or "Timberline" in the name
+      - Shortcuts (.lnk) whose target points at Sage/Timberline paths
+      - Excel workbooks that pull data from Timberline/Sage via ODBC/data connections
+    Read-only: nothing is moved, changed or deleted.
+
+.PARAMETER Path
+    Folder or UNC path to scan, e.g. \\server\Shares\SomeShare or D:\Shares\SomeShare
+
+.PARAMETER OutputFolder
+    Where the CSV report is written. Default C:\temp
+
+.EXAMPLE
+    .\Find-SageDependencies.ps1 -Path "\\server\Shares\SomeShare"
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [string]$OutputFolder = 'C:\temp',
+    [int]$MaxExcelScanMB = 50
+)
+
+if (-not (Test-Path -LiteralPath $Path)) { Write-Host "Path not found: $Path" -ForegroundColor Red; return }
+if (-not (Test-Path -LiteralPath $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
+
+$namePattern   = 'sage|timberline|tsdata|pervasive|actian|btrieve'
+$pervasiveDict = @('file.ddf','field.ddf','index.ddf')
+$pervasiveExt  = @('.mkd','.btr')
+# Timberline module data files: Job Cost, AP, AR, GL, Payroll, Cash Mgmt, Equipment, Service Mgmt, Project Mgmt, Property Mgmt (master/transaction)
+$timberlineExt = '^\.(JC|AP|AR|GL|PR|CM|EQ|SM|PJ|PM|IV|PO|CL)[MT]$'
+$excelExt      = @('.xlsx','.xlsm','.xls','.xlsb')
+
+$results = New-Object System.Collections.Generic.List[object]
+function Add-Hit($item, $reason, $detail) {
+    $results.Add([pscustomobject]@{
+        Reason       = $reason
+        Name         = $item.Name
+        FullPath     = $item.FullName
+        Detail       = $detail
+        SizeKB       = if ($item.PSIsContainer) { '' } else { [math]::Round($item.Length / 1KB, 1) }
+        LastModified = $item.LastWriteTime
+    })
+}
+
+$shell = $null
+try { $shell = New-Object -ComObject WScript.Shell } catch { }
+try { Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop; $zipOk = $true } catch { $zipOk = $false }
+
+Write-Host "Scanning $Path ..." -ForegroundColor Cyan
+$items = Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable scanErrors
+$total = $items.Count; $i = 0
+
+foreach ($item in $items) {
+    $i++
+    if ($i % 500 -eq 0) { Write-Progress -Activity "Checking items" -Status "$i of $total" -PercentComplete (($i / [math]::Max($total,1)) * 100) }
+
+    if ($item.PSIsContainer) {
+        if ($item.Name -match $namePattern) { Add-Hit $item 'Folder name' 'Folder name mentions Sage/Timberline/Pervasive' }
+        continue
+    }
+
+    $lname = $item.Name.ToLower()
+    $ext   = $item.Extension.ToLower()
+
+    if ($pervasiveDict -contains $lname)        { Add-Hit $item 'Pervasive database' 'Pervasive/Actian Zen data dictionary - a live database lives here'; continue }
+    if ($pervasiveExt -contains $ext)           { Add-Hit $item 'Pervasive database' 'Pervasive/Btrieve data file'; continue }
+    if ($item.Extension -match $timberlineExt)  { Add-Hit $item 'Timberline data file' "Timberline-style data file ($($item.Extension))"; continue }
+
+    if ($ext -eq '.lnk' -and $shell) {
+        try {
+            $target = $shell.CreateShortcut($item.FullName).TargetPath
+            if ($target -match $namePattern) { Add-Hit $item 'Shortcut to Sage' "Target: $target" }
+        } catch { }
+        continue
+    }
+
+    if ($excelExt -contains $ext -and $item.Length -le ($MaxExcelScanMB * 1MB)) {
+        try {
+            if ($ext -in '.xlsx','.xlsm' -and $zipOk) {
+                $zip = [System.IO.Compression.ZipFile]::OpenRead($item.FullName)
+                try {
+                    $conn = $zip.Entries | Where-Object { $_.FullName -match '^xl/(connections\.xml|externalLinks/.*\.xml(\.rels)?|externalLinks/_rels/.*)$' }
+                    foreach ($e in $conn) {
+                        $sr = New-Object System.IO.StreamReader($e.Open())
+                        $txt = $sr.ReadToEnd(); $sr.Close()
+                        if ($txt -match 'timberline|sage') { Add-Hit $item 'Excel data link' "Connection in $($e.FullName) references Sage/Timberline"; break }
+                    }
+                } finally { $zip.Dispose() }
+            } elseif ($ext -in '.xls','.xlsb') {
+                $bytes = [System.IO.File]::ReadAllBytes($item.FullName)
+                $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+                $uni   = [System.Text.Encoding]::Unicode.GetString($bytes)
+                if ($ascii -match 'Timberline' -or $uni -match 'Timberline') { Add-Hit $item 'Excel data link' 'Workbook contains "Timberline" (likely ODBC query)' }
+            }
+        } catch { }
+    }
+
+    if ($item.Name -match $namePattern) { Add-Hit $item 'File name' 'File name mentions Sage/Timberline' }
+}
+Write-Progress -Activity "Checking items" -Completed
+
+$stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
+$report = Join-Path $OutputFolder "SageDependencyScan-$stamp.csv"
+$results | Sort-Object Reason, FullPath | Export-Csv -Path $report -NoTypeInformation -Encoding UTF8
+
+Write-Host ""
+Write-Host "Scanned $total items under $Path" -ForegroundColor Cyan
+if ($results.Count -eq 0) {
+    Write-Host "No Sage/Timberline dependencies found." -ForegroundColor Green
+} else {
+    Write-Host "$($results.Count) item(s) flagged:" -ForegroundColor Yellow
+    $results | Group-Object Reason | Sort-Object Count -Descending | ForEach-Object { Write-Host ("  {0,-22} {1}" -f $_.Name, $_.Count) }
+    Write-Host ""
+    $results | Sort-Object Reason | Select-Object -First 25 Reason, FullPath | Format-Table -AutoSize -Wrap | Out-String -Width 220 | Write-Host
+    if ($results.Count -gt 25) { Write-Host "(first 25 shown - see the CSV for all)" }
+}
+if ($scanErrors.Count -gt 0) { Write-Host "$($scanErrors.Count) path(s) could not be read (access denied or too long) - run as an admin to cover everything." -ForegroundColor DarkYellow }
+Write-Host "Report: $report" -ForegroundColor Cyan
 '@
 #endregion
 
