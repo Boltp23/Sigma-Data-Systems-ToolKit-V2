@@ -2,7 +2,7 @@
 
 *Prepared by [Sigma Data Systems Inc.](https://sigmadatainc.com/)*
 
-<!-- AUTO-VERSION -->**Current version: v2.0.1** | 140 options | updated 2026-10-16<!-- /AUTO-VERSION -->
+<!-- AUTO-VERSION -->**Current version: v2.0.2** | 140 options | updated 2026-10-20<!-- /AUTO-VERSION -->
 
 ```
   _____ _____ _____ __  __            _____       _______
@@ -110,7 +110,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 ## All options
 
 <!-- AUTO-OPTIONS:START -->
-<details><summary><b>Quick index of all 140 options</b> (auto-generated from the script, 2026-10-16)</summary>
+<details><summary><b>Quick index of all 140 options</b> (auto-generated from the script, 2026-10-20)</summary>
 
 **A. SYSTEM HEALTH**
 
@@ -190,7 +190,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 56. Active Directory / DC health (dcdiag, repadmin, FSMO, SYSVOL/DFSR)
 57. Group Policy audit (HTML + CSV)
 58. Group Policy results for this machine (gpresult HTML + GP errors)
-59. AD users - true last logon (all DCs)
+59. AD user security audit (last logon all DCs, password age, stale/risky, privileged)
 60. Export BitLocker recovery keys from AD
 61. Export LAPS passwords from AD (legacy + Windows LAPS)
 62. Azure AD / Entra Connect Sync (ADSync) status + self-heal
@@ -376,7 +376,7 @@ Legend: **[!]** = changes the machine (asks first) | **slow** = can take several
 | 51 | Active Directory / DC health | dcdiag, repadmin, FSMO, SYSVOL / DFSR |
 | 52 | Group Policy audit | HTML + CSV |
 | 53 | Group Policy results for this machine | gpresult HTML + Group Policy errors |
-| 54 | AD users - true last logon | Queries every DC. slow |
+| 54 | AD user security audit | True last logon from every DC, password last set / age / expiry, never-used and stale accounts, password-never-expires, privileged group members (nested), Kerberoastable / AS-REP roastable / delegation flags, password + lockout policy, krbtgt age, stale and end-of-life computers. HTML report + CSVs in `C:\temp\AD\ADUserAudit_<date>`. Read-only |
 | 55 | Export BitLocker recovery keys from AD | **Secret output - handle securely** |
 | 56 | Export LAPS passwords from AD (legacy + Windows LAPS) | **Secret output - handle securely** |
 | 57 | Azure AD / Entra Connect Sync (ADSync) status | Offers to restart the service if it's stopped |
@@ -689,6 +689,9 @@ SigmaDataSystems-ToolKit-v2.ps1
 ---
 
 ## Changelog
+
+### v2.0.2 (2026-10)
+- **AD user security audit (option 54)** replaces the basic "AD users - true last logon" option. It reads `lastLogon` from every DC in one bulk query per DC (much faster than the old per-user loop) and reports password last set / age / expiry, never-used and stale accounts, password-never-expires and password-not-required, privileged group members (nested, by well-known SID so it works in any language), Kerberoastable SPNs, AS-REP roastable accounts, unconstrained delegation, reversible encryption, DES-only, SID history and orphaned adminCount. Domain checks: default and fine-grained password / lockout policy, krbtgt password age, stale and end-of-life computer accounts. Output: a sortable HTML report plus CSVs. Read-only. Option numbers are unchanged.
 
 ### v2.0.1 (2026-10)
 - **RAM audit (option 6)** and **RAM optimizer / business-safe debloat (options 86-87)**. See *RAM audit and RAM optimizer* above. Options after 5 moved down by one, and options after 85 moved down by two more.

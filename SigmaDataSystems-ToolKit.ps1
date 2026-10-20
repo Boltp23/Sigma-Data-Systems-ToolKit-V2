@@ -33,6 +33,10 @@
     report to C:\temp\SelfTest. Add -IncludeSlow and/or -IncludeDownloads for full coverage.
 
 .NOTES
+    v2.0.2 - AD user security audit (replaces the basic last-logon option): true last logon from every DC,
+    password last set / age / expiry, never-used and stale accounts, privileged group members (nested),
+    Kerberoastable / AS-REP roastable / delegation / reversible-encryption flags, password + lockout policy,
+    krbtgt age, stale and end-of-life computers. HTML report + CSVs.
     v2.0.1 - adds: RAM audit + RAM optimizer / business-safe debloat (Optimize-WindowsMemory: real memory
     pressure, agent stack, bloat, Widgets/Copilot/Recall, Edge/Chrome memory policies; preview + undo).
     Fixes: Office install (ODT) crashed on workstations (Get-WindowsFeature is Server-only).
@@ -67,7 +71,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$Script:ToolkitVersion = '2.0.1'
+$Script:ToolkitVersion = '2.0.2'
 $Script:Auto = [bool]$SelfTest
 $Script:LastToolExit = $null
 $Script:OutRoot  = $OutputRoot
@@ -831,31 +835,20 @@ function Invoke-GPOAudit {
 }
 
 function Invoke-ADLastLogon {
-    Write-Title 'AD users - true last logon (queries every DC)'
+    Write-Title 'AD user security audit - last logon (all DCs), password age, stale & risky accounts'
     if (-not (Test-Module 'ActiveDirectory')) { return }
-    Import-Module ActiveDirectory
-    $dcs   = @(Get-ADDomainController -Filter * | Select-Object -ExpandProperty HostName)
-    $users = @(Get-ADUser -Filter 'Enabled -eq $true' -Properties LastLogonTimestamp)
-    Write-Host "  $($users.Count) enabled users x $($dcs.Count) DC(s)..." -ForegroundColor DarkGray
-    $i = 0
-    $rows = foreach ($u in $users) {
-        $i++; Write-Progress -Activity 'Querying last logon' -Status $u.SamAccountName -PercentComplete (($i / $users.Count) * 100)
-        $t = [int64]$u.LastLogonTimestamp
-        foreach ($dc in $dcs) {
-            $l = (Get-ADUser $u.SamAccountName -Server $dc -Properties lastLogon -ErrorAction SilentlyContinue).lastLogon
-            if ([int64]$l -gt $t) { $t = [int64]$l }
-        }
-        [pscustomobject]@{
-            Name           = $u.Name
-            SamAccountName = $u.SamAccountName
-            LastLogon      = if ($t -gt 0) { [DateTime]::FromFileTime($t).ToString('yyyy-MM-dd HH:mm') } else { 'Never' }
-        }
+    Write-Host '  Read-only. Reports true last logon (every DC), password last set / age / expiry, never-used and'
+    Write-Host '  stale accounts, password-never-expires, privileged group members, Kerberoastable / AS-REP roastable'
+    Write-Host '  accounts, delegation, domain password + lockout policy, krbtgt age and stale computers.'
+    $stale = Read-Int 'Flag enabled accounts with no logon in how many days' 90
+    $pwAge = Read-Int 'Flag passwords older than how many days' 365
+    $base  = Read-Default 'Limit to OU distinguished name (blank = whole domain)' ''
+    $fast  = Read-YesNo 'Fast mode (skip querying every DC - for very large domains)?' $false
+    Invoke-Tool 'Get-ADUserSecurityAudit' ([ordered]@{ OutputPath = (Get-OutDir 'AD'); StaleDays = $stale; PasswordAgeDays = $pwAge; SearchBase = $base; FastMode = $fast }) | Out-Null
+    if (-not $Script:Auto) {
+        $last = Get-ChildItem -Path (Get-OutDir 'AD') -Directory -Filter 'ADUserAudit_*' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($last -and (Test-Path (Join-Path $last.FullName 'ADUserAudit_Report.html')) -and (Read-YesNo 'Open the HTML report now?' $true)) { Start-Process (Join-Path $last.FullName 'ADUserAudit_Report.html') }
     }
-    Write-Progress -Activity 'Querying last logon' -Completed
-    $out = Join-Path (Get-OutDir 'AD') "ADUsersLastLogon_$(Get-Stamp).csv"
-    $rows | Sort-Object LastLogon | Export-Csv -Path $out -NoTypeInformation
-    $rows | Sort-Object LastLogon | Select-Object -First 25 | Format-Table -AutoSize
-    Write-Host "  Full list ($($rows.Count) users) saved to $out" -ForegroundColor Green
 }
 
 function Invoke-BitLockerExport {
@@ -4015,7 +4008,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'Active Directory / DC health (dcdiag, repadmin, FSMO, SYSVOL/DFSR)';            Action = { Invoke-ADHealth } }
     @{ Test='safe'; Text = 'Group Policy audit (HTML + CSV)';                                               Action = { Invoke-GPOAudit } }
     @{ Test='safe'; Text = 'Group Policy results for this machine (gpresult HTML + GP errors)';             Action = { Invoke-GPResult } }
-    @{ Test='slow'; Text = 'AD users - true last logon (all DCs)';                                          Action = { Invoke-ADLastLogon } }
+    @{ Test='safe'; Text = 'AD user security audit (last logon all DCs, password age, stale/risky, privileged)'; Action = { Invoke-ADLastLogon } }
     @{               Text = 'Export BitLocker recovery keys from AD';                                        Action = { Invoke-BitLockerExport } }
     @{               Text = 'Export LAPS passwords from AD (legacy + Windows LAPS)';                         Action = { Invoke-LAPSExport } }
     @{ Test='safe'; Text = 'Azure AD / Entra Connect Sync (ADSync) status + self-heal';                     Action = { Invoke-ADSyncStatus } }
@@ -7225,6 +7218,514 @@ if ($pf) {
 Write-Host "`nDone. A dump will be written to %SystemRoot%\MEMORY.DMP (and referenced in"
 Write-Host "%SystemRoot%\Minidump) on the *next* crash. This does not retroactively"
 Write-Host "recover data from past crashes - only future ones from this point forward."
+'@
+
+# ======================= Get-ADUserSecurityAudit.ps1 =======================
+$Script:Payloads['Get-ADUserSecurityAudit'] = @'
+<#
+.SYNOPSIS
+    Active Directory user security audit - true last logon (every DC), password age,
+    stale / never-used accounts, risky account settings and privileged access.
+
+.DESCRIPTION
+    Prepared by Sigma Data Systems Inc. - https://sigmadatainc.com/
+
+    Read-only. Nothing in Active Directory is changed.
+
+    For every user account it reports:
+      - True last logon: the newest lastLogon from EVERY domain controller (lastLogon is
+        not replicated), plus the replicated lastLogonTimestamp, and which DC saw it.
+      - Password last set / password age / when it expires / never-expires / not-required.
+      - Last bad password attempt and bad password count (newest across all DCs), lock-out.
+      - Created date, account expiry, OU, title, department, email.
+      - Privileged group membership (nested membership included).
+      - Risky settings: Kerberoastable SPN, AS-REP roastable (no pre-auth), reversible
+        encryption, DES-only, unconstrained delegation, SID history, orphaned adminCount,
+        privileged accounts not marked "sensitive and cannot be delegated".
+    Each account gets a list of findings and a risk level (High / Medium / Low / OK).
+
+    Domain-level checks: default password + lockout policy, fine-grained password
+    policies, krbtgt password age, privileged group members, stale computer accounts.
+
+    Output (one time-stamped folder):
+      ADUserAudit_Report.html   - client-ready report (summary, findings, privileged, all users)
+      AllUsers.csv              - every user with every column (open in Excel)
+      Findings.csv              - one row per account per finding
+      PrivilegedMembers.csv     - members of each privileged group
+      StaleComputers.csv        - enabled computers with no logon in -StaleDays
+      DomainPolicy.csv          - default + fine-grained password policies
+
+.PARAMETER OutputPath
+    Folder for the report. A time-stamped subfolder is created inside it.
+
+.PARAMETER StaleDays
+    An enabled account with no logon for this many days is "stale". Default 90.
+
+.PARAMETER PasswordAgeDays
+    An enabled account whose password is older than this is flagged. Default 365.
+
+.PARAMETER NewAccountGraceDays
+    "Never logged on" is only flagged for accounts older than this. Default 14.
+
+.PARAMETER SearchBase
+    Limit the user audit to one OU (distinguished name). Blank = whole domain.
+
+.PARAMETER Server
+    Domain / DC to query. Blank = the domain of this machine.
+
+.PARAMETER FastMode
+    Skip querying every DC; use only the replicated lastLogonTimestamp (can be up to
+    ~14 days behind). Use on very large domains or when DCs are slow/unreachable.
+
+.PARAMETER SkipComputers
+    Skip the stale computer account check.
+
+.EXAMPLE
+    .\Get-ADUserSecurityAudit.ps1
+.EXAMPLE
+    .\Get-ADUserSecurityAudit.ps1 -StaleDays 60 -PasswordAgeDays 180 -OutputPath D:\Reports
+#>
+[CmdletBinding()]
+param(
+    [string]$OutputPath = 'C:\temp\AD',
+    [int]$StaleDays = 90,
+    [int]$PasswordAgeDays = 365,
+    [int]$NewAccountGraceDays = 14,
+    [string]$SearchBase = '',
+    [string]$Server = '',
+    [switch]$FastMode,
+    [switch]$SkipComputers
+)
+
+$ErrorActionPreference = 'Continue'
+
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    Write-Host 'The ActiveDirectory PowerShell module is not installed.' -ForegroundColor Red
+    Write-Host 'Run this on a domain controller, or install RSAT: Active Directory DS tools.' -ForegroundColor Yellow
+    exit 1
+}
+Import-Module ActiveDirectory -ErrorAction Stop
+
+$now   = Get-Date
+$stamp = $now.ToString('yyyyMMdd_HHmmss')
+$dir   = Join-Path $OutputPath "ADUserAudit_$stamp"
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+$srv = @{}
+if ($Server) { $srv['Server'] = $Server }
+
+function Write-Step([string]$t) { Write-Host "  $t" -ForegroundColor Cyan }
+
+function Convert-FileTime($v) {
+    $n = [int64]0
+    if ($null -eq $v) { return $null }
+    if (-not [int64]::TryParse("$v", [ref]$n)) { return $null }
+    if ($n -le 0 -or $n -ge 9223372036854775807) { return $null }
+    try { return [DateTime]::FromFileTime($n) } catch { return $null }
+}
+
+function Get-DaysSince($d) { if ($d) { return [int][math]::Floor(($now - $d).TotalDays) } else { return $null } }
+
+function Format-D($d) { if ($d) { return $d.ToString('yyyy-MM-dd HH:mm') } else { return '' } }
+
+function HtmlEnc([string]$s) { return [System.Net.WebUtility]::HtmlEncode("$s") }
+
+# ------------------------------------------------------------------ domain
+Write-Step 'Reading domain and domain controllers...'
+try { $domain = Get-ADDomain @srv -ErrorAction Stop }
+catch { Write-Host "  Could not contact the domain: $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
+$forest = $null
+try { $forest = Get-ADForest @srv -ErrorAction Stop } catch { }
+$domainSid = $domain.DomainSID.Value
+$pdc = $domain.PDCEmulator
+if (-not $Server) { $srv['Server'] = $pdc }
+
+$dcs = @()
+try { $dcs = @(Get-ADDomainController -Filter * -Server $domain.DNSRoot -ErrorAction Stop | Sort-Object HostName) }
+catch { Write-Host "  Could not list domain controllers: $($_.Exception.Message)" -ForegroundColor Yellow }
+Write-Host "  Domain: $($domain.DNSRoot)   DCs: $($dcs.Count)   PDC: $pdc" -ForegroundColor DarkGray
+
+# ------------------------------------------------------------------ policies
+Write-Step 'Reading password and lockout policies...'
+$policyRows = @()
+$ddp = $null
+try {
+    $ddp = Get-ADDefaultDomainPasswordPolicy @srv -ErrorAction Stop
+    $policyRows += [pscustomobject]@{
+        Policy = 'Default Domain Policy'; AppliesTo = 'All users (unless a fine-grained policy applies)'; Precedence = ''
+        MinPasswordLength = $ddp.MinPasswordLength; ComplexityEnabled = $ddp.ComplexityEnabled
+        MaxPasswordAgeDays = [int]$ddp.MaxPasswordAge.TotalDays; MinPasswordAgeDays = [int]$ddp.MinPasswordAge.TotalDays
+        PasswordHistoryCount = $ddp.PasswordHistoryCount; ReversibleEncryption = $ddp.ReversibleEncryptionEnabled
+        LockoutThreshold = $ddp.LockoutThreshold; LockoutDurationMin = [int]$ddp.LockoutDuration.TotalMinutes
+        LockoutWindowMin = [int]$ddp.LockoutObservationWindow.TotalMinutes
+    }
+} catch { Write-Host "  Default password policy not readable: $($_.Exception.Message)" -ForegroundColor Yellow }
+try {
+    foreach ($fg in @(Get-ADFineGrainedPasswordPolicy -Filter * @srv -ErrorAction Stop)) {
+        $policyRows += [pscustomobject]@{
+            Policy = "FGPP: $($fg.Name)"; AppliesTo = (($fg.AppliesTo | ForEach-Object { ($_ -split ',')[0] -replace '^CN=' }) -join '; '); Precedence = $fg.Precedence
+            MinPasswordLength = $fg.MinPasswordLength; ComplexityEnabled = $fg.ComplexityEnabled
+            MaxPasswordAgeDays = [int]$fg.MaxPasswordAge.TotalDays; MinPasswordAgeDays = [int]$fg.MinPasswordAge.TotalDays
+            PasswordHistoryCount = $fg.PasswordHistoryCount; ReversibleEncryption = $fg.ReversibleEncryptionEnabled
+            LockoutThreshold = $fg.LockoutThreshold; LockoutDurationMin = [int]$fg.LockoutDuration.TotalMinutes
+            LockoutWindowMin = [int]$fg.LockoutObservationWindow.TotalMinutes
+        }
+    }
+} catch { }
+$policyRows | Export-Csv (Join-Path $dir 'DomainPolicy.csv') -NoTypeInformation
+
+$domainFindings = New-Object System.Collections.ArrayList
+function Add-DomainFinding([string]$Level, [string]$Text) { [void]$domainFindings.Add([pscustomobject]@{ Risk = $Level; Finding = $Text }) }
+if ($ddp) {
+    if ($ddp.MinPasswordLength -lt 12) { Add-DomainFinding 'High' "Minimum password length is $($ddp.MinPasswordLength) (recommend 14+, or 12+ with MFA)." }
+    if (-not $ddp.ComplexityEnabled)   { Add-DomainFinding 'Medium' 'Password complexity is disabled in the Default Domain Policy.' }
+    if ($ddp.LockoutThreshold -eq 0)   { Add-DomainFinding 'High' 'Account lockout is OFF (threshold 0) - unlimited password guessing is allowed.' }
+    elseif ($ddp.LockoutThreshold -gt 10) { Add-DomainFinding 'Medium' "Account lockout threshold is $($ddp.LockoutThreshold) bad attempts (recommend 5-10)." }
+    if ($ddp.PasswordHistoryCount -lt 12) { Add-DomainFinding 'Low' "Password history remembers $($ddp.PasswordHistoryCount) passwords (recommend 24)." }
+    if ($ddp.ReversibleEncryptionEnabled) { Add-DomainFinding 'High' 'Store passwords using reversible encryption is ENABLED domain-wide.' }
+    if ($ddp.MaxPasswordAge.TotalDays -eq 0) { Add-DomainFinding 'Low' 'Passwords never expire by policy (acceptable only with long passwords + MFA + breached-password screening).' }
+}
+
+# krbtgt
+try {
+    $krb = Get-ADUser krbtgt -Properties PasswordLastSet @srv -ErrorAction Stop
+    $krbAge = Get-DaysSince $krb.PasswordLastSet
+    if ($krbAge -gt 180) { Add-DomainFinding 'Medium' "krbtgt password last changed $krbAge days ago ($(Format-D $krb.PasswordLastSet)). Recommend rotating twice, 10+ hours apart, at least every 180 days." }
+} catch { }
+
+# ------------------------------------------------------------------ privileged groups
+Write-Step 'Resolving privileged groups (nested membership)...'
+$rootDomainSid = $domainSid
+$rootServer = $srv['Server']
+if ($forest -and $forest.RootDomain -ne $domain.DNSRoot) {
+    try { $rd = Get-ADDomain -Identity $forest.RootDomain -Server $forest.RootDomain -ErrorAction Stop; $rootDomainSid = $rd.DomainSID.Value; $rootServer = $rd.PDCEmulator } catch { }
+}
+$privDefs = @(
+    @{ Sid = "$domainSid-512";      Srv = $srv['Server'] }   # Domain Admins
+    @{ Sid = "$rootDomainSid-519";  Srv = $rootServer }      # Enterprise Admins
+    @{ Sid = "$rootDomainSid-518";  Srv = $rootServer }      # Schema Admins
+    @{ Sid = 'S-1-5-32-544';        Srv = $srv['Server'] }   # Administrators
+    @{ Sid = 'S-1-5-32-548';        Srv = $srv['Server'] }   # Account Operators
+    @{ Sid = 'S-1-5-32-549';        Srv = $srv['Server'] }   # Server Operators
+    @{ Sid = 'S-1-5-32-550';        Srv = $srv['Server'] }   # Print Operators
+    @{ Sid = 'S-1-5-32-551';        Srv = $srv['Server'] }   # Backup Operators
+    @{ Sid = "$domainSid-520";      Srv = $srv['Server'] }   # Group Policy Creator Owners
+    @{ Sid = "$domainSid-526";      Srv = $srv['Server'] }   # Key Admins
+    @{ Sid = "$rootDomainSid-527";  Srv = $rootServer }      # Enterprise Key Admins
+)
+$privGroups = @()
+foreach ($p in $privDefs) {
+    try { $privGroups += Get-ADGroup -Identity $p.Sid -Server $p.Srv -ErrorAction Stop } catch { }
+}
+try { $privGroups += Get-ADGroup -Identity 'DnsAdmins' @srv -ErrorAction Stop } catch { }
+
+$privMap = @{}       # user DN -> list of privileged group names
+$privRows = New-Object System.Collections.ArrayList
+foreach ($g in $privGroups) {
+    $gServer = if ($g.DistinguishedName -like "*$($domain.DistinguishedName)") { $srv['Server'] } else { $rootServer }
+    try {
+        # LDAP_MATCHING_RULE_IN_CHAIN = recursive membership, works across nested groups
+        $members = @(Get-ADUser -LDAPFilter "(memberOf:1.2.840.113556.1.4.1941:=$($g.DistinguishedName))" -Server $gServer -Properties Enabled -ErrorAction Stop)
+    } catch { $members = @() }
+    foreach ($m in $members) {
+        if (-not $privMap.ContainsKey($m.DistinguishedName)) { $privMap[$m.DistinguishedName] = New-Object System.Collections.ArrayList }
+        [void]$privMap[$m.DistinguishedName].Add($g.Name)
+        [void]$privRows.Add([pscustomobject]@{ Group = $g.Name; SamAccountName = $m.SamAccountName; Name = $m.Name; Enabled = $m.Enabled; DistinguishedName = $m.DistinguishedName })
+    }
+}
+$privRows | Sort-Object Group, SamAccountName | Export-Csv (Join-Path $dir 'PrivilegedMembers.csv') -NoTypeInformation
+
+# ------------------------------------------------------------------ users
+Write-Step 'Reading user accounts...'
+$props = @('DisplayName','UserPrincipalName','Description','Title','Department','mail','whenCreated','LastLogonTimestamp',
+           'pwdLastSet','PasswordLastSet','PasswordNeverExpires','PasswordNotRequired','PasswordExpired','CannotChangePassword',
+           'AllowReversiblePasswordEncryption','DoesNotRequirePreAuth','TrustedForDelegation','TrustedToAuthForDelegation',
+           'UseDESKeyOnly','ServicePrincipalName','adminCount','SIDHistory','LockedOut','AccountExpirationDate',
+           'msDS-UserPasswordExpiryTimeComputed','AccountNotDelegated','SmartcardLogonRequired','badPwdCount','badPasswordTime','lastLogon')
+$ua = @{ Filter = '*'; Properties = $props; ErrorAction = 'Stop' } + $srv
+if ($SearchBase) { $ua['SearchBase'] = $SearchBase }
+try { $users = @(Get-ADUser @ua) }
+catch { Write-Host "  Could not read users: $($_.Exception.Message)" -ForegroundColor Red; exit 1 }
+Write-Host "  $($users.Count) user accounts." -ForegroundColor DarkGray
+
+# lastLogon / badPasswordTime / badPwdCount are NOT replicated - read them from every DC (one bulk query per DC)
+$perDc = @{}   # SID -> @{ LastLogon; LastLogonDC; BadTime; BadCount }
+$dcErrors = @()
+if (-not $FastMode -and $dcs.Count -gt 0) {
+    $i = 0
+    foreach ($dc in $dcs) {
+        $i++
+        Write-Progress -Activity 'Reading lastLogon from every domain controller' -Status $dc.HostName -PercentComplete (($i / $dcs.Count) * 100)
+        $q = @{ Filter = '*'; Properties = @('lastLogon','badPasswordTime','badPwdCount'); Server = $dc.HostName; ErrorAction = 'Stop' }
+        if ($SearchBase) { $q['SearchBase'] = $SearchBase }
+        try {
+            foreach ($u in (Get-ADUser @q)) {
+                $sid = $u.SID.Value
+                if (-not $perDc.ContainsKey($sid)) { $perDc[$sid] = @{ LastLogon = [int64]0; LastLogonDC = ''; BadTime = [int64]0; BadCount = 0 } }
+                $e = $perDc[$sid]
+                $ll = [int64]0; [void][int64]::TryParse("$($u.lastLogon)", [ref]$ll)
+                if ($ll -gt $e.LastLogon) { $e.LastLogon = $ll; $e.LastLogonDC = $dc.HostName }
+                $bt = [int64]0; [void][int64]::TryParse("$($u.badPasswordTime)", [ref]$bt)
+                if ($bt -gt $e.BadTime) { $e.BadTime = $bt }
+                if ([int]$u.badPwdCount -gt $e.BadCount) { $e.BadCount = [int]$u.badPwdCount }
+            }
+        } catch {
+            $dcErrors += $dc.HostName
+            Write-Host "  DC $($dc.HostName) did not answer: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+    Write-Progress -Activity 'Reading lastLogon from every domain controller' -Completed
+}
+if ($dcErrors.Count) { Add-DomainFinding 'Low' "DC(s) not reachable during the audit: $($dcErrors -join ', '). Last logon times may be understated." }
+if ($FastMode) { Add-DomainFinding 'Low' 'Fast mode: last logon uses the replicated lastLogonTimestamp only (can lag up to ~14 days).' }
+
+Write-Step 'Analysing accounts...'
+$rows = New-Object System.Collections.ArrayList
+$findRows = New-Object System.Collections.ArrayList
+$rank = @{ 'High' = 3; 'Medium' = 2; 'Low' = 1; 'OK' = 0 }
+
+foreach ($u in $users) {
+    $sid = $u.SID.Value
+    $f = New-Object System.Collections.ArrayList
+    $add = { param($lvl, $txt) [void]$f.Add([pscustomobject]@{ L = $lvl; T = $txt }) }
+
+    # true last logon = newest of replicated lastLogonTimestamp and every DC's lastLogon
+    $best = [int64]0; [void][int64]::TryParse("$($u.LastLogonTimestamp)", [ref]$best)
+    $bestDc = if ($best -gt 0) { '(replicated)' } else { '' }
+    $own = [int64]0; [void][int64]::TryParse("$($u.lastLogon)", [ref]$own)
+    if ($own -gt $best) { $best = $own; $bestDc = $srv['Server'] }
+    $badT = [int64]0; [void][int64]::TryParse("$($u.badPasswordTime)", [ref]$badT)
+    $badC = [int]$u.badPwdCount
+    if ($perDc.ContainsKey($sid)) {
+        $e = $perDc[$sid]
+        if ($e.LastLogon -gt $best) { $best = $e.LastLogon; $bestDc = $e.LastLogonDC }
+        if ($e.BadTime -gt $badT) { $badT = $e.BadTime }
+        if ($e.BadCount -gt $badC) { $badC = $e.BadCount }
+    }
+    $lastLogon  = Convert-FileTime $best
+    $lastBad    = Convert-FileTime $badT
+    $daysLogon  = Get-DaysSince $lastLogon
+    $pwdSet     = $u.PasswordLastSet
+    $pwdAge     = Get-DaysSince $pwdSet
+    $created    = $u.whenCreated
+    $ageDays    = Get-DaysSince $created
+    $pwdExpires = $null
+    if (-not $u.PasswordNeverExpires) { $pwdExpires = Convert-FileTime $u.'msDS-UserPasswordExpiryTimeComputed' }
+    $spns       = @($u.ServicePrincipalName | Where-Object { $_ })
+    $privList   = @()
+    if ($privMap.ContainsKey($u.DistinguishedName)) { $privList = @($privMap[$u.DistinguishedName] | Sort-Object -Unique) }
+    $isPriv     = $privList.Count -gt 0
+    $isBuiltinAdmin = $sid -eq "$domainSid-500"
+    $isGuest    = $sid -eq "$domainSid-501"
+    $isKrbtgt   = $sid -eq "$domainSid-502"
+    $expired    = $u.AccountExpirationDate -and $u.AccountExpirationDate -lt $now
+    $ou         = ($u.DistinguishedName -replace '^CN=.+?(?<!\\),', '')
+
+    if (-not $isKrbtgt) {
+        if ($u.Enabled) {
+            if (-not $lastLogon) {
+                if ($ageDays -ge $NewAccountGraceDays) { & $add ($(if ($isPriv) { 'High' } else { 'Medium' })) "Enabled but has NEVER logged on (created $ageDays days ago)" }
+            } elseif ($daysLogon -ge $StaleDays) {
+                & $add ($(if ($isPriv) { 'High' } else { 'Medium' })) "Stale: enabled, no logon for $daysLogon days"
+            }
+            if ($pwdSet -and $pwdAge -ge $PasswordAgeDays) {
+                & $add ($(if ($isPriv -or $u.PasswordNeverExpires) { 'High' } else { 'Medium' })) "Password is $pwdAge days old"
+            }
+            if (-not $pwdSet) { & $add 'Low' 'Password never set / must change at next logon' }
+            if ($u.PasswordNeverExpires) { & $add ($(if ($isPriv) { 'High' } else { 'Medium' })) 'Password never expires' }
+            if ($u.PasswordNotRequired) { & $add 'High' 'Password NOT required (PASSWD_NOTREQD) - account may have a blank password' }
+            if ($u.AllowReversiblePasswordEncryption) { & $add 'High' 'Password stored with reversible encryption' }
+            if ($u.DoesNotRequirePreAuth) { & $add 'High' 'Kerberos pre-auth disabled (AS-REP roastable)' }
+            if ($u.UseDESKeyOnly) { & $add 'High' 'Uses DES-only Kerberos encryption' }
+            if ($u.TrustedForDelegation) { & $add 'High' 'Trusted for UNCONSTRAINED delegation' }
+            elseif ($u.TrustedToAuthForDelegation) { & $add 'Medium' 'Trusted to authenticate for delegation (protocol transition)' }
+            if ($spns.Count -gt 0) { & $add ($(if ($isPriv) { 'High' } else { 'Medium' })) "Has SPN(s) - Kerberoastable: $($spns -join ', ')" }
+            if ($isPriv -and -not $u.AccountNotDelegated) { & $add 'Low' 'Privileged account not marked "sensitive and cannot be delegated"' }
+            if ($isPriv) { & $add 'Low' ("Privileged: " + ($privList -join ', ')) }
+            if ($isBuiltinAdmin) { & $add 'Medium' 'Built-in Administrator (RID 500) is enabled - rename/disable and use named admin accounts' }
+            if ($isGuest) { & $add 'High' 'Guest account is ENABLED' }
+            if ($expired) { & $add 'Low' "Account expired on $(Format-D $u.AccountExpirationDate) but is still enabled" }
+            if ($u.LockedOut) { & $add 'Low' 'Currently locked out' }
+            if ($lastBad -and (Get-DaysSince $lastBad) -le 7 -and $badC -ge 3) { & $add 'Medium' "$badC bad password attempts, last on $(Format-D $lastBad)" }
+        } else {
+            if ($isPriv) { & $add 'Medium' ("Disabled but still in privileged group(s): " + ($privList -join ', ')) }
+        }
+        if (@($u.SIDHistory).Count -gt 0 -and $u.SIDHistory[0]) { & $add 'Medium' 'Has SID history (leftover from migration - can grant hidden access)' }
+        if ([int]$u.adminCount -eq 1 -and -not $isPriv -and -not $isBuiltinAdmin) { & $add 'Low' 'adminCount=1 but no longer privileged (orphaned - ACL inheritance still blocked)' }
+    }
+
+    $risk = 'OK'
+    foreach ($x in $f) { if ($rank[$x.L] -gt $rank[$risk]) { $risk = $x.L } }
+    foreach ($x in $f) {
+        [void]$findRows.Add([pscustomobject]@{ Risk = $x.L; SamAccountName = $u.SamAccountName; Name = $u.Name; Enabled = $u.Enabled; Finding = $x.T; LastLogon = (Format-D $lastLogon); PasswordLastSet = (Format-D $pwdSet); OU = $ou })
+    }
+
+    [void]$rows.Add([pscustomobject][ordered]@{
+        Risk                    = $risk
+        Name                    = $u.Name
+        SamAccountName          = $u.SamAccountName
+        UserPrincipalName       = $u.UserPrincipalName
+        Enabled                 = $u.Enabled
+        Privileged              = $isPriv
+        PrivilegedGroups        = ($privList -join '; ')
+        LastLogon               = (Format-D $lastLogon)
+        DaysSinceLastLogon      = $daysLogon
+        LastLogonSeenOn         = $bestDc
+        LastLogonTimestampRepl  = (Format-D (Convert-FileTime $u.LastLogonTimestamp))
+        PasswordLastSet         = (Format-D $pwdSet)
+        PasswordAgeDays         = $pwdAge
+        PasswordExpires         = $(if ($u.PasswordNeverExpires) { 'Never' } else { Format-D $pwdExpires })
+        PasswordExpired         = $u.PasswordExpired
+        PasswordNeverExpires    = $u.PasswordNeverExpires
+        PasswordNotRequired     = $u.PasswordNotRequired
+        CannotChangePassword    = $u.CannotChangePassword
+        LockedOut               = $u.LockedOut
+        BadPasswordCount        = $badC
+        LastBadPassword         = (Format-D $lastBad)
+        Created                 = (Format-D $created)
+        AccountExpires          = (Format-D $u.AccountExpirationDate)
+        SmartcardRequired       = $u.SmartcardLogonRequired
+        KerberoastableSPN       = ($spns -join '; ')
+        NoKerberosPreAuth       = $u.DoesNotRequirePreAuth
+        ReversibleEncryption    = $u.AllowReversiblePasswordEncryption
+        UnconstrainedDelegation = $u.TrustedForDelegation
+        SensitiveNoDelegation   = $u.AccountNotDelegated
+        AdminCount              = $u.adminCount
+        Findings                = (($f | ForEach-Object { "[$($_.L)] $($_.T)" }) -join ' | ')
+        Title                   = $u.Title
+        Department              = $u.Department
+        Email                   = $u.mail
+        Description             = $u.Description
+        OU                      = $ou
+    })
+}
+
+$rowsSorted = @($rows | Sort-Object @{ e = { $rank[$_.Risk] }; Descending = $true }, @{ e = { if ($null -eq $_.DaysSinceLastLogon) { 99999 } else { $_.DaysSinceLastLogon } }; Descending = $true })
+$rowsSorted | Export-Csv (Join-Path $dir 'AllUsers.csv') -NoTypeInformation
+$findSorted = @($findRows | Sort-Object @{ e = { $rank[$_.Risk] }; Descending = $true }, SamAccountName)
+$findSorted | Export-Csv (Join-Path $dir 'Findings.csv') -NoTypeInformation
+
+# ------------------------------------------------------------------ computers
+$staleComputers = @()
+if (-not $SkipComputers) {
+    Write-Step 'Checking computer accounts...'
+    try {
+        $comps = @(Get-ADComputer -Filter 'Enabled -eq $true' -Properties LastLogonTimestamp, OperatingSystem, PasswordLastSet, whenCreated @srv -ErrorAction Stop)
+        $staleComputers = @(foreach ($c in $comps) {
+            $ll = Convert-FileTime $c.LastLogonTimestamp
+            $d = Get-DaysSince $ll
+            if (-not $ll -or $d -ge $StaleDays) {
+                [pscustomobject]@{ Name = $c.Name; OperatingSystem = $c.OperatingSystem; LastLogon = (Format-D $ll); DaysSinceLastLogon = $d
+                                   PasswordLastSet = (Format-D $c.PasswordLastSet); Created = (Format-D $c.whenCreated); OU = ($c.DistinguishedName -replace '^CN=.+?(?<!\\),', '') }
+            }
+        }) | Sort-Object @{ e = { if ($null -eq $_.DaysSinceLastLogon) { 99999 } else { $_.DaysSinceLastLogon } }; Descending = $true }
+        $staleComputers | Export-Csv (Join-Path $dir 'StaleComputers.csv') -NoTypeInformation
+        $eol = @($comps | Where-Object { $_.OperatingSystem -match 'Windows (XP|Vista|7|8)|Server 200[038]|Server 2012' })
+        if ($eol.Count) { Add-DomainFinding 'High' "$($eol.Count) enabled computer account(s) run an end-of-life Windows version (see StaleComputers / AD)." ; $eol | Select-Object Name, OperatingSystem | Export-Csv (Join-Path $dir 'EndOfLifeComputers.csv') -NoTypeInformation }
+    } catch { Write-Host "  Computer check failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+}
+
+# ------------------------------------------------------------------ summary numbers
+$enabled   = @($rows | Where-Object { $_.Enabled })
+$stats = [ordered]@{
+    'Total user accounts'                   = $rows.Count
+    'Enabled'                               = $enabled.Count
+    'Disabled'                              = $rows.Count - $enabled.Count
+    "Enabled, no logon in $StaleDays+ days" = @($enabled | Where-Object { $_.DaysSinceLastLogon -ge $StaleDays }).Count
+    'Enabled, never logged on'              = @($enabled | Where-Object { -not $_.LastLogon }).Count
+    "Password older than $PasswordAgeDays days" = @($enabled | Where-Object { $_.PasswordAgeDays -ge $PasswordAgeDays }).Count
+    'Password never expires'                = @($enabled | Where-Object { $_.PasswordNeverExpires }).Count
+    'Privileged accounts (enabled)'         = @($enabled | Where-Object { $_.Privileged }).Count
+    'Kerberoastable (SPN) users'            = @($enabled | Where-Object { $_.KerberoastableSPN }).Count
+    "Stale computers ($StaleDays+ days)"    = @($staleComputers).Count
+    'High-risk accounts'                    = @($rows | Where-Object { $_.Risk -eq 'High' }).Count
+    'Medium-risk accounts'                  = @($rows | Where-Object { $_.Risk -eq 'Medium' }).Count
+}
+
+# ------------------------------------------------------------------ HTML report
+Write-Step 'Writing HTML report...'
+function To-HtmlTable($data, [string[]]$cols, [string]$id) {
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append("<table id='$id' class='t'><thead><tr>")
+    foreach ($c in $cols) { [void]$sb.Append("<th>$(HtmlEnc $c)</th>") }
+    [void]$sb.Append('</tr></thead><tbody>')
+    foreach ($r in $data) {
+        $cls = ''
+        if ($r.PSObject.Properties['Risk']) { $cls = " class='r-$($r.Risk)'" }
+        [void]$sb.Append("<tr$cls>")
+        foreach ($c in $cols) { [void]$sb.Append("<td>$(HtmlEnc $r.$c)</td>") }
+        [void]$sb.Append('</tr>')
+    }
+    [void]$sb.Append('</tbody></table>')
+    return $sb.ToString()
+}
+
+$cards = ($stats.GetEnumerator() | ForEach-Object { "<div class='card'><div class='n'>$($_.Value)</div><div class='l'>$(HtmlEnc $_.Key)</div></div>" }) -join ''
+$domFind = if ($domainFindings.Count) { To-HtmlTable ($domainFindings | Sort-Object @{ e = { $rank[$_.Risk] }; Descending = $true }) @('Risk','Finding') 'dom' } else { "<p class='ok'>No domain-level issues found.</p>" }
+$polTbl  = if ($policyRows.Count) { To-HtmlTable $policyRows @('Policy','AppliesTo','Precedence','MinPasswordLength','ComplexityEnabled','MaxPasswordAgeDays','PasswordHistoryCount','LockoutThreshold','LockoutDurationMin','ReversibleEncryption') 'pol' } else { '<p>Not readable.</p>' }
+$findTbl = if ($findSorted.Count) { To-HtmlTable ($findSorted | Where-Object { $_.Risk -ne 'Low' -or $_.Finding -notlike 'Privileged:*' }) @('Risk','SamAccountName','Name','Enabled','Finding','LastLogon','PasswordLastSet') 'find' } else { "<p class='ok'>No account findings.</p>" }
+$privTbl = if ($privRows.Count) { To-HtmlTable ($privRows | Sort-Object Group, SamAccountName) @('Group','SamAccountName','Name','Enabled') 'priv' } else { '<p>None found.</p>' }
+$userTbl = To-HtmlTable $rowsSorted @('Risk','Name','SamAccountName','Enabled','Privileged','LastLogon','DaysSinceLastLogon','PasswordLastSet','PasswordAgeDays','PasswordExpires','PasswordNeverExpires','LockedOut','LastBadPassword','Created','Department','Title') 'users'
+$compTbl = if (@($staleComputers).Count) { To-HtmlTable $staleComputers @('Name','OperatingSystem','LastLogon','DaysSinceLastLogon','PasswordLastSet','Created','OU') 'comp' } elseif ($SkipComputers) { '<p>Skipped.</p>' } else { "<p class='ok'>No stale computer accounts.</p>" }
+$scope = if ($SearchBase) { HtmlEnc $SearchBase } else { 'Whole domain' }
+$mode  = if ($FastMode) { 'Fast (replicated lastLogonTimestamp only)' } else { "True last logon - queried $($dcs.Count - $dcErrors.Count) of $($dcs.Count) DC(s)" }
+
+$html = @"
+<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>AD User Security Audit</title>
+<style>
+body{font-family:Segoe UI,Arial,sans-serif;margin:24px;color:#1d2330;background:#fff}
+h1{margin:0 0 4px;font-size:26px}h2{margin:32px 0 8px;font-size:19px;border-bottom:2px solid #e3e7ee;padding-bottom:4px}
+.sub{color:#5b6475;margin:2px 0}.cards{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px}
+.card{border:1px solid #e3e7ee;border-radius:8px;padding:10px 14px;min-width:150px}.card .n{font-size:24px;font-weight:600}.card .l{font-size:12px;color:#5b6475}
+table.t{border-collapse:collapse;width:100%;font-size:12.5px;margin-top:6px}
+.t th{background:#f2f4f8;text-align:left;padding:6px;border-bottom:2px solid #d5dae3;cursor:pointer;position:sticky;top:0}
+.t td{padding:5px 6px;border-bottom:1px solid #edf0f4;vertical-align:top}
+tr.r-High td:first-child{color:#fff;background:#c62828;font-weight:600}tr.r-Medium td:first-child{background:#f9a825;font-weight:600}
+tr.r-Low td:first-child{background:#e3f2fd}tr.r-OK td:first-child{color:#2e7d32}
+.ok{color:#2e7d32}input.f{margin:6px 0;padding:6px;width:280px;max-width:100%}
+.note{font-size:12px;color:#5b6475}.wrap{overflow-x:auto}
+</style></head><body>
+<h1>Active Directory User Security Audit</h1>
+<p class='sub'><b>Prepared by Sigma Data Systems Inc.</b></p>
+<p class='sub'>Domain: <b>$(HtmlEnc $domain.DNSRoot)</b> &nbsp;|&nbsp; Scope: $scope &nbsp;|&nbsp; Generated: $(Format-D $now) on $(HtmlEnc $env:COMPUTERNAME)</p>
+<p class='sub'>Mode: $mode &nbsp;|&nbsp; Stale threshold: $StaleDays days &nbsp;|&nbsp; Password age threshold: $PasswordAgeDays days</p>
+<div class='cards'>$cards</div>
+<h2>Domain-level findings</h2>$domFind
+<h2>Password &amp; lockout policy</h2><div class='wrap'>$polTbl</div>
+<h2>Account findings</h2><p class='note'>One row per issue. "Privileged: ..." info rows are in the privileged section below. Click a column to sort.</p>
+<input class='f' placeholder='Filter findings...' oninput="flt(this,'find')"><div class='wrap'>$findTbl</div>
+<h2>Privileged group members (nested included)</h2><div class='wrap'>$privTbl</div>
+<h2>All users</h2><input class='f' placeholder='Filter users...' oninput="flt(this,'users')"><div class='wrap'>$userTbl</div>
+<h2>Stale computer accounts (no logon in $StaleDays+ days)</h2><div class='wrap'>$compTbl</div>
+<p class='note' style='margin-top:30px'>Last logon is the newest value from every reachable domain controller (lastLogon is not replicated between DCs). Accounts used only by cloud sign-in (Microsoft 365 / Entra ID) or by services may show old on-prem logons - confirm before disabling. Prepared by Sigma Data Systems Inc. - sigmahelpdesk@sigmadatainc.com</p>
+<script>
+function flt(i,id){var q=i.value.toLowerCase();document.querySelectorAll('#'+id+' tbody tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().indexOf(q)>-1?'':'none'})}
+document.querySelectorAll('table.t').forEach(function(t){t.querySelectorAll('th').forEach(function(th,ci){var asc=true;th.onclick=function(){var b=t.tBodies[0];var rs=Array.prototype.slice.call(b.rows);rs.sort(function(a,c){var x=a.cells[ci].textContent,y=c.cells[ci].textContent,nx=parseFloat(x),ny=parseFloat(y);var r=(!isNaN(nx)&&!isNaN(ny))?nx-ny:x.localeCompare(y);return asc?r:-r});asc=!asc;rs.forEach(function(r){b.appendChild(r)})}})})
+</script></body></html>
+"@
+$htmlPath = Join-Path $dir 'ADUserAudit_Report.html'
+[System.IO.File]::WriteAllText($htmlPath, $html, (New-Object System.Text.UTF8Encoding($true)))
+
+# ------------------------------------------------------------------ console summary
+Write-Host ''
+Write-Host '  ===== Summary =====' -ForegroundColor Cyan
+foreach ($k in $stats.Keys) { Write-Host ("  {0,-40} {1}" -f $k, $stats[$k]) }
+if ($domainFindings.Count) {
+    Write-Host "`n  Domain-level findings:" -ForegroundColor Yellow
+    foreach ($d in ($domainFindings | Sort-Object @{ e = { $rank[$_.Risk] }; Descending = $true })) {
+        Write-Host ("  [{0}] {1}" -f $d.Risk, $d.Finding) -ForegroundColor $(if ($d.Risk -eq 'High') { 'Red' } elseif ($d.Risk -eq 'Medium') { 'Yellow' } else { 'Gray' })
+    }
+}
+$top = @($rowsSorted | Where-Object { $_.Risk -in 'High','Medium' } | Select-Object -First 25)
+if ($top.Count) {
+    Write-Host "`n  Top accounts to review:" -ForegroundColor Yellow
+    $top | Format-Table Risk, SamAccountName, Enabled, LastLogon, DaysSinceLastLogon, PasswordLastSet, PasswordAgeDays, PasswordNeverExpires -AutoSize | Out-String -Width 220 | Write-Host
+}
+Write-Host "  Report folder : $dir" -ForegroundColor Green
+Write-Host "  HTML report   : $htmlPath" -ForegroundColor Green
+Write-Host '  The report lists account names and security weaknesses - store and send it securely.' -ForegroundColor Yellow
+exit 0
 '@
 
 # ======================= Export-Bitlockerkeys.ps1 =======================
