@@ -33,6 +33,9 @@
     report to C:\temp\SelfTest. Add -IncludeSlow and/or -IncludeDownloads for full coverage.
 
 .NOTES
+    v2.0.3 - PHP2Shell scan (CVE-2026-109618 / CVE-2026-109619): finds PHP installs on this machine, checks
+    version vs fixed releases, web-served detection, webshell/OOM compromise indicators, optional interim
+    php.ini mitigation; or checks a list of websites from the outside (passive fingerprint).
     v2.0.2 - AD user security audit (replaces the basic last-logon option): true last logon from every DC,
     password last set / age / expiry, never-used and stale accounts, privileged group members (nested),
     Kerberoastable / AS-REP roastable / delegation / reversible-encryption flags, password + lockout policy,
@@ -71,7 +74,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$Script:ToolkitVersion = '2.0.2'
+$Script:ToolkitVersion = '2.0.3'
 $Script:Auto = [bool]$SelfTest
 $Script:LastToolExit = $null
 $Script:OutRoot  = $OutputRoot
@@ -1427,6 +1430,41 @@ function Invoke-ZipBrowserRepair {
             Write-Host '  Windows blocks silent default-browser changes via registry - opening Default Apps for a one-click confirm.' -ForegroundColor Yellow
             Start-Process "ms-settings:defaultapps?registeredAppUser=$regName"
         }
+    }
+}
+
+function Invoke-PHP2ShellScan {
+    Write-Title 'PHP2Shell (CVE-2026-109618 / 109619) - PHP vulnerability scan'
+    Write-Host '  1. Scan THIS machine (find PHP installs, version, web-served?, compromise indicators)'
+    Write-Host '  2. Check a list of WEBSITES from the outside (passive fingerprint, no exploit traffic)'
+    Write-Host '  3. [!] Scan THIS machine + apply interim php.ini mitigation to vulnerable installs'
+    $mode = Read-Default 'Choose 1, 2 or 3' '1'
+    $out  = Get-OutDir 'PHP2Shell'
+    switch ("$mode") {
+        '2' {
+            $file = Read-Default 'Path to a text file of sites (one per line) - blank to type them instead' ''
+            if ($file) {
+                if (-not (Test-Path -LiteralPath $file)) { Write-Host "  File not found: $file" -ForegroundColor Red; return }
+                Invoke-Tool 'Scan-PHP2Shell' ([ordered]@{ UrlFile = $file; OutputDir = $out }) | Out-Null
+            } else {
+                $sites = Read-List 'Websites to check (comma separated, e.g. site1.com, site2.org)' ''
+                if (-not $sites) { Write-Host '  No sites entered.' -ForegroundColor DarkGray; return }
+                Invoke-Tool 'Scan-PHP2Shell' ([ordered]@{ Url = ($sites -join ','); OutputDir = $out }) | Out-Null
+            }
+        }
+        '3' {
+            if (-not (Confirm-Change 'Back up php.ini and set session.upload_progress.enabled = 0 (+ fatal_error_backtraces = 0 on 8.5) on VULNERABLE PHP installs. Partial stop-gap only - upgrade PHP.')) { return }
+            Invoke-Tool 'Scan-PHP2Shell' ([ordered]@{ OutputDir = $out; ApplyInterimMitigation = $true }) | Out-Null
+        }
+        default {
+            $skip = -not (Read-YesNo 'Run the compromise check on web roots/logs (slower)?' $true)
+            Invoke-Tool 'Scan-PHP2Shell' ([ordered]@{ OutputDir = $out; SkipIocCheck = $skip }) | Out-Null
+        }
+    }
+    $codes = @{ 0 = 'clean / patched'; 1 = 'vulnerable PHP present, not serving web'; 2 = 'VULNERABLE + web-facing - PATCH NOW'; 3 = 'review by hand (version hidden/unknown)'; 4 = 'POSSIBLE COMPROMISE - investigate before patching' }
+    if ($codes.ContainsKey([int]$Script:LastToolExit)) {
+        $c = if ($Script:LastToolExit -eq 0) { 'Green' } elseif ($Script:LastToolExit -in 2,4) { 'Red' } else { 'Yellow' }
+        Write-Host ("  Verdict: {0}" -f $codes[[int]$Script:LastToolExit]) -ForegroundColor $c
     }
 }
 
@@ -4027,6 +4065,7 @@ $Script:Menu = @(
     @{ Test='safe'; Text = 'SharePoint/OneDrive migration - find Sage/Timberline/Pervasive dependencies';  Action = { Invoke-SageDependencyScan } }
     @{ Section = 'SECURITY / INCIDENT RESPONSE / RMM' }
     @{ Test='safe'; Text = 'Security posture (AV, firewall, BitLocker, TPM, SMBv1, admins, certs, activation)'; Action = { Invoke-SecurityPosture } }
+    @{               Text = 'PHP2Shell scan (CVE-2026-109618/109619) - this machine or a list of websites';  Action = { Invoke-PHP2ShellScan } }
     @{ Test='net';  Text = 'Sysinternals Autoruns - startup/persistence report (unsigned flagged)';         Action = { Invoke-AutorunsReport } }
     @{ Test='net';  Text = 'Sysinternals Sigcheck - unsigned executables in user/ProgramData folders';      Action = { Invoke-SigcheckScan } }
     @{ Test='safe'; Text = 'N-central compromise IOC hunt';                                                 Action = { Invoke-NCentralHunt } }
@@ -4187,6 +4226,546 @@ function Show-Menu {
 # Stored as readable text - no encoding or compression. Lines that begin with the
 # here-string terminator are prefixed with #SDSI-ESC# and restored when extracted.
 $Script:Payloads = @{}
+
+$Script:Payloads['Scan-PHP2Shell'] = @'
+#Requires -Version 5.1
+<#
+.SYNOPSIS
+    PHP2Shell scanner - finds every PHP install on a Windows machine and flags any
+    vulnerable to CVE-2026-109618 / CVE-2026-109619 ("PHP2Shell").
+
+    Sigma Data Systems INC ToolKit
+    Prepared by Sigma Data Systems Inc.
+
+.DESCRIPTION
+    Universal script - no client or machine-specific values. Safe to run fleet-wide
+    from N-central (Automation Manager / Run Script / Scheduled Task) as SYSTEM.
+    Read-only unless -ApplyInterimMitigation is used.
+
+    What it does:
+      1. Walks all fixed drives for PHP binaries (php.exe, php-cgi.exe, phpNts.dll,
+         phpNapache*.dll) - catches XAMPP/WAMP/IIS PHP and PHP bundled inside vendor apps.
+      2. Reads each install's version and compares it to the fixed releases:
+             8.5.12 / 8.4.27 / 8.3.36 / 8.2.35
+         PHP 8.1 and older have NO official fixed release -> flagged VULNERABLE-EOL.
+      3. Works out whether that PHP is actually serving web requests
+         (IIS FastCGI, Apache mod_php / mod_fcgid, running php-cgi, php -S).
+      4. Reads php.ini for the interim-mitigation settings.
+      5. Compromise check (web-served installs): recently changed PHP files in the
+         web roots, common webshell patterns, and out-of-memory errors in logs.
+      6. Writes CSV + TXT report to C:\temp\PHP2Shell and returns an N-central exit code.
+
+    Exit codes (use these for the N-central script/AMP status):
+      0 = no PHP found, or every PHP install is patched
+      1 = vulnerable PHP present but NOT seen serving web requests (CLI / dormant)
+      2 = vulnerable PHP serving web requests            -> PATCH NOW
+      3 = PHP found but version unknown / newer branch    -> review by hand
+      4 = possible compromise indicators found            -> investigate before patching
+
+.PARAMETER OutputDir
+    Report folder. Default C:\temp\PHP2Shell
+
+.PARAMETER MaxDepth
+    How deep to walk each drive. Default 10.
+
+.PARAMETER LookbackDays
+    Window for the "recently changed PHP files" and log checks. Default 14.
+
+.PARAMETER SkipIocCheck
+    Skip the web root / log compromise checks (faster).
+
+.PARAMETER ApplyInterimMitigation
+    For VULNERABLE installs only: backs up php.ini, then sets
+    session.upload_progress.enabled = 0 (and fatal_error_backtraces = 0 on 8.5).
+    This is a PARTIAL stop-gap - only upgrading PHP fixes PHP2Shell.
+    Services are NOT restarted; the report lists what to restart.
+
+.PARAMETER Url
+    WEBSITE MODE. One or more sites to check from the outside (e.g. example.com).
+    Passive: one GET of the home page, reads X-Powered-By / Server / cookies / CMS markers.
+    No exploit traffic is sent. Verdicts: VULNERABLE, VULNERABLE-EOL, PATCHED,
+    PHP-VERSION-HIDDEN, NO-PHP-DETECTED, UNREACHABLE. Skips the local scan.
+
+.PARAMETER UrlFile
+    WEBSITE MODE. Text file with one site per line (# lines ignored).
+
+    Website-mode exit codes: 0 = nothing vulnerable seen, 2 = vulnerable version exposed,
+    3 = PHP present but version hidden (confirm with host).
+
+.EXAMPLE
+    .\Scan-PHP2Shell.ps1
+.EXAMPLE
+    .\Scan-PHP2Shell.ps1 -SkipIocCheck -MaxDepth 6
+.EXAMPLE
+    .\Scan-PHP2Shell.ps1 -Url example.com, shop.example.org
+.EXAMPLE
+    .\Scan-PHP2Shell.ps1 -UrlFile C:\temp\sites.txt
+#>
+[CmdletBinding()]
+param(
+    [string]$OutputDir = 'C:\temp\PHP2Shell',
+    [int]$MaxDepth = 10,
+    [int]$LookbackDays = 14,
+    [switch]$SkipIocCheck,
+    [switch]$ApplyInterimMitigation,
+    [string[]]$Url,
+    [string]$UrlFile
+)
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# ---------------- Reference data ----------------
+$FixedVersions = @{
+    '8.5' = [version]'8.5.12'
+    '8.4' = [version]'8.4.27'
+    '8.3' = [version]'8.3.36'
+    '8.2' = [version]'8.2.35'
+}
+$PhpExtPattern  = '\.(php\d?|phtml|phar)$'
+$WebshellRegex  = @(
+    'eval\s*\(\s*(base64_decode|gzinflate|gzuncompress|str_rot13|rawurldecode)\s*\(',
+    'assert\s*\(\s*\$_(POST|GET|REQUEST|COOKIE)',
+    '(system|passthru|shell_exec|exec|popen|proc_open)\s*\(\s*\$_(POST|GET|REQUEST|COOKIE|SERVER)',
+    '\$_(POST|GET|REQUEST|COOKIE)\s*\[[^\]]{1,40}\]\s*\(\s*\$_(POST|GET|REQUEST|COOKIE)',
+    'preg_replace\s*\(\s*[''"]/.*/e[''"]',
+    'create_function\s*\(.*\$_(POST|GET|REQUEST|COOKIE)'
+) -join '|'
+$OomRegex = 'Allowed memory size of \d+ bytes exhausted|Out of memory \(allocated'
+
+function Get-PatchStatus([string]$ver) {
+    if (-not $ver) { return @('UNKNOWN', 'Check version by hand') }
+    $v = [version]$ver
+    $branch = '{0}.{1}' -f $v.Major, $v.Minor
+    if ($FixedVersions.ContainsKey($branch)) {
+        if ($v -ge $FixedVersions[$branch]) { return @('PATCHED', $FixedVersions[$branch].ToString()) }
+        return @('VULNERABLE', $FixedVersions[$branch].ToString())
+    }
+    if ($v -gt [version]'8.5.999') { return @('REVIEW', 'Newer branch - confirm vendor guidance') }
+    return @('VULNERABLE-EOL', 'No official fix - upgrade to 8.4.27+ / 8.5.12+')
+}
+
+# ---------------- Output setup ----------------
+if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+$stamp   = Get-Date -Format 'yyyyMMdd_HHmmss'
+$csvPath = Join-Path $OutputDir "PHP2Shell_Scan_$stamp.csv"
+$txtPath = Join-Path $OutputDir "PHP2Shell_Scan_$stamp.txt"
+$Report  = New-Object System.Collections.Generic.List[string]
+function Out-Line([string]$m) { $script:Report.Add($m); Write-Output $m }
+
+Out-Line '=================================================================='
+Out-Line ' Sigma Data Systems INC ToolKit - PHP2Shell Scan'
+Out-Line ' CVE-2026-109618 / CVE-2026-109619'
+Out-Line (" Host: {0}   Run: {1}" -f $env:COMPUTERNAME, (Get-Date))
+Out-Line '=================================================================='
+
+# ---------------- 0. WEBSITE MODE (-Url / -UrlFile) ----------------
+# Passive fingerprint only: one GET of the home page, reads headers/cookies/page markers.
+# Never sends exploit payloads. Sites that hide their PHP version can't be confirmed from outside.
+function Get-WebPhpStatus([string]$target) {
+    $u = $target.Trim()
+    if ($u -notmatch '^https?://') { $u = "https://$u" }
+    $res = [ordered]@{ Site = $target.Trim(); FinalUrl = $u; HttpStatus = ''; Server = ''; XPoweredBy = ''
+                       PhpDetected = $false; PhpEvidence = ''; PhpVersion = ''; Verdict = ''; Notes = '' }
+    $resp = $null; $errs = New-Object System.Collections.Generic.List[string]
+    # Candidate URLs: as given, www. variant, then plain http
+    $cands = New-Object System.Collections.Generic.List[string]
+    $cands.Add($u)
+    if ($u -match '^(https?://)(?!www\.)([^/]+)(.*)$') { $cands.Add($matches[1] + 'www.' + $matches[2] + $matches[3]) }
+    $cands.Add(($u -replace '^https://', 'http://'))
+    # TLS sets: TLS 1.2 first (most reliable on Windows PowerShell 5.1), then TLS 1.2+1.3 where supported
+    $tlsSets = @([Net.SecurityProtocolType]::Tls12)
+    try { $tlsSets += ([Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13) } catch {}
+    :outer foreach ($try in ($cands | Select-Object -Unique)) {
+        $sets = if ($try -like 'https*') { $tlsSets } else { @($tlsSets[0]) }
+        foreach ($proto in $sets) {
+            try {
+                [Net.ServicePointManager]::SecurityProtocol = $proto
+                $req = [System.Net.HttpWebRequest]::Create($try)
+                $req.Method = 'GET'; $req.Timeout = 20000; $req.ReadWriteTimeout = 20000
+                $req.AllowAutoRedirect = $true; $req.MaximumAutomaticRedirections = 5
+                $req.KeepAlive = $false
+                $req.UserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+                $req.Accept = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                $req.Headers.Add('Accept-Language', 'en-US,en;q=0.9')
+                $req.AutomaticDecompression = [System.Net.DecompressionMethods]::GZip -bor [System.Net.DecompressionMethods]::Deflate
+                $resp = $req.GetResponse()
+            } catch [System.Net.WebException] {
+                if ($_.Exception.Response) { $resp = $_.Exception.Response }
+                else {
+                    $m = $_.Exception.Message
+                    if ($_.Exception.InnerException) { $m += ' / ' + $_.Exception.InnerException.Message }
+                    $errs.Add("$try [$proto]: $m")
+                }
+            } catch { $errs.Add("$try [$proto]: $($_.Exception.Message)") }
+            if ($resp) { $res.FinalUrl = $resp.ResponseUri.AbsoluteUri; break outer }
+        }
+    }
+    if (-not $resp) { $res.Verdict = 'UNREACHABLE'; $res.Notes = ($errs -join ' | '); return [pscustomobject]$res }
+
+    $res.HttpStatus = [int]$resp.StatusCode
+    $res.Server     = [string]$resp.Headers['Server']
+    $res.XPoweredBy = [string]$resp.Headers['X-Powered-By']
+    $cookies        = [string]$resp.Headers['Set-Cookie']
+    $body = ''
+    try {
+        $sr  = New-Object System.IO.StreamReader($resp.GetResponseStream())
+        $buf = New-Object char[] 300000
+        $n   = $sr.ReadBlock($buf, 0, $buf.Length)
+        $body = New-Object string($buf, 0, $n)
+    } catch {}
+    $resp.Close()
+
+    $ev = New-Object System.Collections.Generic.List[string]
+    foreach ($hv in @($res.XPoweredBy, $res.Server)) {
+        if ($hv -match 'PHP/(\d+\.\d+\.\d+)') { $res.PhpVersion = $matches[1]; $ev.Add("header PHP/$($matches[1])") }
+        elseif ($hv -match 'PHP') { $ev.Add('header says PHP') }
+    }
+    if ($cookies -match 'PHPSESSID')                                    { $ev.Add('PHPSESSID cookie') }
+    if ($body -match 'content="WordPress\s*([\d\.]+)')                  { $ev.Add("WordPress $($matches[1])") }
+    elseif ($body -match 'wp-content/|wp-includes/|content="WordPress') { $ev.Add('WordPress') }
+    if ($body -match 'content="Joomla|/media/jui/|/media/system/js/')   { $ev.Add('Joomla') }
+    if ($body -match 'content="Drupal|Drupal\.settings|drupalSettings') { $ev.Add('Drupal') }
+    if ($body -match 'Mage\.Cookies|/static/version\d+/frontend/')      { $ev.Add('Magento') }
+    if ($res.FinalUrl -match '\.php(\?|$)')                             { $ev.Add('.php URL') }
+
+    $res.PhpDetected = $ev.Count -gt 0
+    $res.PhpEvidence = ($ev | Select-Object -Unique) -join '; '
+    if ($res.PhpVersion) {
+        $st = Get-PatchStatus $res.PhpVersion
+        $res.Verdict = $st[0]
+        if ($st[0] -like 'VULNERABLE*' -and $res.Server -match 'Ubuntu|Debian|CentOS|Red Hat|RHEL|Alma|Rocky|SUSE') {
+            $res.Notes = 'Linux distro build - may carry a backported fix under an old version number; confirm with host / package changelog'
+        } else { $res.Notes = "Fixed in $($st[1])" }
+    } elseif ($res.PhpDetected) {
+        $res.Verdict = 'PHP-VERSION-HIDDEN'
+        $res.Notes   = 'Runs PHP but hides its version - confirm patch level with the host / server owner'
+    } else {
+        $res.Verdict = 'NO-PHP-DETECTED'
+        $res.Notes   = 'No PHP fingerprint seen (PHP can still sit behind a CDN/proxy)'
+    }
+    if ($res.Server -match 'cloudflare') { $res.Notes += ' | Behind Cloudflare (WAF rules help but are not a fix)' }
+    return [pscustomobject]$res
+}
+
+$Targets = @()
+if ($Url)     { $Targets += @($Url | ForEach-Object { $_ -split '[,;\s]+' } | Where-Object { $_ }) }
+if ($UrlFile) {
+    if (Test-Path $UrlFile) { $Targets += Get-Content $UrlFile | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') } }
+    else { Out-Line "URL file not found: $UrlFile"; exit 3 }
+}
+if ($Targets.Count -gt 0) {
+    $origProto = [Net.ServicePointManager]::SecurityProtocol
+
+    Out-Line (" Website mode: checking {0} site(s) - passive fingerprint only" -f $Targets.Count)
+    $WebResults = New-Object System.Collections.Generic.List[object]
+    foreach ($t in ($Targets | Select-Object -Unique)) {
+        $r = Get-WebPhpStatus $t
+        $WebResults.Add($r)
+        Out-Line ''
+        Out-Line ("[{0}] {1}" -f $r.Verdict, $r.Site)
+        Out-Line ("    PHP version : {0}   evidence: {1}" -f $(if ($r.PhpVersion) { $r.PhpVersion } else { '-' }), $(if ($r.PhpEvidence) { $r.PhpEvidence } else { 'none' }))
+        Out-Line ("    Server      : {0}  {1}" -f $r.Server, $r.XPoweredBy)
+        Out-Line ("    Notes       : {0}" -f $r.Notes)
+    }
+    [Net.ServicePointManager]::SecurityProtocol = $origProto
+    $webCsv = Join-Path $OutputDir "PHP2Shell_WebCheck_$stamp.csv"
+    $WebResults | Export-Csv -Path $webCsv -NoTypeInformation -Encoding UTF8
+
+    $wVuln   = @($WebResults | Where-Object { $_.Verdict -like 'VULNERABLE*' }).Count
+    $wHidden = @($WebResults | Where-Object { $_.Verdict -eq 'PHP-VERSION-HIDDEN' }).Count
+    $wDown   = @($WebResults | Where-Object { $_.Verdict -eq 'UNREACHABLE' }).Count
+    Out-Line ''
+    Out-Line '------------------------------------------------------------------'
+    Out-Line ("WEB RESULT: sites={0} vulnerable={1} php-version-hidden={2} unreachable={3}" -f $WebResults.Count, $wVuln, $wHidden, $wDown)
+    Out-Line ("Report: {0}" -f $webCsv)
+    $Report | Set-Content -Path $txtPath -Encoding UTF8
+    if ($wVuln -gt 0) { exit 2 } elseif ($wHidden -gt 0) { exit 3 } else { exit 0 }
+}
+
+# ---------------- 1. Discover PHP binaries ----------------
+$skipTop    = @('Windows','$Recycle.Bin','System Volume Information','Recovery','Config.Msi','$WinREAgent','Windows.old','$SysReset')
+$binPattern = '^(php|php-cgi|php-win)\.exe$|^php\d*(ts)?\.dll$|^php\d*apache.*\.dll$'
+$Found      = New-Object System.Collections.Generic.List[string]
+
+function Find-PhpBinaries([string]$root) {
+    $stack = New-Object System.Collections.Generic.Stack[object]
+    $stack.Push(@($root, 0))
+    while ($stack.Count -gt 0) {
+        $item = $stack.Pop(); $dir = [string]$item[0]; $depth = [int]$item[1]
+        $files = $null
+        try { $files = [System.IO.Directory]::GetFiles($dir) } catch { continue }
+        foreach ($f in $files) {
+            if ([System.IO.Path]::GetFileName($f) -match $binPattern) { $script:Found.Add($f) }
+        }
+        if ($depth -ge $MaxDepth) { continue }
+        $subs = $null
+        try { $subs = [System.IO.Directory]::GetDirectories($dir) } catch { continue }
+        foreach ($s in $subs) {
+            if ($depth -eq 0 -and $skipTop -contains [System.IO.Path]::GetFileName($s)) { continue }
+            try {
+                if ([System.IO.File]::GetAttributes($s) -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+            } catch { continue }
+            $stack.Push(@($s, ($depth + 1)))
+        }
+    }
+}
+
+$drives = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object { $_.DeviceID + '\' }
+foreach ($d in $drives) { Find-PhpBinaries $d }
+
+$Installs = $Found | Group-Object { [System.IO.Path]::GetDirectoryName($_) }
+
+if (-not $Installs) {
+    Out-Line ''
+    Out-Line 'RESULT: CLEAN - no PHP installations found on this machine.'
+    $Report | Set-Content -Path $txtPath -Encoding UTF8
+    Write-Output "PHP2SHELL: NO-PHP | 0 installs"
+    exit 0
+}
+
+# ---------------- 2. Web-serving context ----------------
+$Procs     = @(Get-CimInstance Win32_Process | Select-Object ProcessId, Name, ExecutablePath, CommandLine)
+$Listeners = @(Get-NetTCPConnection -State Listen | Select-Object LocalPort, OwningProcess)
+
+# IIS
+$IisFastCgi = @(); $IisRoots = @()
+$ahc = Join-Path $env:windir 'System32\inetsrv\config\applicationHost.config'
+if (Test-Path $ahc) {
+    try {
+        [xml]$cfg = Get-Content $ahc -Raw
+        $IisFastCgi = @($cfg.configuration.'system.webServer'.fastCgi.application | ForEach-Object {
+            [Environment]::ExpandEnvironmentVariables($_.fullPath) })
+        $IisFastCgi += @($cfg.SelectNodes('//handlers/add[@scriptProcessor]') | ForEach-Object {
+            [Environment]::ExpandEnvironmentVariables(($_.scriptProcessor -split '\|')[0]) })
+        $IisRoots = @($cfg.SelectNodes('//sites/site/application/virtualDirectory') | ForEach-Object {
+            [Environment]::ExpandEnvironmentVariables($_.physicalPath) })
+    } catch {}
+}
+
+# Apache (from running httpd.exe and Apache services)
+$ApacheBins = @($Procs | Where-Object { $_.Name -ieq 'httpd.exe' -and $_.ExecutablePath } | ForEach-Object { $_.ExecutablePath })
+$ApacheBins += @(Get-CimInstance Win32_Service | Where-Object { $_.PathName -match 'httpd\.exe' } | ForEach-Object {
+    if ($_.PathName -match '^"?([^"]+httpd\.exe)') { $matches[1] } })
+$ApacheBins = $ApacheBins | Select-Object -Unique
+$ApacheConfText = ''; $ApacheRoots = @()
+foreach ($bin in $ApacheBins) {
+    $srvRoot = Split-Path (Split-Path $bin -Parent) -Parent
+    $confDir = Join-Path $srvRoot 'conf'
+    if (-not (Test-Path $confDir)) { continue }
+    $confFiles = Get-ChildItem $confDir -Recurse -Filter '*.conf' -File
+    foreach ($cf in $confFiles) {
+        $t = Get-Content $cf.FullName -Raw
+        $ApacheConfText += "`n" + $t
+        $defRoot = $srvRoot
+        if ($t -match 'Define\s+SRVROOT\s+"?([^"\r\n]+)"?') { $defRoot = $matches[1] }
+        foreach ($m in [regex]::Matches($t, '(?im)^\s*DocumentRoot\s+"?([^"\r\n]+)"?')) {
+            $ApacheRoots += ($m.Groups[1].Value -replace '\$\{SRVROOT\}', $defRoot) -replace '/', '\'
+        }
+    }
+}
+$ApacheConfNorm = $ApacheConfText -replace '/', '\'
+
+# ---------------- Helpers ----------------
+function Get-PhpVersion([string]$dir, [string[]]$files) {
+    $ordered = @($files | Sort-Object { if ($_ -match 'ts\.dll$|\d\.dll$') { 0 } elseif ($_ -match 'php-cgi') { 1 } else { 2 } })
+    foreach ($f in $ordered) {
+        $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($f)
+        foreach ($v in @($vi.ProductVersion, $vi.FileVersion)) {
+            if ($v -match '^\s*(\d+\.\d+\.\d+)') { return $matches[1] }
+        }
+    }
+    $exe = Join-Path $dir 'php.exe'
+    if (Test-Path $exe) {
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $exe; $psi.Arguments = '-n -v'
+            $psi.RedirectStandardOutput = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $task = $p.StandardOutput.ReadToEndAsync()
+            if ($p.WaitForExit(5000)) { if ($task.Result -match 'PHP (\d+\.\d+\.\d+)') { return $matches[1] } }
+            else { $p.Kill() }
+        } catch {}
+    }
+    return $null
+}
+
+function Get-IniInfo([string]$dir) {
+    $r = [ordered]@{ Path = $null; UploadProgress = 'On (default)'; MemoryLimit = '128M (default)'
+                     PostMax = '8M (default)'; ErrorLog = $null; FatalBacktraces = 'default' }
+    $ini = Join-Path $dir 'php.ini'
+    if (-not (Test-Path $ini)) { return $r }
+    $r.Path = $ini
+    foreach ($line in (Get-Content $ini)) {
+        $l = $line.Trim()
+        if ($l -eq '' -or $l.StartsWith(';')) { continue }
+        if ($l -match '^session\.upload_progress\.enabled\s*=\s*"?([^";]+)') { $r.UploadProgress = $matches[1].Trim() }
+        elseif ($l -match '^memory_limit\s*=\s*"?([^";]+)')               { $r.MemoryLimit    = $matches[1].Trim() }
+        elseif ($l -match '^post_max_size\s*=\s*"?([^";]+)')              { $r.PostMax        = $matches[1].Trim() }
+        elseif ($l -match '^error_log\s*=\s*"?([^";]+)')                  { $r.ErrorLog       = $matches[1].Trim() }
+        elseif ($l -match '^fatal_error_backtraces\s*=\s*"?([^";]+)')     { $r.FatalBacktraces = $matches[1].Trim() }
+    }
+    return $r
+}
+
+function Set-IniValue([string]$iniPath, [string]$key, [string]$value) {
+    $lines = [System.Collections.Generic.List[string]](Get-Content $iniPath)
+    $rx = '^\s*;?\s*' + [regex]::Escape($key) + '\s*='
+    $idx = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match $rx) { $idx = $i; break } }
+    $newLine = "$key = $value"
+    if ($idx -ge 0) { $lines[$idx] = $newLine } else { $lines.Add($newLine) }
+    $lines | Set-Content -Path $iniPath -Encoding ASCII
+}
+
+function Test-UnderPath([string]$child, [string]$parent) {
+    if (-not $child -or -not $parent) { return $false }
+    $c = $child.TrimEnd('\').ToLowerInvariant(); $p = $parent.TrimEnd('\').ToLowerInvariant()
+    return ($c -eq $p -or $c.StartsWith($p + '\'))
+}
+
+# ---------------- 3. Evaluate each install ----------------
+$Results   = New-Object System.Collections.Generic.List[object]
+$cutoff    = (Get-Date).AddDays(-$LookbackDays)
+$restartHints = New-Object System.Collections.Generic.List[string]
+
+foreach ($g in $Installs) {
+    $dir   = $g.Name
+    $files = @($g.Group)
+    $ver   = Get-PhpVersion $dir $files
+    $st    = Get-PatchStatus $ver
+    $ini   = Get-IniInfo $dir
+
+    # --- Is it serving web requests? ---
+    $servedBy = New-Object System.Collections.Generic.List[string]
+    $pids     = New-Object System.Collections.Generic.List[int]
+    if ($IisFastCgi | Where-Object { Test-UnderPath $_ $dir }) { $servedBy.Add('IIS FastCGI'); $restartHints.Add('IIS: iisreset (or recycle app pools)') }
+    foreach ($p in $Procs) {
+        if ($p.ExecutablePath -and (Test-UnderPath $p.ExecutablePath $dir)) {
+            if ($p.Name -ieq 'php-cgi.exe') { $servedBy.Add('php-cgi running'); $pids.Add([int]$p.ProcessId) }
+            elseif ($p.CommandLine -match '\s-S\s') { $servedBy.Add('php -S built-in server'); $pids.Add([int]$p.ProcessId) }
+        }
+    }
+    $dirNorm = $dir.ToLowerInvariant()
+    if ($ApacheConfNorm -and $ApacheConfNorm.ToLowerInvariant().Contains($dirNorm)) {
+        $servedBy.Add('Apache (mod_php / fcgid)')
+        $restartHints.Add('Apache: restart the Apache service')
+        foreach ($p in ($Procs | Where-Object { $_.Name -ieq 'httpd.exe' })) { $pids.Add([int]$p.ProcessId) }
+    }
+    $servedBy = @($servedBy | Select-Object -Unique)
+    $webServed = $servedBy.Count -gt 0
+    $ports = @($Listeners | Where-Object { $pids -contains $_.OwningProcess } | ForEach-Object { $_.LocalPort } | Sort-Object -Unique) -join ','
+
+    # --- Compromise indicators (web-served only) ---
+    $recentCount = 0; $shellHits = New-Object System.Collections.Generic.List[string]; $oomHits = 0
+    if (-not $SkipIocCheck -and $webServed) {
+        $roots = @()
+        if ($servedBy -contains 'IIS FastCGI') { $roots += $IisRoots }
+        if ($servedBy -contains 'Apache (mod_php / fcgid)') { $roots += $ApacheRoots }
+        $roots = @($roots | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)
+        foreach ($root in $roots) {
+            $recent = @(Get-ChildItem $root -Recurse -File -Force | Where-Object {
+                $_.Name -match $PhpExtPattern -and ($_.LastWriteTime -ge $cutoff -or $_.CreationTime -ge $cutoff) })
+            $recentCount += $recent.Count
+            foreach ($f in ($recent | Where-Object { $_.Length -lt 2MB } | Select-Object -First 1000)) {
+                if (Select-String -Path $f.FullName -Pattern $WebshellRegex -Quiet) { $shellHits.Add($f.FullName) }
+            }
+        }
+        $logs = @()
+        if ($ini.ErrorLog -and (Test-Path $ini.ErrorLog)) { $logs += $ini.ErrorLog }
+        foreach ($bin in $ApacheBins) {
+            $ld = Join-Path (Split-Path (Split-Path $bin -Parent) -Parent) 'logs'
+            if (Test-Path $ld) { $logs += @(Get-ChildItem $ld -Filter '*error*' -File | ForEach-Object { $_.FullName }) }
+        }
+        foreach ($lf in ($logs | Select-Object -Unique)) {
+            $item = Get-Item $lf
+            if ($item.LastWriteTime -ge $cutoff -and $item.Length -lt 500MB) {
+                $oomHits += @(Select-String -Path $lf -Pattern $OomRegex).Count
+            }
+        }
+    }
+
+    # --- Optional interim mitigation ---
+    $mitigation = 'No'
+    if ($ApplyInterimMitigation -and $st[0] -like 'VULNERABLE*') {
+        if ($ini.Path) {
+            Copy-Item $ini.Path ("{0}.bak_PHP2Shell_{1}" -f $ini.Path, $stamp) -Force
+            Set-IniValue $ini.Path 'session.upload_progress.enabled' '0'
+            if ($ver -like '8.5.*') { Set-IniValue $ini.Path 'fatal_error_backtraces' '0' }
+            $mitigation = 'Applied (restart needed)'
+        } else { $mitigation = 'Skipped - no php.ini in install folder' }
+    }
+
+    $Results.Add([pscustomobject]@{
+        Computer          = $env:COMPUTERNAME
+        InstallPath       = $dir
+        Version           = $(if ($ver) { $ver } else { 'unknown' })
+        Status            = $st[0]
+        FixedIn           = $st[1]
+        WebServed         = $webServed
+        ServedBy          = ($servedBy -join '; ')
+        ListeningPorts    = $ports
+        PhpIni            = $ini.Path
+        UploadProgress    = $ini.UploadProgress
+        MemoryLimit       = $ini.MemoryLimit
+        PostMaxSize       = $ini.PostMax
+        RecentPhpFiles    = $recentCount
+        WebshellHits      = $shellHits.Count
+        WebshellFiles     = ($shellHits -join '; ')
+        OomLogHits        = $oomHits
+        MitigationApplied = $mitigation
+        Binaries          = ($files | ForEach-Object { [System.IO.Path]::GetFileName($_) }) -join ','
+    })
+}
+
+# ---------------- 4. Report ----------------
+$Results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+foreach ($r in $Results) {
+    Out-Line ''
+    Out-Line ("[{0}] {1}" -f $r.Status, $r.InstallPath)
+    Out-Line ("    Version      : {0}   (fixed in {1})" -f $r.Version, $r.FixedIn)
+    Out-Line ("    Web-served   : {0}  {1}  {2}" -f $r.WebServed, $r.ServedBy, $(if ($r.ListeningPorts) { "ports " + $r.ListeningPorts }))
+    Out-Line ("    php.ini      : {0}" -f $(if ($r.PhpIni) { $r.PhpIni } else { 'none in folder (may use PHPIniDir/other)' }))
+    Out-Line ("    upload_progress={0}  memory_limit={1}  post_max_size={2}" -f $r.UploadProgress, $r.MemoryLimit, $r.PostMaxSize)
+    if ($r.WebServed -and -not $SkipIocCheck) {
+        Out-Line ("    IoC check    : {0} PHP files changed in last {1} days, {2} webshell-pattern hits, {3} OOM log lines" -f $r.RecentPhpFiles, $LookbackDays, $r.WebshellHits, $r.OomLogHits)
+        if ($r.WebshellHits -gt 0) { Out-Line ("    !! SUSPECT FILES: {0}" -f $r.WebshellFiles) }
+    }
+    if ($r.MitigationApplied -ne 'No') { Out-Line ("    Mitigation   : {0}" -f $r.MitigationApplied) }
+}
+
+$vuln     = @($Results | Where-Object { $_.Status -like 'VULNERABLE*' })
+$vulnWeb  = @($vuln | Where-Object { $_.WebServed })
+$unknown  = @($Results | Where-Object { $_.Status -in 'UNKNOWN','REVIEW' })
+$suspect  = @($Results | Where-Object { $_.WebshellHits -gt 0 })
+
+$exitCode = 0; $verdict = 'PATCHED'
+if ($vuln.Count -gt 0)    { $exitCode = 1; $verdict = 'VULNERABLE-NOT-WEB' }
+if ($unknown.Count -gt 0 -and $exitCode -lt 1) { $exitCode = 3; $verdict = 'REVIEW' }
+if ($vulnWeb.Count -gt 0) { $exitCode = 2; $verdict = 'VULNERABLE-WEB' }
+if ($suspect.Count -gt 0) { $exitCode = 4; $verdict = 'POSSIBLE-COMPROMISE' }
+
+Out-Line ''
+Out-Line '------------------------------------------------------------------'
+Out-Line ("RESULT: {0} | installs={1} vulnerable={2} vulnerable+web={3} suspect={4}" -f $verdict, $Results.Count, $vuln.Count, $vulnWeb.Count, $suspect.Count)
+if ($vuln.Count -gt 0) {
+    Out-Line 'NEXT STEPS:'
+    Out-Line '  - Upgrade PHP to 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35 (8.1 and older: move to a supported branch).'
+    Out-Line '  - PHP bundled inside a vendor app: get the vendor update - do not swap files by hand.'
+    Out-Line '  - Restart the web server / PHP workers after upgrading.'
+    $restartHints | Select-Object -Unique | ForEach-Object { Out-Line ("      {0}" -f $_) }
+    Out-Line '  - After upgrade, re-check memory_limit / post_max_size (the fix adds a hard memory cap).'
+}
+if ($suspect.Count -gt 0) {
+    Out-Line '  !! Webshell-like files found. Preserve evidence, isolate the server, review before patching.'
+}
+Out-Line ("Report: {0}" -f $csvPath)
+$Report | Set-Content -Path $txtPath -Encoding UTF8
+
+# Single summary line for N-central output parsing
+Write-Output ("PHP2SHELL: {0} | installs={1} vuln={2} vulnWeb={3} suspect={4}" -f $verdict, $Results.Count, $vuln.Count, $vulnWeb.Count, $suspect.Count)
+exit $exitCode
+'@
 
 # ======================= Audit-GPOs.ps1 =======================
 $Script:Payloads['Audit-GPOs'] = @'
