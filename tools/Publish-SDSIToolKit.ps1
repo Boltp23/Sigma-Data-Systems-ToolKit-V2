@@ -16,6 +16,11 @@
         connection strings.
       - Optional block-list of client names / domains you never want published.
 
+    Code signing: after the checks pass, changed .ps1 files are Authenticode-signed with
+    Sign-SDSIToolKit.ps1 (settings in SDSI-Signing.json). Unchanged scripts keep their existing
+    signature. If signing is configured and fails, nothing is published. If it is not configured,
+    the ToolKit is published unsigned with a warning.
+
     Sign-in: uses Git for Windows + Git Credential Manager. The FIRST push opens a
     GitHub sign-in in your browser; after that the credential is stored in Windows
     Credential Manager. No password or token is ever written in this script or its config.
@@ -188,6 +193,35 @@ try {
         Invoke-Git checkout -B $cfg.Branch | Out-Null   # brand-new empty repo
     }
 
+    # ------------------------------------------------------------------ keep signed scripts byte-exact
+    # Git line-ending conversion would break Authenticode signatures, so .ps1/.psm1/.psd1 are stored as-is.
+    $gaPath = Join-Path $Repo '.gitattributes'
+    $gaNeed = @('*.ps1 -text', '*.psm1 -text', '*.psd1 -text')
+    $gaHave = if (Test-Path $gaPath) { @(Get-Content $gaPath) } else { @() }
+    $gaAdd  = @($gaNeed | Where-Object { $gaHave -notcontains $_ })
+    if ($gaAdd) { Add-Content -Path $gaPath -Value $gaAdd; Log ".gitattributes updated: $($gaAdd -join ', ')" }
+
+    # Remember the currently published (signed) scripts, so an unchanged script keeps its existing
+    # signature instead of being re-signed (a new timestamp) and committed every 30 minutes.
+    $SigBlock = '(?s)\r?\n# SIG # Begin signature block.*?# SIG # End signature block\r?\n?'
+    function Get-ScriptBody([string]$file) {
+        $t = [System.IO.File]::ReadAllText($file)   # detects the BOM, defaults to UTF-8
+        (([regex]::Replace($t, $SigBlock, '')) -replace "`r`n", "`n").TrimEnd()
+    }
+    $prevScripts = @{}
+    foreach ($f in $cfg.Files) {
+        if ($f.Target -notmatch '\.ps(m|d)?1$') { continue }
+        $dst = Join-Path $Repo $f.Target
+        if (Test-Path $dst) {
+            $bytes = [System.IO.File]::ReadAllBytes($dst)
+            $prevScripts[$f.Target] = @{
+                Bytes  = $bytes
+                Body   = Get-ScriptBody $dst
+                Signed = [bool](Select-String -Path $dst -Pattern '^# SIG # Begin signature block' -Quiet)
+            }
+        }
+    }
+
     # ------------------------------------------------------------------ copy whitelisted files
     $oldToolkit = Join-Path $Repo (($cfg.Files | Where-Object { $_.Source -like 'SigmaDataSystems-ToolKit*' } | Select-Object -First 1).Target)
     $oldMenu = @()
@@ -283,8 +317,44 @@ try {
         exit 2
     }
 
+    # ------------------------------------------------------------------ code-sign scripts
+    # Runs AFTER all checks and README edits - any later change to a signed file breaks its signature.
+    # Signing settings: SDSI-Signing.json (see Sign-SDSIToolKit.ps1 -InitConfig). No config = publish unsigned.
+    $signScript = Join-Path $SourceFolder 'Sign-SDSIToolKit.ps1'
+    $signConfig = Join-Path $SourceFolder 'SDSI-Signing.json'
+    $toSign = @()
+    foreach ($f in $cfg.Files) {
+        if ($f.Target -notmatch '\.ps(m|d)?1$') { continue }
+        $dst = Join-Path $Repo $f.Target
+        if (-not (Test-Path $dst)) { continue }
+        $prev = $prevScripts[$f.Target]
+        if ($prev -and $prev.Signed -and $prev.Body -eq (Get-ScriptBody $dst)) {
+            [System.IO.File]::WriteAllBytes($dst, $prev.Bytes)   # unchanged - keep the existing signature
+        } else {
+            $toSign += $dst
+        }
+    }
+    if ($toSign) {
+        if ($DryRun) {
+            Log "DRY RUN - would sign: $(($toSign | ForEach-Object { Split-Path $_ -Leaf }) -join ', ')" 'WARN'
+        } elseif (-not (Test-Path $signScript) -or -not (Test-Path $signConfig)) {
+            Log "Code signing not configured ($signConfig missing) - publishing UNSIGNED." 'WARN'
+        } else {
+            Log "Signing: $(($toSign | ForEach-Object { Split-Path $_ -Leaf }) -join ', ')"
+            & $signScript -Path $toSign -ConfigPath $signConfig *>&1 | ForEach-Object { Log "$_" }
+            if ($LASTEXITCODE -ne 0) {
+                Log 'NOT PUBLISHED - code signing failed.' 'ERROR'
+                $null = Invoke-GitRaw @('-C', $Repo, 'checkout', '--', '.')
+                $null = Invoke-GitRaw @('-C', $Repo, 'clean', '-fd')
+                exit 3
+            }
+            Log 'Code signing OK.' 'OK'
+        }
+    }
+
     # ------------------------------------------------------------------ anything changed?
     Invoke-Git add -A | Out-Null
+    Invoke-Git add --renormalize . | Out-Null
     $changed = @(Invoke-Git diff --cached --name-only | Where-Object { $_ })
     if (-not $changed) { Log 'No changes - nothing to publish.'; exit 0 }
 
