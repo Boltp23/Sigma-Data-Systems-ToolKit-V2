@@ -11276,7 +11276,7 @@ $lastDrvFail = $drvFailRows | Select-Object -First 1
 if ($rebootPending -and $lastOk -and $boot -and $lastOk.Date -gt $boot) { $rebootSince = Iso $lastOk.Date }
 
 # ---------------------------------------------------------------- hotfixes (second source)
-$hfDate = $null; $hfId = ''; $hf30 = 0
+$hfDate = $null; $hfId = ''; $hf30 = 0; $hfList = @()
 try {
     foreach ($h in @(Get-WmiObject Win32_QuickFixEngineering)) {
         $d = $null
@@ -11284,8 +11284,17 @@ try {
         if (-not $d -and "$($h.psbase.Properties['InstalledOn'].Value)" -match '^[0-9A-Fa-f]{16}$') { try { $d = [datetime]::FromFileTime([Convert]::ToInt64($h.psbase.Properties['InstalledOn'].Value, 16)) } catch { } }
         if ($d -and (-not $hfDate -or $d -gt $hfDate)) { $hfDate = $d; $hfId = "$($h.HotFixID)" }
         if ($d -and $d -ge $since) { $hf30++ }
+        if ($d) { $hfList += New-Object PSObject -Property @{ Id = "$($h.HotFixID)"; Date = $d; Desc = "$($h.Description)" } }
     }
 } catch { }
+
+# Monthly OS updates installed outside Windows Update's history (N-central / wusa / DISM installs show up only in
+# the hotfix list): the newest 'Security Update' hotfix that WU history doesn't name as .NET / platform / etc.
+$notCuKbs = @{}; foreach ($x in $rows) { if ("$($x.Title)" -match $notCuRx) { $k = KB $x.Title; if ($k) { $notCuKbs[$k] = $true } } }
+$hfCu = @($hfList | Where-Object { $_.Desc -match '(?i)security update' -and -not $notCuKbs[$_.Id] } | Sort-Object Date -Descending) | Select-Object -First 1
+if ($hfCu -and (-not $lastCu -or $hfCu.Date -gt ([datetime]$lastCu.Date).Date)) {
+    $lastCu = New-Object PSObject -Property @{ Date = $hfCu.Date; Title = "$($hfCu.Id) (hotfix list)"; Code = 2; HResult = ''; Def = $false; Cat = 'Imp' }
+}
 
 # no install in WU history or the event log: the newest installed hotfix (Win32_QuickFixEngineering) is the best
 # answer to "when was this machine last patched" - shows as source 'hotfix'
