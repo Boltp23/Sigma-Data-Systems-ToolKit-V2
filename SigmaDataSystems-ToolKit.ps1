@@ -11150,7 +11150,20 @@ function JObj($h) {   # ordered list of name/value pairs -> JSON object (PowerSh
 function Iso($d) { if ($d) { try { return ([datetime]$d).ToString('yyyy-MM-ddTHH:mm:ss') } catch { } }; return $null }
 function KB([string]$t) { if ($t -match '(KB\d{6,8})') { return $Matches[1] }; return '' }
 $defRx = '(?i)definition|security intelligence|antimalware platform|malicious software removal|KB2267602|KB890830|KB4052623'
-$cuRx  = '(?i)cumulative update|monthly (security )?(quality )?rollup|security only'
+# Monthly OS update. Since late 2025 Windows titles them '2026-10 Security Update (KB...) (build)' instead of
+# 'Cumulative Update for Windows...'; .NET Framework cumulative/security updates are not the OS update.
+# What counts: only security / critical / cumulative updates mark a machine as failed. Store apps are ignored,
+# drivers are reported on their own (Df/Dfl/Ldf) for the NOC's Patching > Drivers view.
+$storeRx = '(?i)^(9[A-Z0-9]{11}-|XP[A-Z0-9]{10}-|ApplicationSet-)|microsoft store|windows store'
+$drvRx   = '(?i)\bdriver\b|\bfirmware\b| - (Printer|USB|USBDevice|Extension|Display|SoftwareComponent|MEDIA|Other hardware|System|Image|Net|Bluetooth|Audio|Camera|Mouse|Keyboard|HIDClass|Biometric|SCSIAdapter|Monitor|Firmware|Sensor|Ports|Battery|HDC|Volume|DiskDrive|SecurityDevices|Processor|Modem|SmartCard)\b'
+$impRx   = '(?i)security|critical|cumulative|rollup|servicing stack'
+function Cat([string]$t, [string]$c) {
+    if ($t -match $storeRx -or $c -match 'Store') { return 'Store' }
+    if ($c -match 'Driver' -or $t -match $drvRx) { return 'Drv' }
+    if ($t -notmatch '(?i)preview' -and ($c -match 'Security|Critical|Rollup' -or $t -match $impRx)) { return 'Imp' }
+    return 'Other'
+}
+$cuRx  = '(?i)^(?!.*\.net)(.*cumulative update for (windows|microsoft server)|\d{4}-\d{2} (security|preview|cumulative) update.*\(KB|.*monthly (security )?(quality )?rollup|.*security only|.*\(KB\d+\) \(\d{5}\.\d+\))'
 
 # ---------------------------------------------------------------- OS / boot
 $os = Get-WmiObject Win32_OperatingSystem
@@ -11177,11 +11190,11 @@ if ($rebootPending) {   # roughly when: the newest successful install after the 
 }
 
 # ---------------------------------------------------------------- Windows Update history
-$histOk = $false; $hist = @()
+$histOk = $false; $hist = @(); $histCount = $null
 try {
     $sess = New-Object -ComObject Microsoft.Update.Session
     $srch = $sess.CreateUpdateSearcher()
-    $n = $srch.GetTotalHistoryCount()
+    $n = $srch.GetTotalHistoryCount(); $histCount = $n
     if ($n -gt 0) {
         $hist = @($srch.QueryHistory(0, [Math]::Min($n, $HistoryMax)) | Where-Object { $_.Operation -eq 1 -and $_.Title })   # installs only
     }
@@ -11196,20 +11209,27 @@ try {
         $t = ''; $hr = ''
         try { if ($_.Id -eq 20) { $t = "$($_.Properties[1].Value)"; $hr = '0x{0:X8}' -f [int64]$_.Properties[0].Value } else { $t = "$($_.Properties[0].Value)" } } catch { }
         if (-not $t) { $t = ("$($_.Message)" -replace '^.*?:\s*', '') }
-        New-Object PSObject -Property @{ Date = $_.TimeCreated; Title = $t; Code = $(if ($_.Id -eq 19) { 2 } else { 4 }); HResult = $hr; Def = ($t -match $defRx) }
+        New-Object PSObject -Property @{ Date = $_.TimeCreated; Title = $t; Code = $(if ($_.Id -eq 19) { 2 } else { 4 }); HResult = $hr; Def = ($t -match $defRx); Cat = (Cat $t '') }
     })
 } catch { }
 # ResultCode: 1 in progress, 2 succeeded, 3 succeeded with errors, 4 failed, 5 aborted
 $rows = @($hist | ForEach-Object {
     $d = $null; try { $d = ([datetime]$_.Date).ToLocalTime() } catch { }
-    New-Object PSObject -Property @{ Date = $d; Title = "$($_.Title)"; Code = [int]$_.ResultCode; HResult = $(if ($_.HResult) { '0x{0:X8}' -f [int]$_.HResult } else { '' }); Def = ("$($_.Title)" -match $defRx) }
+    $cn = ''; try { $cn = (@($_.Categories | ForEach-Object { $_.Name }) -join ',') } catch { }
+    New-Object PSObject -Property @{ Date = $d; Title = "$($_.Title)"; Code = [int]$_.ResultCode; HResult = $(if ($_.HResult) { '0x{0:X8}' -f [int]$_.HResult } else { '' }); Def = ("$($_.Title)" -match $defRx); Cat = (Cat "$($_.Title)" $cn) }
 } | Where-Object { $_.Date })
-if (-not $rows.Count -and $evRows.Count) { $rows = $evRows; $src = 'event log' } elseif ($rows.Count) { $src = 'Windows Update' } else { $src = 'none' }
+# WU history can be wiped (SoftwareDistribution reset / repair) and then hold only Defender, Store or driver
+# entries - so fall back to the event log whenever it has no real Windows / Microsoft install, not only when empty
+$hasReal = [bool]($rows | Where-Object { -not $_.Def -and $_.Cat -ne 'Store' -and $_.Cat -ne 'Drv' -and ($_.Code -eq 2 -or $_.Code -eq 3) } | Select-Object -First 1)
+if (-not $hasReal -and $evRows.Count) { $rows = $(if ($hist.Count) { @($rows) + @($evRows | Where-Object { $_.Code -eq 2 }) } else { $evRows }); $src = $(if ($hist.Count) { 'Windows Update + event log' } else { 'event log' }) }
+elseif ($rows.Count) { $src = 'Windows Update' } else { $src = 'none' }
 $rows = @($rows | Sort-Object Date -Descending)
 if ($rows.Count) { $histOk = $true }
-$real = @($rows | Where-Object { -not $_.Def })
-$okRows = @($real | Where-Object { $_.Code -eq 2 -or $_.Code -eq 3 })
-$failRows = @($real | Where-Object { $_.Code -eq 4 -or $_.Code -eq 5 })
+$real = @($rows | Where-Object { -not $_.Def -and $_.Cat -ne 'Store' })
+$allOk = @($real | Where-Object { $_.Code -eq 2 -or $_.Code -eq 3 })
+$okRows = @($allOk | Where-Object { $_.Cat -ne 'Drv' })                                       # Windows / Microsoft updates
+$failRows = @($real | Where-Object { ($_.Code -eq 4 -or $_.Code -eq 5) -and $_.Cat -eq 'Imp' })  # only these mark the machine failed
+$drvFailRows = @($real | Where-Object { ($_.Code -eq 4 -or $_.Code -eq 5) -and $_.Cat -eq 'Drv' })
 $lastOk = $okRows | Select-Object -First 1
 $lastFail = $failRows | Select-Object -First 1
 $lastCu = $okRows | Where-Object { $_.Title -match $cuRx } | Select-Object -First 1
@@ -11224,6 +11244,13 @@ foreach ($f in @($failRows | Where-Object { $_.Date -ge $since })) {
     $fixed = $okRows | Where-Object { $_.Date -gt $f.Date -and ((KB $_.Title) -eq $k -and $k -or $_.Title -eq $f.Title) } | Select-Object -First 1
     if (-not $fixed -and -not ($openFails | Where-Object { $_.Key -eq $key })) { $openFails += New-Object PSObject -Property @{ Key = $key; Row = $f } }
 }
+# drivers: still failing = no successful install of the same title since
+$drvOpen = @()
+foreach ($f in @($drvFailRows | Where-Object { $_.Date -ge $since })) {
+    $fixed = $allOk | Where-Object { $_.Date -gt $f.Date -and $_.Title -eq $f.Title } | Select-Object -First 1
+    if (-not $fixed -and -not ($drvOpen | Where-Object { $_.Title -eq $f.Title })) { $drvOpen += $f }
+}
+$lastDrvFail = $drvFailRows | Select-Object -First 1
 if ($rebootPending -and $lastOk -and $boot -and $lastOk.Date -gt $boot) { $rebootSince = Iso $lastOk.Date }
 
 # ---------------------------------------------------------------- hotfixes (second source)
@@ -11236,6 +11263,14 @@ try {
         if ($d -and (-not $hfDate -or $d -gt $hfDate)) { $hfDate = $d; $hfId = "$($h.HotFixID)" }
     }
 } catch { }
+
+# no install in WU history or the event log: the newest installed hotfix (Win32_QuickFixEngineering) is the best
+# answer to "when was this machine last patched" - shows as source 'hotfix'
+if (-not $lastOk -and $hfDate) {
+    $lastOk = New-Object PSObject -Property @{ Date = $hfDate; Title = "$hfId"; Code = 2; HResult = ''; Def = $false; Cat = 'Imp' }
+    $src = $(if ($src -eq 'none') { 'hotfix' } else { "$src + hotfix" })
+    if ($rebootPending -and $boot -and $hfDate -gt $boot -and (-not $rebootSince -or $rebootSince -eq 'unknown')) { $rebootSince = Iso $hfDate }
+}
 
 # ---------------------------------------------------------------- services / optional missing-update scan
 $wu = Get-WmiObject Win32_Service -Filter "Name='wuauserv'"
@@ -11250,21 +11285,37 @@ if ($CheckMissing) {
 }
 
 # ---------------------------------------------------------------- output
-# Kept short on purpose: RMM task output can be cut off, and a cut-off line can't be read
-function Short([string]$t, [int]$n) { $t = ($t -replace '\s*\(KB\d+\)', '' -replace '\s+', ' ').Trim(); if ($t.Length -gt $n) { $t.Substring(0, $n) } else { $t } }
-function U($r, [int]$n = 50) { if (-not $r) { return $null }; $o = New-Object System.Collections.Specialized.OrderedDictionary; $o['Date'] = Iso $r.Date; $o['KB'] = KB $r.Title; if ($n) { $o['Title'] = Short $r.Title $n }; if ($r.HResult) { $o['HResult'] = $r.HResult }; return $o }
+# N-central keeps only the first 500 characters of a task's output, so the PATCHRPT line uses short keys and is
+# trimmed until it fits in 480 characters (least important fields go first). The Sigma NOC collector expands it.
+#   V=3  Os  B=build  S=history source  Bt=last boot  Up=uptime days  Rp=reboot pending  Rw=why  Rs=since
+#   H=history readable  D=days  Ok/F=installed/failed in D days  Of=still failing count  Ofl=still-failing KBs
+#   Lo/Lf/Lc = last installed / last failed / last cumulative {d=date k=KB t=title h=error}  Ld=last definition
+#   Hf/Hk=newest hotfix date/id  Wu=WU service  At=report time
+#   V4: F/Of/Ofl/Lf count security/critical/cumulative updates only (Store apps ignored, drivers separate)
+#   Df=still-failing drivers  Dfl=their names  Ldf=last driver failure {d t h}
+#   V5: Hn=Windows Update history count; S can be 'event log' / 'hotfix' when WU history has no installs
+function Short([string]$t, [int]$n) { $t = ($t -replace '\s*\(KB\d+\)', '' -replace '^\d{4}-\d{2} ', '' -replace '\s+', ' ').Trim(); if ($t.Length -gt $n) { $t.Substring(0, $n) } else { $t } }
+function Dt($d) { if ($d) { try { return ([datetime]$d).ToString('yyyy-MM-ddTHH:mm') } catch { } }; return $null }
+function U($r, [int]$n) { if (-not $r) { return $null }; $o = New-Object System.Collections.Specialized.OrderedDictionary; $o['d'] = Dt $r.Date; $k = KB $r.Title; if ($k) { $o['k'] = $k }; if ($n) { $o['t'] = Short $r.Title $n }; if ($r.HResult) { $o['h'] = $r.HResult }; return $o }
+$osShort = ($caption -replace '^Microsoft\s+', '' -replace 'Windows Server', 'Server' -replace 'Standard', 'Std' -replace 'Datacenter', 'DC' -replace 'Professional', 'Pro' -replace 'Enterprise', 'Ent' -replace '\s+Edition', '').Trim()
 $j = New-Object System.Collections.Specialized.OrderedDictionary
-$j['V'] = 2; $j['Os'] = ($caption -replace '^Microsoft\s+', ''); $j['Build'] = $build; $j['Src'] = $src
-$j['LastBoot'] = Iso $boot; $j['UptimeDays'] = $upDays
-$j['RebootPending'] = $rebootPending; if ($why) { $j['RebootWhy'] = ($why -join ', ') }; if ($rebootSince -and $rebootSince -ne 'unknown') { $j['RebootSince'] = $rebootSince }
-$j['HistoryOk'] = $histOk; $j['Days'] = $Days; $j['Ok'] = $ok30; $j['Failed'] = $fail30; $j['OpenFailed'] = @($openFails).Count
-$j['LastOk'] = U $lastOk 50; $j['LastFail'] = U $lastFail 40; $j['LastCu'] = U $lastCu 0; $j['LastDef'] = Iso $(if ($lastDef) { $lastDef.Date })
-$j['OpenFail'] = $(if (@($openFails).Count) { ((@($openFails) | Select-Object -First 3 | ForEach-Object { $k = KB $_.Row.Title; if ($k) { $k } else { $_.Row.Title.Substring(0, [Math]::Min(60, $_.Row.Title.Length)) } }) -join ', ') } else { '' })
-$j['Hotfix'] = Iso $hfDate; $j['HotfixId'] = $hfId; $j['Wu'] = $wuState -replace '^Running/', 'Run/' -replace '^Stopped/', 'Stop/'
-if ($CheckMissing) { $j['Missing'] = $missing; $j['MissingSec'] = $missingSec; if ($missingErr) { $j['MissingErr'] = $missingErr } }
-$j['At'] = Iso (Get-Date)
-foreach ($k in @($j.Keys)) { if ($null -eq $j[$k]) { $j.Remove($k) } }
-$line = 'PATCHRPT,' + (JObj $j)
+$j['V'] = 5; $j['Os'] = $osShort; $j['B'] = $build; if ($src -ne 'Windows Update') { $j['S'] = $src }
+$j['Bt'] = Dt $boot; $j['Up'] = $upDays
+$j['Rp'] = $rebootPending; if ($why) { $abbr = @{ 'Windows Update' = 'WU'; 'File rename' = 'PFR' }; $j['Rw'] = (@($why | ForEach-Object { if ($abbr[$_]) { $abbr[$_] } else { $_ } })) -join ',' }
+if ($rebootSince -and $rebootSince -ne 'unknown') { $j['Rs'] = Dt $rebootSince }
+$j['H'] = $histOk; if ($null -ne $histCount) { $j['Hn'] = $histCount }; $j['D'] = $Days; $j['Ok'] = $ok30; $j['F'] = $fail30; $j['Of'] = @($openFails).Count
+if (@($openFails).Count) { $j['Ofl'] = ((@($openFails) | Select-Object -First 3 | ForEach-Object { $k = KB $_.Row.Title; if ($k) { $k } else { Short $_.Row.Title 30 } }) -join ',') }
+$j['Lo'] = U $lastOk 40; $j['Lf'] = U $lastFail 30; $j['Lc'] = U $lastCu 0; $j['Ld'] = Dt $(if ($lastDef) { $lastDef.Date })
+$j['Hf'] = Dt $hfDate; $j['Hk'] = $hfId; $j['Wu'] = ($wuState -replace '^Running/', 'Run/' -replace '^Stopped/', 'Stop/')
+if (@($drvOpen).Count) { $j['Df'] = @($drvOpen).Count; $j['Dfl'] = ((@($drvOpen) | Select-Object -First 2 | ForEach-Object { Short $_.Title 28 }) -join '|') }
+$j['Ldf'] = U $lastDrvFail 30
+if ($CheckMissing) { $j['Mi'] = $missing; $j['Ms'] = $missingSec }
+$j['At'] = Dt (Get-Date)
+foreach ($k in @($j.Keys)) { if ($null -eq $j[$k] -or "$($j[$k])" -eq '') { $j.Remove($k) } }
+# fit: drop the least important details until the line is short enough
+$drop = @({ if ($j['Ldf']) { $j['Ldf'].Remove('t') } }, { $j.Remove('Hk') }, { $j.Remove('Hf') }, { $j.Remove('Wu') }, { $j.Remove('Ld') }, { if ($j['Lf']) { $j['Lf'].Remove('t') } }, { if ($j['Lo']) { $j['Lo'].Remove('t') } }, { $j.Remove('Lc') }, { $j.Remove('Os') }, { $j.Remove('Rw') }, { $j.Remove('Dfl') }, { $j.Remove('Ldf') }, { $j.Remove('Hn') })
+$line = 'PATCHRPT,' + (JObj $j); $i = 0
+while ($line.Length -gt 480 -and $i -lt $drop.Count) { & $drop[$i]; $i++; $line = 'PATCHRPT,' + (JObj $j) }
 Write-Output $line
 Write-Output ''
 Write-Output ("Computer      : {0}  ({1}, build {2})" -f $env:COMPUTERNAME, $caption, $build)
@@ -11273,14 +11324,13 @@ Write-Output ("Reboot pending: {0}" -f $(if ($rebootPending) { "YES ($($why -joi
 if (-not $histOk) { Write-Output 'Update history: could not be read (Windows Update agent not available)' }
 Write-Output ("Last installed: {0}" -f $(if ($lastOk) { "$($lastOk.Date.ToString('yyyy-MM-dd HH:mm'))  $($lastOk.Title)" } else { 'none in history' }))
 Write-Output ("Last cumulative: {0}" -f $(if ($lastCu) { "$($lastCu.Date.ToString('yyyy-MM-dd'))  $($lastCu.Title)" } else { 'none in history' }))
+Write-Output ("Drivers failing: {0}" -f $(if (@($drvOpen).Count) { (@($drvOpen) | ForEach-Object { "$($_.Title) $($_.HResult)" }) -join '; ' } else { 'none' }))
 Write-Output ("Last failure  : {0}" -f $(if ($lastFail) { "$($lastFail.Date.ToString('yyyy-MM-dd HH:mm'))  $($lastFail.Title)  $($lastFail.HResult)" } else { 'none in history' }))
-Write-Output ("Last {0} days : {1} installed, {2} failed, {3} still failing{4}" -f $Days, $ok30, $fail30, @($openFails).Count, $(if (@($openFails).Count) { " ($($j['OpenFail']))" } else { '' }))
+Write-Output ("Last {0} days : {1} installed, {2} failed, {3} still failing{4}" -f $Days, $ok30, $fail30, @($openFails).Count, $(if (@($openFails).Count) {  " ($($j['Ofl']))" } else { '' }))
 if ($hfDate) { Write-Output ("Newest hotfix : {0}  {1}" -f $hfDate.ToString('yyyy-MM-dd'), $hfId) }
 Write-Output ("WU service    : {0}" -f $wuState)
 if ($CheckMissing) { Write-Output ("Missing       : {0}" -f $(if ($missingErr) { "scan failed: $missingErr" } else { "$missing available, $missingSec security/critical" })) }
-Write-Output ("History source: {0}" -f $src)
-Write-Output ''
-Write-Output $line   # again at the end, in case the RMM keeps only the end of long output
+Write-Output ("History source: {0}{1}" -f $src, $(if ($null -ne $histCount) { "  ($histCount Windows Update history entries)" } else { '' }))
 if ($histOk) { exit 0 } else { exit 1 }
 '@
 
