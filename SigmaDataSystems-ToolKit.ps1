@@ -11126,12 +11126,17 @@ $Script:Payloads['Get-PatchReport'] = @'
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Get-PatchReport.ps1
 .EXAMPLE
     .\Get-PatchReport.ps1 -CheckMissing -Days 60
+.EXAMPLE
+    .\Get-PatchReport.ps1 -Diag
+    Short diagnostic (fits N-central's 500-character output): what the Windows Update history and the
+    WindowsUpdateClient event log contain, and how this script sorts them - for "none in history" devices.
 #>
 [CmdletBinding()]
 param(
     [int]$Days = 30,            # window for the installed / failed counts
-    [int]$HistoryMax = 400,     # newest Windows Update history entries to read
-    [switch]$CheckMissing
+    [int]$HistoryMax = 2000,    # newest Windows Update history entries to read (Store app updates can be 3/4 of them)
+    [switch]$CheckMissing,
+    [switch]$Diag               # print only a short diagnostic of the Windows Update history / event log, then stop
 )
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -11157,13 +11162,15 @@ $defRx = '(?i)definition|security intelligence|antimalware platform|malicious so
 $storeRx = '(?i)^(9[A-Z0-9]{11}-|XP[A-Z0-9]{10}-|ApplicationSet-)|microsoft store|windows store'
 $drvRx   = '(?i)\bdriver\b|\bfirmware\b| - (Printer|USB|USBDevice|Extension|Display|SoftwareComponent|MEDIA|Other hardware|System|Image|Net|Bluetooth|Audio|Camera|Mouse|Keyboard|HIDClass|Biometric|SCSIAdapter|Monitor|Firmware|Sensor|Ports|Battery|HDC|Volume|DiskDrive|SecurityDevices|Processor|Modem|SmartCard)\b'
 $impRx   = '(?i)security|critical|cumulative|rollup|servicing stack'
-function Cat([string]$t, [string]$c) {
+# NOT named 'Cat': cat is a built-in alias of Get-Content, and aliases win over functions - every call
+# silently failed and dropped the update from the history (the fleet-wide "none in history").
+function Get-UpdateCategory([string]$t, [string]$c) {
     if ($t -match $storeRx -or $c -match 'Store') { return 'Store' }
     if ($c -match 'Driver' -or $t -match $drvRx) { return 'Drv' }
     if ($t -notmatch '(?i)preview' -and ($c -match 'Security|Critical|Rollup' -or $t -match $impRx)) { return 'Imp' }
     return 'Other'
 }
-$cuRx  = '(?i)^(?!.*\.net)(.*cumulative update for (windows|microsoft server)|\d{4}-\d{2} (security|preview|cumulative) update.*\(KB|.*monthly (security )?(quality )?rollup|.*security only|.*\(KB\d+\) \(\d{5}\.\d+\))'
+$cuRx  = '(?i)^(?!.*\.net)(.*cumulative update for (windows|microsoft server)|\d{4}-\d{2} (security|preview|cumulative) update.*\(KB|.*monthly (security )?(quality )?rollup|.*security only|.*\(KB\d+\) \(\d{5}\.\d+\)|(\d{4}-\d{2} )?(security|cumulative) update for (windows|microsoft server)( \d|\b(?! security platform| malicious)))'
 
 # ---------------------------------------------------------------- OS / boot
 $os = Get-WmiObject Win32_OperatingSystem
@@ -11209,14 +11216,24 @@ try {
         $t = ''; $hr = ''
         try { if ($_.Id -eq 20) { $t = "$($_.Properties[1].Value)"; $hr = '0x{0:X8}' -f [int64]$_.Properties[0].Value } else { $t = "$($_.Properties[0].Value)" } } catch { }
         if (-not $t) { $t = ("$($_.Message)" -replace '^.*?:\s*', '') }
-        New-Object PSObject -Property @{ Date = $_.TimeCreated; Title = $t; Code = $(if ($_.Id -eq 19) { 2 } else { 4 }); HResult = $hr; Def = ($t -match $defRx); Cat = (Cat $t '') }
+        New-Object PSObject -Property @{ Date = $_.TimeCreated; Title = $t; Code = $(if ($_.Id -eq 19) { 2 } else { 4 }); HResult = $hr; Def = ($t -match $defRx); Cat = (Get-UpdateCategory $t '') }
     })
 } catch { }
+if ($Diag) {
+    $all = @(); try { if ($srch -and $histCount) { $all = @($srch.QueryHistory(0, [Math]::Min($histCount, $HistoryMax))) } } catch { }
+    $g = { param($x) (@($x) | Group-Object | Sort-Object Count -Descending | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ',' }
+    $evAll = @(); try { $evAll = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WindowsUpdateClient' } -MaxEvents 2000 -ErrorAction Stop) } catch { }
+    $cats = @($all | Where-Object { $_.Operation -eq 1 } | ForEach-Object { $t = "$($_.Title)"; $cn = ''; try { $cn = (@($_.Categories | ForEach-Object { $_.Name }) -join ',') } catch { }; if ($t -match $defRx) { 'Def' } else { Get-UpdateCategory $t $cn } })
+    Write-Output ("PATCHDIAG n={0} read={1} op[{2}] rc[{3}] nodate={4} cat[{5}] ev19={6} ev20={7} evAll={8} ps{9} {10}" -f $histCount, $all.Count, (& $g ($all | ForEach-Object { $_.Operation })), (& $g ($all | ForEach-Object { $_.ResultCode })),
+        @($all | Where-Object { -not $_.Date }).Count, (& $g $cats), @($evAll | Where-Object { $_.Id -eq 19 }).Count, @($evAll | Where-Object { $_.Id -eq 20 }).Count, $evAll.Count, ([IntPtr]::Size * 8), $env:USERNAME)
+    foreach ($e in @($all | Where-Object { "$($_.Title)" -match '(?i)security|cumulative|rollup' -and "$($_.Title)" -notmatch '(?i)\.net|security platform|defender|intelligence|malicious' } | Select-Object -First 4)) { $t = "$($e.Title)"; Write-Output ("{0:yyyy-MM-dd} op{1} rc{2} {3}" -f $e.Date, $e.Operation, $e.ResultCode, $t.Substring(0, [Math]::Min(70, $t.Length))) }
+    exit 0
+}
 # ResultCode: 1 in progress, 2 succeeded, 3 succeeded with errors, 4 failed, 5 aborted
 $rows = @($hist | ForEach-Object {
     $d = $null; try { $d = ([datetime]$_.Date).ToLocalTime() } catch { }
     $cn = ''; try { $cn = (@($_.Categories | ForEach-Object { $_.Name }) -join ',') } catch { }
-    New-Object PSObject -Property @{ Date = $d; Title = "$($_.Title)"; Code = [int]$_.ResultCode; HResult = $(if ($_.HResult) { '0x{0:X8}' -f [int]$_.HResult } else { '' }); Def = ("$($_.Title)" -match $defRx); Cat = (Cat "$($_.Title)" $cn) }
+    New-Object PSObject -Property @{ Date = $d; Title = "$($_.Title)"; Code = [int]$_.ResultCode; HResult = $(if ($_.HResult) { '0x{0:X8}' -f [int]$_.HResult } else { '' }); Def = ("$($_.Title)" -match $defRx); Cat = (Get-UpdateCategory "$($_.Title)" $cn) }
 } | Where-Object { $_.Date })
 # WU history can be wiped (SoftwareDistribution reset / repair) and then hold only Defender, Store or driver
 # entries - so fall back to the event log whenever it has no real Windows / Microsoft install, not only when empty
@@ -11232,7 +11249,12 @@ $failRows = @($real | Where-Object { ($_.Code -eq 4 -or $_.Code -eq 5) -and $_.C
 $drvFailRows = @($real | Where-Object { ($_.Code -eq 4 -or $_.Code -eq 5) -and $_.Cat -eq 'Drv' })
 $lastOk = $okRows | Select-Object -First 1
 $lastFail = $failRows | Select-Object -First 1
-$lastCu = $okRows | Where-Object { $_.Title -match $cuRx } | Select-Object -First 1
+# Monthly OS update: Microsoft keeps renaming it ('Cumulative Update for Windows 11...', 'Security Update for Windows',
+# '2026-10 Windows 11 ... Security Update'), so besides the known names, any successful security / cumulative update
+# for Windows counts - except the ones that aren't the OS update (.NET, Security platform, MSRT, servicing stack).
+$notCuRx = '(?i)\.net|security platform|malicious software|defender|servicing stack|office|microsoft 365|edge|visual c|sql server|exchange|sharepoint|silverlight|flash'
+$buildTag = if ($build -match '\.(\d+\.\d+)$') { "($($Matches[1]))" } else { '' }
+$lastCu = $okRows | Where-Object { $_.Title -notmatch $notCuRx -and ($_.Title -match $cuRx -or ($buildTag -and $_.Title.Contains($buildTag)) -or ($_.Cat -eq 'Imp' -and $_.Title -match '(?i)\bwindows\b' -and $_.Title -match '(?i)security update|cumulative update')) } | Select-Object -First 1
 $lastDef = $rows | Where-Object { $_.Def -and ($_.Code -eq 2 -or $_.Code -eq 3) } | Select-Object -First 1
 $since = (Get-Date).AddDays(-$Days)
 $ok30 = @($okRows | Where-Object { $_.Date -ge $since }).Count
@@ -11254,13 +11276,14 @@ $lastDrvFail = $drvFailRows | Select-Object -First 1
 if ($rebootPending -and $lastOk -and $boot -and $lastOk.Date -gt $boot) { $rebootSince = Iso $lastOk.Date }
 
 # ---------------------------------------------------------------- hotfixes (second source)
-$hfDate = $null; $hfId = ''
+$hfDate = $null; $hfId = ''; $hf30 = 0
 try {
     foreach ($h in @(Get-WmiObject Win32_QuickFixEngineering)) {
         $d = $null
         try { if ($h.InstalledOn) { $d = [datetime]$h.InstalledOn } } catch { }
         if (-not $d -and "$($h.psbase.Properties['InstalledOn'].Value)" -match '^[0-9A-Fa-f]{16}$') { try { $d = [datetime]::FromFileTime([Convert]::ToInt64($h.psbase.Properties['InstalledOn'].Value, 16)) } catch { } }
         if ($d -and (-not $hfDate -or $d -gt $hfDate)) { $hfDate = $d; $hfId = "$($h.HotFixID)" }
+        if ($d -and $d -ge $since) { $hf30++ }
     }
 } catch { }
 
@@ -11269,6 +11292,7 @@ try {
 if (-not $lastOk -and $hfDate) {
     $lastOk = New-Object PSObject -Property @{ Date = $hfDate; Title = "$hfId"; Code = 2; HResult = ''; Def = $false; Cat = 'Imp' }
     $src = $(if ($src -eq 'none') { 'hotfix' } else { "$src + hotfix" })
+    if (-not $ok30) { $ok30 = $hf30 }    # installed count from the hotfix list (patches installed outside Windows Update's history)
     if ($rebootPending -and $boot -and $hfDate -gt $boot -and (-not $rebootSince -or $rebootSince -eq 'unknown')) { $rebootSince = Iso $hfDate }
 }
 
