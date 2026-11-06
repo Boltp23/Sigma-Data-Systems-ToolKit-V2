@@ -11296,6 +11296,12 @@ if ($hfCu -and (-not $lastCu -or $hfCu.Date -gt ([datetime]$lastCu.Date).Date)) 
     $lastCu = New-Object PSObject -Property @{ Date = $hfCu.Date; Title = "$($hfCu.Id) (hotfix list)"; Code = 2; HResult = ''; Def = $false; Cat = 'Imp' }
 }
 
+# hotfix list newer than Windows Update's history (patches installed outside WU): it's the real "last installed"
+if ($lastOk -and $hfDate -and $hfDate.Date -gt ([datetime]$lastOk.Date).Date) {
+    $lastOk = New-Object PSObject -Property @{ Date = $hfDate; Title = "$hfId (hotfix list)"; Code = 2; HResult = ''; Def = $false; Cat = 'Imp' }
+    if ($hf30 -gt $ok30) { $ok30 = $hf30 }
+}
+
 # no install in WU history or the event log: the newest installed hotfix (Win32_QuickFixEngineering) is the best
 # answer to "when was this machine last patched" - shows as source 'hotfix'
 if (-not $lastOk -and $hfDate) {
