@@ -454,6 +454,23 @@ function Invoke-WURepairServer {
     }
 }
 
+function Invoke-FeatureUpgrade {
+    Write-Title 'Windows 11 feature upgrade to 26H2 (enablement package from 24H2/25H2, full upgrade from 21H2-23H2 / Windows 10)'
+    Write-Host '  Check = pre-flight only (changes nothing). Upgrade = do it. Status = result of the last background upgrade.'
+    $mode = "$(Read-Default 'Mode (Check / Upgrade / Status)' 'Check')"
+    if ($mode -notmatch '^(?i)(check|upgrade|status)$') { Write-Host '  Pick Check, Upgrade or Status.' -ForegroundColor Yellow; return }
+    $p = [ordered]@{ Mode = (Get-Culture).TextInfo.ToTitleCase($mode.ToLower()) }
+    if ($p.Mode -ne 'Status') {
+        $p.MediaPath = "$(Read-Default 'Windows 11 ISO or setup folder on a share (blank = Installation Assistant download)' '')"
+        $p.EkbPath   = "$(Read-Default 'Enablement package .msu (KB5121794) on a share for 24H2/25H2 machines (blank = Windows Update)' '')"
+    }
+    if ($p.Mode -eq 'Upgrade') {
+        $p.Reboot = Read-YesNo 'Restart automatically when the upgrade is staged (10-minute warning)?' $false
+        if (-not (Confirm-Change 'Upgrade this PC to the current Windows 11 feature release.')) { return }
+    }
+    Invoke-Tool 'Invoke-SDSIFeatureUpgrade' $p | Out-Null
+}
+
 function Invoke-Win11Troubleshooter {
     Write-Title 'Windows 11 upgrade troubleshooter'
     Invoke-Tool 'Troubleshoot-Win11Upgrade' ([ordered]@{ ListActions = $true }) | Out-Null
@@ -4011,6 +4028,7 @@ $Script:Menu = @(
     @{               Text = '[!] Reset Windows Update components (Windows 10/11)';                           Action = { Invoke-WUReset } }
     @{               Text = '[!] Repair Windows Update (Windows Server 2016+)';                              Action = { Invoke-WURepairServer } }
     @{               Text = '[!] System file repair (DISM RestoreHealth + SFC)';                             Action = { Invoke-SfcDism } }
+    @{               Text = '[!] Windows 11 feature upgrade to 26H2 (check / upgrade / status)';             Action = { Invoke-FeatureUpgrade } }
     @{ Test='safe'; Text = 'Windows 11 upgrade troubleshooter (status, SetupDiag, logs...)';                Action = { Invoke-Win11Troubleshooter } }
     @{ Test='net';  Text = 'Microsoft SetupDiag - why did an upgrade fail? (downloads from Microsoft)';     Action = { Invoke-SetupDiag } }
     @{               Text = 'System Reserved / EFI partition - check & free space';                         Action = { Invoke-SystemPartition } }
@@ -22052,6 +22070,364 @@ Write-Host "  Certificate Thumbprint: $($cert.Thumbprint)"
 Write-Host "===================================================="
 Write-Host "`nNo further admin consent is required. The licensing script will authenticate"
 Write-Host "unattended using this AppId + certificate from now on."
+'@
+
+# ======================= Invoke-SDSIFeatureUpgrade.ps1 =======================
+$Script:Payloads['Invoke-SDSIFeatureUpgrade'] = @'
+<#
+.SYNOPSIS
+    Upgrades a Windows 10 / Windows 11 workstation to the current Windows 11 feature release (default 26H2) in ONE
+    step - no version-by-version hops. Built for N-central Automation Manager script tasks (runs as SYSTEM).
+
+.DESCRIPTION
+    Prepared by Sigma Data Systems Inc.  Universal - no client or machine specific values.
+
+    How each starting version is upgraded:
+      Windows 11 24H2 / 25H2 (26100 / 26200) -> 26H2 enablement package (KB5121794): ~200 KB, ~5 min, ONE restart.
+                                                 Needs the Sept 2026 cumulative update or later (build .9278+).
+      Windows 11 21H2 / 22H2 / 23H2           -> full in-place upgrade (apps, files and settings kept), ~45-90 min.
+      Windows 10 (22H2)                       -> the same full in-place upgrade, straight to Windows 11 26H2,
+                                                 if the hardware meets Windows 11's requirements.
+      Already on 26H2 or newer                -> nothing to do.
+    To stop at 25H2 instead: -TargetBuild 26200 -TargetName 25H2 -EkbKB KB5054156 (then only 24H2 uses the package).
+      Windows Server                          -> never touched (exit 0, "server - skipped").
+
+    Where the update comes from (first one that works):
+      Enablement package : -EkbPath (file share or local .msu)  ->  -EkbUrl  ->  Windows Update (searches for KB5121794)
+      Full upgrade       : -MediaPath (file share: the current Windows 11 ISO from microsoft.com/software-download/windows11, or a folder holding the ISO's files with
+                           setup.exe)  ->  download the Windows 11 Installation Assistant from Microsoft (-AssistantUrl)
+      Use a file share for sites with several machines: one 5 GB download per site instead of one per PC. The share
+      must be readable by the computer account (grant "Domain Computers" Read) because N-central runs as SYSTEM.
+
+    The full upgrade runs in the background as a one-time SYSTEM scheduled task ("SDSI-FeatureUpgrade"), so the
+    N-central task returns within a minute (status STARTED) instead of being tied up for an hour. Run again with
+    -Mode Status to see how it went: it reads the result file and the current build.
+
+    Restarts: nothing restarts unless you pass -Reboot. With -Reboot, logged-on users get a warning and the PC
+    restarts -RebootDelayMinutes later (default 10). Without it the upgrade finishes at the next restart - e.g. your
+    N-central reboot window.
+
+    Pre-flight checks (all modes): Windows Server, already current, pending restart (full upgrade only), free space on
+    C: (-MinFreeGB, default 25 for a full upgrade, 3 for the enablement package), laptop on battery under 40%,
+    an upgrade already running, Windows 11 hardware requirements (TPM 2.0, Secure Boot, the compatibility appraiser's
+    own verdict), and a TargetReleaseVersion policy that pins the device to an older version.
+
+    First line of output is one compact line for the NOC / N-central (fits the 500-character limit):
+      FEATUPG,{"V":1,"From":"23H2","B":"22631.6199","To":"26H2","Act":"Full","Res":"STARTED","Why":"..."}
+    Res values: CURRENT, SERVER, READY, STARTED, DONE (restart needed), UPGRADED, BLOCKED, FAILED, RUNNING, NONE.
+
+    Files: C:\ProgramData\SigmaDataSystems\FeatureUpgrade\  (log, state.json, cached media / installer).
+
+    Exit codes: 0 ok (current / ready / started / done)  10 hardware not eligible  11 not enough disk space
+                12 on battery  13 restart pending  14 upgrade already running  20 failed  21 no update source.
+
+.PARAMETER Mode
+    Check   - pre-flight only: says what it WOULD do and whether the device can. Changes nothing.  (default)
+    Upgrade - does it.
+    Status  - reports the result of the last background upgrade and the current version.
+
+.EXAMPLE
+    .\Invoke-SDSIFeatureUpgrade.ps1                                   # check only - run fleet-wide first
+.EXAMPLE
+    .\Invoke-SDSIFeatureUpgrade.ps1 -Mode Upgrade -MediaPath '\\server\share\Win11_26H2_x64.iso' -EkbPath '\\server\share\Windows11.0-KB5121794-x64.msu'
+.EXAMPLE
+    .\Invoke-SDSIFeatureUpgrade.ps1 -Mode Upgrade -Reboot             # sources from Microsoft, restart when done
+.EXAMPLE
+    .\Invoke-SDSIFeatureUpgrade.ps1 -Mode Status
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('Check', 'Upgrade', 'Status')]
+    [string]$Mode = 'Check',
+    [string]$MediaPath,                         # ISO, or folder with setup.exe (UNC or local) - full upgrades
+    [string]$EkbPath,                           # enablement package .msu (UNC or local) - 24H2/25H2 -> 26H2
+    [string]$EkbUrl,                            # direct download URL for the .msu
+    [string]$AssistantUrl = 'https://go.microsoft.com/fwlink/?linkid=2171764',   # Windows 11 Installation Assistant
+    [int]$TargetBuild = 26300,                  # 26H2   (25H2 = 26200)
+    [string]$TargetName = '26H2',
+    [string]$EkbKB = 'KB5121794',               # 26H2 enablement package (25H2's is KB5054156)
+    [int]$EkbMinUbr = 9278,                     # cumulative update level the enablement package needs (KB5120998)
+    [int]$MinFreeGB = 0,                        # 0 = 25 GB full upgrade / 3 GB enablement package
+    [int]$MinBatteryPercent = 40,
+    [switch]$Reboot,
+    [int]$RebootDelayMinutes = 10,
+    [switch]$RemoveVersionLock,                 # delete a TargetReleaseVersion pin (a GPO may put it back)
+    [switch]$IgnoreHardwareCheck,               # full upgrade: let setup decide instead of stopping on TPM / Secure Boot / appraiser
+    [int]$MaxHours = 6,                         # background upgrade gives up after this long
+    [string]$WorkDir = "$env:ProgramData\SigmaDataSystems\FeatureUpgrade"
+)
+$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+$LogFile = Join-Path $WorkDir 'feature-upgrade.log'
+$StatePath = Join-Path $WorkDir 'state.json'
+$TaskName = 'SDSI-FeatureUpgrade'
+$Lines = New-Object System.Collections.Generic.List[string]
+
+function Log([string]$m) { $t = "{0:yyyy-MM-dd HH:mm:ss}  {1}" -f (Get-Date), $m; try { Add-Content -LiteralPath $LogFile -Value $t -Encoding UTF8 } catch { }; $Lines.Add($m) }
+function Save-State($h) { try { ($h | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $StatePath -Encoding UTF8 } catch { } }
+function Read-State { if (Test-Path -LiteralPath $StatePath) { try { return (Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json) } catch { } }; $null }
+function Finish([string]$fRes, [string]$fAct, [string]$fWhy, [int]$code) {
+    $j = [ordered]@{ V = 1; From = $script:FromName; B = $script:BuildStr; To = $TargetName; Act = $fAct; Res = $fRes }
+    if ($fWhy) { $j.Why = $(if ($fWhy.Length -gt 220) { $fWhy.Substring(0, 217) + '...' } else { $fWhy }) }
+    Write-Output ('FEATUPG,' + ($j | ConvertTo-Json -Compress))
+    Write-Output ''
+    foreach ($l in $Lines) { Write-Output $l }
+    Log "result: $fRes ($fAct) exit $code"
+    exit $code
+}
+
+# ---------------------------------------------------------------- what is this machine
+$cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
+$Build = [int]"$($cv.CurrentBuildNumber)"; $Ubr = [int]"$($cv.UBR)"
+$script:BuildStr = "$Build.$Ubr"
+$Display = "$($cv.DisplayVersion)"; if (-not $Display) { $Display = "$($cv.ReleaseId)" }
+$IsServer = "$($cv.InstallationType)" -match '(?i)server' -or "$($cv.ProductName)" -match '(?i)server'
+$OsName = if ($Build -ge 22000) { 'Windows 11' } else { 'Windows 10' }
+$script:FromName = switch ($Build) { 26100 { '24H2' } 26200 { '25H2' } 26300 { '26H2' } default { if ($Display) { $Display } else { "$Build" } } }
+$Edition = "$($cv.EditionID)"
+Log ("{0} {1} {2} build {3} on {4}" -f $OsName, $Edition, $script:FromName, $script:BuildStr, $env:COMPUTERNAME)
+
+if ($Mode -eq 'Status') {
+    $st = Read-State
+    $running = Get-Process -Name 'SetupHost', 'Windows10UpgraderApp', 'Windows11InstallationAssistant', 'setupprep' -ErrorAction SilentlyContinue
+    if ($Build -ge $TargetBuild) { Finish 'UPGRADED' $(if ($st) { "$($st.Act)" } else { 'None' }) "Now on $OsName build $script:BuildStr" 0 }
+    if ($running) { Finish 'RUNNING' $(if ($st) { "$($st.Act)" } else { 'Full' }) ("Upgrade in progress: " + (($running | Select-Object -ExpandProperty Name -Unique) -join ', ')) 0 }
+    if (-not $st) { Finish 'NONE' 'None' 'No upgrade has been started on this device by this script' 0 }
+    Log "last run: $($st.Started) - $($st.Act) - $($st.Res) $($st.Why)"
+    Finish "$($st.Res)" "$($st.Act)" "$($st.Why)" $(if ("$($st.Res)" -eq 'FAILED') { 20 } else { 0 })
+}
+
+# ---------------------------------------------------------------- pre-flight
+if ($IsServer) { Finish 'SERVER' 'None' 'Windows Server - feature upgrades are not done by this script' 0 }
+if ($Build -ge $TargetBuild) { Finish 'CURRENT' 'None' "Already on $TargetName or newer ($script:BuildStr)" 0 }
+# 24H2 / 25H2 / 26H2 share one servicing branch: anything on it below the target only needs the enablement package
+$Act = if ($Build -ge 26100 -and $Build -lt $TargetBuild) { 'eKB' } else { 'Full' }
+if ($Act -eq 'eKB' -and $Ubr -lt $EkbMinUbr) { Finish 'BLOCKED' 'eKB' "Build $script:BuildStr is missing the cumulative update the enablement package needs (.$EkbMinUbr or later) - install this month's update first" 13 }
+if ($Act -eq 'Full' -and $Build -lt 19041) { Finish 'BLOCKED' 'Full' "Windows 10 build $Build is too old for a direct upgrade - needs 19041 (2004) or newer" 10 }
+$why = @()
+
+$busy = Get-Process -Name 'SetupHost', 'Windows10UpgraderApp', 'Windows11InstallationAssistant', 'setupprep' -ErrorAction SilentlyContinue
+if ($busy) { Finish 'RUNNING' $Act ("An upgrade is already running: " + (($busy | Select-Object -ExpandProperty Name -Unique) -join ', ')) 14 }
+
+$need = if ($MinFreeGB -gt 0) { $MinFreeGB } elseif ($Act -eq 'Full') { 25 } else { 3 }
+$freeGB = [math]::Round(((Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue).FreeSpace) / 1GB, 1)
+Log "free space on $($env:SystemDrive): $freeGB GB (needs $need GB)"
+if ($freeGB -lt $need) { Finish 'BLOCKED' $Act "Only $freeGB GB free on $($env:SystemDrive) - needs $need GB (run Disk-Space-Cleanup first)" 11 }
+
+$bat = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($bat -and $bat.BatteryStatus -eq 1 -and [int]$bat.EstimatedChargeRemaining -lt $MinBatteryPercent) {
+    Finish 'BLOCKED' $Act "On battery at $($bat.EstimatedChargeRemaining)% - plug in (needs $MinBatteryPercent%+ or AC power)" 12
+}
+
+$rebootWhy = @()
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $rebootWhy += 'CBS' }
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $rebootWhy += 'Windows Update' }
+if ($rebootWhy.Count) {
+    if ($Act -eq 'Full') { Finish 'BLOCKED' $Act ("Restart pending (" + ($rebootWhy -join ', ') + ") - restart first, setup refuses to run") 13 }
+    Log ("note: restart pending (" + ($rebootWhy -join ', ') + ") - the enablement package can still install")
+}
+
+# version lock (Group Policy / registry TargetReleaseVersion)
+$wuPol = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue
+if ($wuPol -and [int]"$($wuPol.TargetReleaseVersion)" -eq 1 -and "$($wuPol.TargetReleaseVersionInfo)") {
+    $lock = "$($wuPol.ProductVersion) $($wuPol.TargetReleaseVersionInfo)".Trim()
+    if ($RemoveVersionLock -and $Mode -eq 'Upgrade') {
+        foreach ($n in 'TargetReleaseVersion', 'TargetReleaseVersionInfo', 'ProductVersion') { Remove-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -Name $n -ErrorAction SilentlyContinue }
+        Log "removed version lock ($lock) - if a Group Policy sets it, it comes back at the next policy refresh: change the GPO too"
+    } else {
+        Log "version lock: Windows Update is pinned to $lock (TargetReleaseVersion policy). This script installs past it, but Windows Update will keep offering nothing newer - remove it in the GPO or run with -RemoveVersionLock"
+    }
+}
+
+# Windows 11 hardware requirements (only matter for a full upgrade)
+if ($Act -eq 'Full') {
+    $hw = @()
+    try { $tpm = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftTpm' -ClassName Win32_Tpm -ErrorAction Stop } catch { $tpm = $null }
+    if (-not $tpm) { $hw += 'no TPM' } elseif ("$($tpm.SpecVersion)" -notmatch '^2\.') { $hw += "TPM $(("$($tpm.SpecVersion)" -split ',')[0])" }
+    $sb = $null; try { $sb = Confirm-SecureBootUEFI -ErrorAction Stop } catch { }
+    if ($null -eq $sb) { $hw += 'legacy BIOS (no Secure Boot)' } elseif (-not $sb) { $hw += 'Secure Boot off' }
+    # the compatibility appraiser's own verdict for Windows 11 (RedReason = what blocks it)
+    $ind = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\TargetVersionUpgradeExperienceIndicators'
+    $red = @(Get-ChildItem $ind -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^(NI|GE|CU)' } | ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).RedReason } | Where-Object { $_ -and $_ -ne 'None' } | Select-Object -Unique)
+    if ($red.Count) { $hw += ('appraiser: ' + ($red -join ', ')) }
+    if ($hw.Count) {
+        Log ('hardware: ' + ($hw -join '; '))
+        if (-not $IgnoreHardwareCheck -and ($hw -match 'no TPM|legacy BIOS|TPM 1')) { Finish 'BLOCKED' 'Full' ('Not eligible for Windows 11: ' + ($hw -join '; ')) 10 }
+        $why += ('hardware warnings: ' + ($hw -join '; '))
+    } else { Log 'hardware: TPM 2.0 and Secure Boot OK' }
+}
+
+# ---------------------------------------------------------------- source
+function Test-Src([string]$p) { if (-not $p) { return $false }; try { return (Test-Path -LiteralPath $p) } catch { return $false } }
+if ($Act -eq 'eKB') {
+    $src = if (Test-Src $EkbPath) { "file $EkbPath" } elseif ($EkbPath) { $why += "EkbPath not reachable as SYSTEM: $EkbPath"; $null } else { $null }
+    if (-not $src -and $EkbUrl) { $src = "download $EkbUrl" }
+    if (-not $src) { $src = 'Windows Update' }
+} else {
+    $src = if (Test-Src $MediaPath) { "media $MediaPath" } elseif ($MediaPath) { $why += "MediaPath not reachable as SYSTEM: $MediaPath (grant Domain Computers read)"; $null } else { $null }
+    if (-not $src) { $src = 'Installation Assistant download' }
+}
+Log "plan: $Act from $($script:FromName) to $TargetName using $src"
+
+if ($Mode -eq 'Check') { Finish 'READY' $Act (("Would upgrade $($script:FromName) -> $TargetName via $Act from $src") + $(if ($why.Count) { ' | ' + ($why -join ' | ') })) 0 }
+
+# ---------------------------------------------------------------- upgrade: enablement package (24H2 / 25H2 -> 26H2)
+function Start-RebootWarned([string]$what) {
+    $msg = "Your computer will restart in $RebootDelayMinutes minutes to finish $what. Please save your work. - Sigma Data Systems"
+    try { & msg.exe * /TIME:600 $msg 2>$null } catch { }
+    & shutdown.exe /r /t ($RebootDelayMinutes * 60) /c $msg /d p:2:17 2>$null | Out-Null
+    Log "restart scheduled in $RebootDelayMinutes minutes"
+}
+
+if ($Act -eq 'eKB') {
+    $state = [ordered]@{ Started = (Get-Date).ToString('s'); Act = 'eKB'; From = $script:FromName; Build = $script:BuildStr; Source = $src; Res = 'RUNNING'; Why = '' }
+    Save-State $state
+    $ok = $false; $detail = ''
+    $msu = $null
+    if ($src -like 'file *') { $msu = Join-Path $WorkDir ([IO.Path]::GetFileName($EkbPath)); Copy-Item -LiteralPath $EkbPath -Destination $msu -Force -ErrorAction SilentlyContinue }
+    elseif ($src -like 'download *') {
+        $msu = Join-Path $WorkDir "$EkbKB-x64.msu"
+        try { Invoke-WebRequest -Uri $EkbUrl -OutFile $msu -UseBasicParsing -ErrorAction Stop } catch { Log "download failed: $($_.Exception.Message) - trying Windows Update"; $msu = $null; $src = 'Windows Update' }
+    }
+    if ($msu -and (Test-Path -LiteralPath $msu)) {
+        Log "installing $msu (wusa)"
+        $p = Start-Process -FilePath "$env:SystemRoot\System32\wusa.exe" -ArgumentList "`"$msu`" /quiet /norestart" -Wait -PassThru
+        $rc = $p.ExitCode
+        if ($rc -notin 0, 3010, 2359302) {
+            Log "wusa exit $rc - trying DISM"
+            $d = Start-Process -FilePath "$env:SystemRoot\System32\dism.exe" -ArgumentList "/Online /Add-Package /PackagePath:`"$msu`" /Quiet /NoRestart" -Wait -PassThru
+            $rc = $d.ExitCode
+        }
+        $ok = $rc -in 0, 3010, 2359302; $detail = "installer exit $rc$(if ($rc -eq 2359302) { ' (already installed)' })"
+    } else {
+        # Windows Update: find the enablement package / feature update and install it
+        try {
+            $ses = New-Object -ComObject Microsoft.Update.Session
+            $srch = $ses.CreateUpdateSearcher(); $srch.ServerSelection = 2     # 2 = Windows Update online, not WSUS / N-central
+            Log 'searching Windows Update for the enablement package...'
+            $res = $srch.Search("IsInstalled=0 and IsHidden=0")
+            $kbNum = $EkbKB -replace '\D', ''
+            $hit = @($res.Updates | Where-Object { @($_.KBArticleIDs) -contains $kbNum -or "$($_.Title)" -match "version $TargetName" }) | Select-Object -First 1
+            if (-not $hit) { $state.Res = 'FAILED'; $state.Why = "Windows Update did not offer $EkbKB - pass -EkbPath (file share) or -EkbUrl"; Save-State $state; Finish 'FAILED' 'eKB' $state.Why 21 }
+            Log "found: $($hit.Title)"
+            if (-not $hit.EulaAccepted) { $hit.AcceptEula() }
+            $col = New-Object -ComObject Microsoft.Update.UpdateColl; [void]$col.Add($hit)
+            $dl = $ses.CreateUpdateDownloader(); $dl.Updates = $col; [void]$dl.Download()
+            $ins = $ses.CreateUpdateInstaller(); $ins.Updates = $col; $r = $ins.Install()
+            $ok = $r.ResultCode -in 2, 3; $detail = "Windows Update result $($r.ResultCode), HResult 0x{0:X8}" -f ([int64]$r.HResult -band 0xFFFFFFFFL)
+        } catch { $detail = "Windows Update error: $($_.Exception.Message)" }
+    }
+    Log $detail
+    if ($ok) {
+        $state.Res = 'DONE'; $state.Why = "Enablement package installed ($detail) - becomes $TargetName after one restart"; Save-State $state
+        if ($Reboot) { Start-RebootWarned "the Windows 11 $TargetName update" }
+        Finish 'DONE' 'eKB' $state.Why 0
+    }
+    $state.Res = 'FAILED'; $state.Why = "Enablement package failed: $detail"; Save-State $state
+    Finish 'FAILED' 'eKB' $state.Why 20
+}
+
+# ---------------------------------------------------------------- upgrade: full in-place upgrade, in the background
+# A small runner script is written next to the log and started as a one-time SYSTEM scheduled task. It mounts / copies
+# the media (or downloads the Installation Assistant), runs setup, waits for it, records the result and restarts if
+# -Reboot was given, then removes its own scheduled task.
+$cfg = [ordered]@{ Act = 'Full'; From = $script:FromName; Build = $script:BuildStr; MediaPath = $(if ($src -like 'media *') { $MediaPath } else { '' })
+    AssistantUrl = $AssistantUrl; Reboot = [bool]$Reboot; RebootDelayMinutes = $RebootDelayMinutes; MaxHours = $MaxHours; TargetName = $TargetName
+    WorkDir = $WorkDir; TaskName = $TaskName; IgnoreHardwareCheck = [bool]$IgnoreHardwareCheck }
+($cfg | ConvertTo-Json) | Set-Content -LiteralPath (Join-Path $WorkDir 'runner.json') -Encoding UTF8
+
+# (a script block, not a here-string, so this file can itself be embedded in the ToolKit's here-strings)
+$runner = {
+$ErrorActionPreference = 'Continue'; $ProgressPreference = 'SilentlyContinue'
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$c = Get-Content -LiteralPath (Join-Path $dir 'runner.json') -Raw | ConvertFrom-Json
+$log = Join-Path $dir 'feature-upgrade.log'; $sp = Join-Path $dir 'state.json'
+function L([string]$m) { Add-Content -LiteralPath $log -Value ("{0:yyyy-MM-dd HH:mm:ss}  [runner] {1}" -f (Get-Date), $m) -Encoding UTF8 }
+$st = [ordered]@{ Started = (Get-Date).ToString('s'); Act = 'Full'; From = $c.From; Build = $c.Build; Source = ''; Res = 'RUNNING'; Why = '' }
+function S { ($st | ConvertTo-Json) | Set-Content -LiteralPath $sp -Encoding UTF8 }
+function Done([string]$res, [string]$why) {
+    $st.Res = $res; $st.Why = $why; $st.Ended = (Get-Date).ToString('s'); S; L "$res - $why"
+    if ($res -eq 'DONE' -and $c.Reboot) {
+        $m = "Your computer will restart in $($c.RebootDelayMinutes) minutes to finish the Windows 11 $($c.TargetName) upgrade. Please save your work. - Sigma Data Systems"
+        try { & msg.exe * /TIME:600 $m 2>$null } catch { }
+        & shutdown.exe /r /t ([int]$c.RebootDelayMinutes * 60) /c $m /d p:2:17 2>$null | Out-Null; L 'restart scheduled'
+    }
+    try { Unregister-ScheduledTask -TaskName $c.TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+    if ($mounted) { try { Dismount-DiskImage -ImagePath $mounted -ErrorAction SilentlyContinue | Out-Null } catch { } }
+    exit 0
+}
+S; $mounted = $null
+$codes = @{ '0xC1900210' = 'compatible (no issues)'; '0xC1900208' = 'an installed app blocks the upgrade'; '0xC1900204' = 'upgrade path not available for this edition / language'
+    '0xC1900200' = 'hardware does not meet Windows 11 requirements'; '0xC1900202' = 'hardware does not meet Windows 11 requirements'; '0xC190020E' = 'not enough disk space'
+    '0xC1900107' = 'a cleanup from a previous upgrade is pending - restart and retry'; '0xC1900101' = 'a driver failed - rolled back'; '0xC1800118' = 'WSUS / N-central upgrade metadata problem'
+    '0x80070070' = 'not enough disk space'; '0xC1900209' = 'an installed app blocks the upgrade' }
+function Why-Code([int64]$rc) { $h = '0x{0:X8}' -f ($rc -band 0xFFFFFFFFL); if ($codes[$h]) { "$h $($codes[$h])" } else { "exit $h" } }
+$deadline = (Get-Date).AddHours([double]$c.MaxHours)
+
+if ($c.MediaPath) {
+    # ---- setup.exe from the share (ISO or extracted folder)
+    $setup = $null; $mp = $c.MediaPath
+    if ($mp -match '\.iso$') {
+        try { $img = Mount-DiskImage -ImagePath $mp -PassThru -ErrorAction Stop; $mounted = $mp } catch {
+            L "can't mount the ISO from the share ($($_.Exception.Message)) - copying it locally first"
+            $loc = Join-Path $dir ([IO.Path]::GetFileName($mp)); Copy-Item -LiteralPath $mp -Destination $loc -Force
+            try { $img = Mount-DiskImage -ImagePath $loc -PassThru -ErrorAction Stop; $mounted = $loc } catch { Done 'FAILED' "Can't mount $mp : $($_.Exception.Message)" }
+        }
+        Start-Sleep -Seconds 3
+        $vol = ($img | Get-Volume -ErrorAction SilentlyContinue).DriveLetter
+        if (-not $vol) { $vol = (Get-DiskImage -ImagePath $mounted | Get-Volume).DriveLetter }
+        $setup = "$($vol):\setup.exe"
+    } else { $setup = Join-Path $mp 'setup.exe' }
+    if (-not (Test-Path -LiteralPath $setup)) { Done 'FAILED' "setup.exe not found in $mp" }
+    $st.Source = "media $mp"; S
+    $logs = Join-Path $dir 'setup-logs'; New-Item -ItemType Directory -Path $logs -Force | Out-Null
+    $args2 = @('/auto', 'upgrade', '/quiet', '/eula', 'accept', '/noreboot', '/dynamicupdate', 'disable', '/showoobe', 'none', '/telemetry', 'disable', '/copylogs', "`"$logs`"")
+    if ($c.IgnoreHardwareCheck) { $args2 += @('/compat', 'ignorewarning') }
+    L "running $setup $($args2 -join ' ')"
+    $p = Start-Process -FilePath $setup -ArgumentList $args2 -PassThru
+    while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 30 }
+    if (-not $p.HasExited) { Done 'FAILED' "setup still running after $($c.MaxHours) h - check $logs" }
+    $rc = [int64]$p.ExitCode
+    if ($rc -in 0, 3010) { Done 'DONE' "Upgrade staged (setup exit $rc) - becomes Windows 11 $($c.TargetName) at the next restart (takes 15-30 min)" }
+    Done 'FAILED' ("Setup failed: " + (Why-Code $rc) + " - logs in $logs")
+}
+
+# ---- no media: Windows 11 Installation Assistant from Microsoft
+$st.Source = 'Installation Assistant'; S
+$exe = Join-Path $dir 'Windows11InstallationAssistant.exe'
+try { Invoke-WebRequest -Uri $c.AssistantUrl -OutFile $exe -UseBasicParsing -ErrorAction Stop } catch { Done 'FAILED' "Installation Assistant download failed: $($_.Exception.Message)" }
+L 'starting the Installation Assistant (downloads ~4 GB itself)'
+$p = Start-Process -FilePath $exe -ArgumentList @('/QuietInstall', '/SkipEULA', '/Auto', 'Upgrade', '/NoRestartUI', '/CopyLogs', "`"$dir`"") -PassThru
+Start-Sleep -Seconds 120
+$names = 'Windows11InstallationAssistant', 'Windows10UpgraderApp', 'SetupHost', 'setupprep'
+while ((Get-Process -Name $names -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 60 }
+if (Get-Process -Name $names -ErrorAction SilentlyContinue) { Done 'FAILED' "Installation Assistant still running after $($c.MaxHours) h" }
+$pend = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or (Test-Path "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setupact.log" -NewerThan (Get-Date).AddMinutes(-90))
+$sd = Get-ChildItem "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther" -Filter 'setuperr.log' -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($pend) { Done 'DONE' "Installation Assistant finished staging - becomes Windows 11 $($c.TargetName) at the next restart" }
+Done 'FAILED' ("Installation Assistant ended without staging the upgrade" + $(if ($sd) { " - see $($sd.FullName)" }) + ' (no TPM 2.0 / Secure Boot? use -MediaPath with setup.exe)')
+}.ToString()
+$runPath = Join-Path $WorkDir 'Run-FeatureUpgrade.ps1'
+Set-Content -LiteralPath $runPath -Value $runner -Encoding UTF8
+
+$state = [ordered]@{ Started = (Get-Date).ToString('s'); Act = 'Full'; From = $script:FromName; Build = $script:BuildStr; Source = $src; Res = 'STARTED'; Why = '' }
+Save-State $state
+try {
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runPath`""
+    $pr = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $se = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours ($MaxHours + 1)) -StartWhenAvailable
+    Register-ScheduledTask -TaskName $TaskName -Action $a -Principal $pr -Settings $se -Force -ErrorAction Stop | Out-Null
+    Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+} catch {
+    $state.Res = 'FAILED'; $state.Why = "Couldn't start the background task: $($_.Exception.Message)"; Save-State $state
+    Finish 'FAILED' 'Full' $state.Why 20
+}
+Log "background upgrade started (scheduled task $TaskName) - check later with -Mode Status"
+Finish 'STARTED' 'Full' (("Full upgrade $($script:FromName) -> $TargetName started in the background from $src" + $(if ($Reboot) { ', restarts when staged' } else { ', finishes at the next restart' })) + $(if ($why.Count) { ' | ' + ($why -join ' | ') })) 0
 '@
 
 # ======================= Troubleshoot-Win11Upgrade.ps1 =======================
