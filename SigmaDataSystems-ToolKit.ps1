@@ -33,6 +33,9 @@
     report to C:\temp\SelfTest. Add -IncludeSlow and/or -IncludeDownloads for full coverage.
 
 .NOTES
+    v2.0.4 - Hosted web app / API reachability monitor: for vendor-hosted apps whose login/API calls time out
+    intermittently. Logs public egress IP (multi-WAN/SD-WAN), every DNS A record, TCP to each IP, HTTP status; CSV + summary.
+    Live mode or a SYSTEM scheduled task (e.g. 72 h) that resumes after reboot and removes itself when done.
     v2.0.3 - PHP2Shell scan (CVE-2026-109618 / CVE-2026-109619): finds PHP installs on this machine, checks
     version vs fixed releases, web-served detection, webshell/OOM compromise indicators, optional interim
     php.ini mitigation; or checks a list of websites from the outside (passive fingerprint).
@@ -74,7 +77,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$Script:ToolkitVersion = '2.0.3'
+$Script:ToolkitVersion = '2.0.4'
 $Script:Auto = [bool]$SelfTest
 $Script:LastToolExit = $null
 $Script:OutRoot  = $OutputRoot
@@ -740,6 +743,111 @@ function Invoke-InternetDropMonitor {
         return
     }
     Invoke-Tool 'Start-InternetDropMonitor' $p | Out-Null
+}
+
+function Invoke-WebAppReachability {
+    Write-Title 'Hosted web app / API reachability monitor (intermittent timeouts: DNS per IP, TCP, HTTP, egress WAN)'
+    Write-Host '  For a vendor-hosted app that loads but its login/API calls time out (browser F12 shows ERR_CONNECTION_TIMED_OUT).' -ForegroundColor DarkGray
+    Write-Host '  Each pass logs: public egress IP (multi-WAN / SD-WAN path), every DNS A record, TCP to EACH IP, HTTP status.' -ForegroundColor DarkGray
+    $task = 'SDSI - Endpoint Reachability Monitor'
+    $bgDir = Get-OutDir 'Network\EndpointReachability'
+    Write-Host ''
+    Write-Host '  1. Watch live in this window (press Q to stop)'
+    Write-Host '  2. [!] Run in the background as a SYSTEM scheduled task (e.g. 72 h; resumes after reboot, self-removes)'
+    Write-Host '  3. Summarize a background log'
+    Write-Host '  4. [!] Stop / remove the background task'
+    $mode = Read-Default 'Choice' '1'
+    if ($mode -eq '3') {
+        $logs = @(Get-ChildItem -Path $bgDir -Filter 'EndpointReachability-*.csv' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+        if (-not $logs) { Write-Host "  No logs in $bgDir." -ForegroundColor Yellow; return }
+        for ($i = 0; $i -lt [math]::Min(10, $logs.Count); $i++) { Write-Host ("  {0}. {1}  ({2:g})" -f ($i + 1), $logs[$i].Name, $logs[$i].LastWriteTime) }
+        $n = Read-Int 'Which log' 1
+        if ($n -lt 1 -or $n -gt $logs.Count) { return }
+        Invoke-Tool 'Test-EndpointReachability' ([ordered]@{ SummaryOnly = $true; OutputFolder = $bgDir; CsvName = $logs[$n - 1].Name }) | Out-Null
+        return
+    }
+    if ($mode -eq '4') {
+        if (-not (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue)) { Write-Host '  No background task found.' -ForegroundColor Yellow; return }
+        if (Confirm-Change "Stop and remove the '$task' scheduled task (logs are kept).") {
+            Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
+            Write-Host "  Removed. Logs: $bgDir  (use option 3 to summarize)" -ForegroundColor Green
+        }
+        return
+    }
+    $url = Read-Default 'App URL (e.g. https://app.example.com:3000/login)' ''
+    if (-not $url) { return }
+    if ($url -notmatch '^[a-z]+://') { $url = "https://$url" }
+    try { $u = [uri]$url } catch { Write-Host '  Not a valid URL.' -ForegroundColor Red; return }
+    $hostName = $u.Host; $port = $u.Port
+    $interval = Read-Int 'Seconds between passes' 30
+    if ($mode -eq '2') {
+        $hrs = Read-Int 'Hours to keep monitoring' 72
+        if (-not (Confirm-Change "Create scheduled task '$task' (runs as SYSTEM for $hrs h, logs to $bgDir).")) { return }
+        $script = Save-Payload 'Test-EndpointReachability' $bgDir
+        $path = if ($u.PathAndQuery) { $u.PathAndQuery } else { '/' }
+        & $Script:PSExe -NoProfile -ExecutionPolicy Bypass -File $script -TargetHost $u.Host -Port $u.Port -Path $path -Scheme $u.Scheme `
+            -IntervalSeconds $interval -DurationMinutes ($hrs * 60) -OutputFolder $bgDir -TaskName $task -InstallTask
+        Write-Host '  Come back and use option 3 to summarize, or option 4 to stop it early.' -ForegroundColor DarkGray
+        return
+    }
+    $minutes  = Read-Int 'Minutes to run (Q stops early)' 60
+    $timeout  = Read-Int 'TCP/HTTP timeout (ms)' 5000
+    $log = Join-Path (Get-OutDir 'Network\WebAppReachability') "WebAppReachability_$(Get-Stamp).csv"
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+
+    $getEgress = {
+        foreach ($svc in 'https://api.ipify.org', 'https://ifconfig.me/ip', 'https://icanhazip.com') {
+            try { return ("" + (Invoke-RestMethod -Uri $svc -TimeoutSec 5 -UseBasicParsing)).Trim() } catch { }
+        }
+        'unknown'
+    }
+    $tcp = {
+        param($ip)
+        $c = New-Object System.Net.Sockets.TcpClient; $sw = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $iar = $c.BeginConnect($ip, $port, $null, $null)
+            if ($iar.AsyncWaitHandle.WaitOne($timeout, $false) -and $c.Connected) { $c.EndConnect($iar); return @('Open', $sw.ElapsedMilliseconds) }
+            return @('Timeout', $timeout)
+        } catch { return @('Refused/Error', $sw.ElapsedMilliseconds) } finally { $c.Close() }
+    }
+    $http = {
+        try { $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec ([math]::Ceiling($timeout / 1000)) -MaximumRedirection 0 -ErrorAction Stop; "$($r.StatusCode)" }
+        catch { if ($_.Exception.Response) { "$([int]$_.Exception.Response.StatusCode)" } else { "Fail: $($_.Exception.Message)" } }
+    }
+
+    Write-Host "  Target: $url   Log: $log   Press Q to stop." -ForegroundColor Cyan
+    $end = (Get-Date).AddMinutes($minutes); $pass = 0
+    :outer while ((Get-Date) -lt $end) {
+        $pass++; $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $egress = & $getEgress
+        $ips = @(Resolve-DnsName -Name $hostName -Type A -DnsOnly -ErrorAction SilentlyContinue | Where-Object { $_.Type -eq 'A' } | Select-Object -ExpandProperty IPAddress)
+        $hs = & $http
+        if (-not $ips) { $ips = @('DNS-FAIL') }
+        foreach ($ip in $ips) {
+            $t = if ($ip -eq 'DNS-FAIL') { @('DNS-FAIL', '') } else { & $tcp $ip }
+            [pscustomobject]@{ Time = $now; Pass = $pass; EgressIP = $egress; ResolvedIPs = ($ips -join ';'); TestedIP = $ip; Port = $port; Tcp = $t[0]; TcpMs = $t[1]; Http = $hs } |
+                Export-Csv -Path $log -NoTypeInformation -Append
+            $color = if ($t[0] -eq 'Open' -and $hs -notlike 'Fail*') { 'Green' } else { 'Red' }
+            Write-Host ("  {0}  egress={1,-15} ip={2,-15} tcp{3}={4} ({5}ms)  http={6}" -f $now, $egress, $ip, $port, $t[0], $t[1], $hs) -ForegroundColor $color
+        }
+        $until = (Get-Date).AddSeconds($interval)
+        while ((Get-Date) -lt $until) {
+            $q = $false; try { $q = [Console]::KeyAvailable -and [Console]::ReadKey($true).Key -eq 'Q' } catch { }
+            if ($q) { Write-Host '  Stopped.'; break outer }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+
+    $data = @(Import-Csv $log -ErrorAction SilentlyContinue)
+    if (-not $data) { return }
+    Write-Host "`n  ===== SUMMARY =====" -ForegroundColor Cyan
+    foreach ($g in ($data | Group-Object EgressIP)) { $ok = @($g.Group | Where-Object Tcp -eq 'Open').Count; Write-Host ("  Egress {0,-16} OK={1,-5} FAIL={2}" -f $g.Name, $ok, ($g.Count - $ok)) }
+    foreach ($g in ($data | Group-Object TestedIP)) { $ok = @($g.Group | Where-Object Tcp -eq 'Open').Count; Write-Host ("  Dest   {0,-16} OK={1,-5} FAIL={2}" -f $g.Name, $ok, ($g.Count - $ok)) }
+    Write-Host '  Failures on one egress IP only  -> WAN / SD-WAN path or vendor source-IP allow-list.' -ForegroundColor DarkGray
+    Write-Host '  Failures on one destination IP  -> bad DNS record / dead vendor node.' -ForegroundColor DarkGray
+    Write-Host '  Everything fails together       -> vendor outage, or local firewall policy (compare from a hotspot).' -ForegroundColor DarkGray
+    Write-Host "  Log: $log" -ForegroundColor Green
 }
 
 function Invoke-Dhcp1059 {
@@ -4044,6 +4152,7 @@ $Script:Menu = @(
     @{ Test='net';  Text = 'Internet speed test (built-in Cloudflare test or Ookla Speedtest CLI)';       Action = { Invoke-SpeedTest } }
     @{ Test='safe'; Text = 'Ping / port reachability test (optional live monitor)';                         Action = { Invoke-ReachabilityTest } }
     @{               Text = 'Internet drop monitor (PingInfo) - log drops, LAN vs gateway vs WAN/ISP diagnosis'; Action = { Invoke-InternetDropMonitor } }
+    @{               Text = 'Hosted web app / API reachability monitor (live or 72 h background task; per-IP DNS, egress WAN)'; Action = { Invoke-WebAppReachability } }
     @{ Test='slow'; Text = 'Advanced network diagnostics (DNS per server, loss, MTU, tracert, proxy, Wi-Fi)'; Action = { Invoke-NetworkDeepDive } }
     @{ Test='safe'; Text = 'Wi-Fi deep diagnostics (signal, channels & congestion, neighbors, roaming, driver, drops)'; Action = { Invoke-WifiDiagnostics } }
     @{               Text = 'Wi-Fi live monitor (signal / roams / channel changes / drops / lag over time)';    Action = { Invoke-WifiMonitor } }
@@ -25255,6 +25364,215 @@ $Script:Payloads['data/license-sku-map.json'] = @'
     "ENTERPRISEPREMIUM",
     "SPE_E5"
   ]
+}
+'@
+
+# ======================= Test-EndpointReachability.ps1 =======================
+$Script:Payloads['Test-EndpointReachability'] = @'
+<#
+.SYNOPSIS
+    Sigma Data Systems Inc. - Intermittent endpoint reachability monitor.
+
+.DESCRIPTION
+    Repeatedly tests a remote host/port to catch intermittent outages
+    (e.g. a hosted web app whose login/API calls time out some of the time).
+    Each pass records:
+      - Public egress IP (detects multi-WAN / SD-WAN path changes)
+      - Every DNS A record returned for the host
+      - TCP connect result + latency to EACH resolved IP
+      - HTTP(S) response status for the URL
+    Results go to a CSV so failures can be lined up with firewall logs.
+
+    Can run interactively, or install itself as a SYSTEM scheduled task
+    (-InstallTask) that survives reboots and removes itself when the run ends.
+
+    Universal: no client-specific values. Supply the host/port at run time.
+
+.EXAMPLE
+    .\Test-EndpointReachability.ps1 -TargetHost app.example.com -Port 3000 -Path /login -DurationMinutes 120
+
+.EXAMPLE
+    # 72-hour background run as a scheduled task (resumes after reboot, self-removes at the end)
+    .\Test-EndpointReachability.ps1 -TargetHost app.example.com -Port 3000 -Path /login -DurationMinutes 4320 -InstallTask
+
+.EXAMPLE
+    .\Test-EndpointReachability.ps1 -RemoveTask        # stop early (logs are kept)
+.EXAMPLE
+    .\Test-EndpointReachability.ps1 -SummaryOnly -CsvName EndpointReachability-20261111-130000.csv
+#>
+[CmdletBinding()]
+param(
+    [string]$TargetHost,
+    [int]$Port = 443,
+    [string]$Path = "/",
+    [ValidateSet("https","http")][string]$Scheme = "https",
+    [int]$IntervalSeconds = 30,
+    [int]$DurationMinutes = 60,
+    [int]$TimeoutMs = 5000,
+    [string]$OutputFolder = "C:\temp\Network\EndpointReachability",
+    [string]$CsvName,
+    [string]$EndTime,
+    [switch]$InstallTask,
+    [switch]$RemoveTask,
+    [switch]$SummaryOnly,
+    [string]$TaskName = "SDSI - Endpoint Reachability Monitor"
+)
+
+if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
+
+# ---------------- Task management ----------------
+if ($RemoveTask) {
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        Write-Host "Removed scheduled task '$TaskName'. Logs kept in $OutputFolder" -ForegroundColor Green
+    } else { Write-Host "No scheduled task named '$TaskName'." -ForegroundColor Yellow }
+    return
+}
+
+if ($InstallTask) {
+    if (-not $TargetHost) { throw "-TargetHost is required." }
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) { throw "Run elevated (or as SYSTEM from RMM) to create the scheduled task." }
+
+    $dest = Join-Path $OutputFolder "Test-EndpointReachability.ps1"
+    if ($PSCommandPath -and ((Resolve-Path $PSCommandPath).Path -ne $dest)) { Copy-Item -Path $PSCommandPath -Destination $dest -Force }
+    $end  = (Get-Date).AddMinutes($DurationMinutes)
+    $csv  = "EndpointReachability-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+    $psExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+    $argText = "-NoProfile -ExecutionPolicy Bypass -File `"$dest`" -TargetHost `"$TargetHost`" -Port $Port -Path `"$Path`" -Scheme $Scheme " +
+               "-IntervalSeconds $IntervalSeconds -TimeoutMs $TimeoutMs -OutputFolder `"$OutputFolder`" -CsvName `"$csv`" " +
+               "-EndTime `"$($end.ToString('o'))`" -TaskName `"$TaskName`""
+
+    $action   = New-ScheduledTaskAction -Execute $psExe -Argument $argText
+    $triggers = @(
+        (New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10)),
+        (New-ScheduledTaskTrigger -AtStartup)            # resume after a reboot, same CSV, same end time
+    )
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
+                -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes ($DurationMinutes + 60))
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Force | Out-Null
+    Write-Host "Scheduled task '$TaskName' created." -ForegroundColor Green
+    Write-Host "  Target : $($Scheme)://$($TargetHost):$Port$Path"
+    Write-Host "  Runs   : until $end (resumes after reboot, removes itself when done)"
+    Write-Host "  Log    : $(Join-Path $OutputFolder $csv)"
+    Write-Host "  Stop   : .\Test-EndpointReachability.ps1 -RemoveTask"
+    return
+}
+
+if (-not $CsvName) { $CsvName = "EndpointReachability-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv" }
+$csvPath = Join-Path $OutputFolder $CsvName
+
+function Show-Summary([string]$File) {
+    $data = @(Import-Csv $File -ErrorAction SilentlyContinue)
+    if (-not $data) { Write-Host "No data in $File"; return }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("===== SUMMARY  $File =====")
+    $lines.Add("First: $($data[0].Time)   Last: $($data[-1].Time)   Rows: $($data.Count)")
+    foreach ($g in ($data | Group-Object EgressIP)) {
+        $ok = @($g.Group | Where-Object TcpResult -eq "Open").Count
+        $lines.Add(("Egress {0,-16}  OK={1,-6} FAIL={2}" -f $g.Name, $ok, ($g.Count - $ok)))
+    }
+    foreach ($g in ($data | Group-Object TestedIP)) {
+        $ok = @($g.Group | Where-Object TcpResult -eq "Open").Count
+        $lines.Add(("Dest   {0,-16}  OK={1,-6} FAIL={2}" -f $g.Name, $ok, ($g.Count - $ok)))
+    }
+    # Failure windows (consecutive failed passes)
+    $lines.Add("Failure windows:")
+    $inFail = $false; $start = $null; $prev = $null
+    foreach ($p in ($data | Group-Object Pass | Sort-Object { [int]$_.Name })) {
+        $bad = @($p.Group | Where-Object { $_.TcpResult -ne "Open" }).Count -gt 0
+        $t = $p.Group[0].Time
+        if ($bad -and -not $inFail) { $inFail = $true; $start = $t }
+        if (-not $bad -and $inFail) { $inFail = $false; $lines.Add("  $start  ->  $prev") }
+        $prev = $t
+    }
+    if ($inFail) { $lines.Add("  $start  ->  $prev (still failing at end)") }
+    $lines.Add("If failures cluster on one EgressIP -> WAN/SD-WAN path or vendor IP allow-list.")
+    $lines.Add("If failures cluster on one destination IP -> bad DNS record / vendor node.")
+    $lines.Add("If everything fails at once on all paths -> vendor outage or local firewall policy.")
+    $lines | ForEach-Object { Write-Host $_ }
+    $lines | Set-Content -Path ([IO.Path]::ChangeExtension($File, ".summary.txt"))
+}
+
+if ($SummaryOnly) { Show-Summary $csvPath; return }
+if (-not $TargetHost) { throw "-TargetHost is required." }
+
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+
+function Get-EgressIP {
+    foreach ($svc in "https://api.ipify.org","https://ifconfig.me/ip","https://icanhazip.com") {
+        try { return (Invoke-RestMethod -Uri $svc -TimeoutSec 5 -UseBasicParsing).ToString().Trim() } catch {}
+    }
+    return "unknown"
+}
+
+function Test-Tcp([string]$Ip, [int]$P, [int]$Timeout) {
+    $client = New-Object System.Net.Sockets.TcpClient
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $iar = $client.BeginConnect($Ip, $P, $null, $null)
+        if ($iar.AsyncWaitHandle.WaitOne($Timeout, $false) -and $client.Connected) {
+            $client.EndConnect($iar); $sw.Stop()
+            return @{ Result = "Open"; Ms = $sw.ElapsedMilliseconds }
+        }
+        return @{ Result = "Timeout"; Ms = $Timeout }
+    } catch {
+        return @{ Result = "Refused/Error"; Ms = $sw.ElapsedMilliseconds }
+    } finally { $client.Close() }
+}
+
+function Test-Http([string]$Url, [int]$Timeout) {
+    try {
+        $r = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec ([math]::Ceiling($Timeout/1000)) -MaximumRedirection 0 -ErrorAction Stop
+        return "$($r.StatusCode)"
+    } catch {
+        if ($_.Exception.Response) { return "$([int]$_.Exception.Response.StatusCode)" }
+        return "Fail: $($_.Exception.Message)"
+    }
+}
+
+$url = "{0}://{1}:{2}{3}" -f $Scheme, $TargetHost, $Port, $Path
+$end = if ($EndTime) { [datetime]::Parse($EndTime) } else { (Get-Date).AddMinutes($DurationMinutes) }
+$pass = if (Test-Path $csvPath) { [int](@(Import-Csv $csvPath)[-1].Pass) } else { 0 }
+
+Write-Host "Sigma Data Systems Inc. - Endpoint Reachability Monitor" -ForegroundColor Cyan
+Write-Host "Target : $url"
+Write-Host "Log    : $csvPath"
+Write-Host "Until  : $end`n"
+
+while ((Get-Date) -lt $end) {
+    $pass++
+    $now    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $egress = Get-EgressIP
+    try {
+        $ips = @(Resolve-DnsName -Name $TargetHost -Type A -DnsOnly -ErrorAction Stop |
+                 Where-Object { $_.Type -eq 'A' } | Select-Object -ExpandProperty IPAddress)
+    } catch { $ips = @() }
+    $http = Test-Http $url $TimeoutMs
+
+    if ($ips.Count -eq 0) {
+        [pscustomobject]@{ Time=$now; Pass=$pass; EgressIP=$egress; ResolvedIPs="DNS FAIL"; TestedIP="DNS FAIL"; TcpResult="DNS FAIL"; TcpMs=""; Http=$http } |
+            Export-Csv -Path $csvPath -Append -NoTypeInformation
+        Write-Host "$now  egress=$egress  DNS FAILED  http=$http" -ForegroundColor Red
+    } else {
+        foreach ($ip in $ips) {
+            $t = Test-Tcp $ip $Port $TimeoutMs
+            [pscustomobject]@{ Time=$now; Pass=$pass; EgressIP=$egress; ResolvedIPs=($ips -join ";"); TestedIP=$ip; TcpResult=$t.Result; TcpMs=$t.Ms; Http=$http } |
+                Export-Csv -Path $csvPath -Append -NoTypeInformation
+            $color = if ($t.Result -eq "Open" -and $http -notlike "Fail*") { "Green" } else { "Red" }
+            Write-Host ("{0}  egress={1}  ip={2}  tcp={3} ({4}ms)  http={5}" -f $now,$egress,$ip,$t.Result,$t.Ms,$http) -ForegroundColor $color
+        }
+    }
+    Start-Sleep -Seconds $IntervalSeconds
+}
+
+if (Test-Path $csvPath) { Show-Summary $csvPath }
+
+# Background run finished: remove our own scheduled task
+if ($EndTime -and (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 }
 '@
 
