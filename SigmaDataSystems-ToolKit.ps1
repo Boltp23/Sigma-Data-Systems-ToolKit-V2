@@ -459,7 +459,8 @@ function Invoke-WURepairServer {
 
 function Invoke-FeatureUpgrade {
     Write-Title 'Windows 11 feature upgrade to 26H2 (enablement package from 24H2/25H2, full upgrade from 21H2-23H2 / Windows 10)'
-    Write-Host '  Check = pre-flight only (changes nothing). Upgrade = do it. Status = result of the last background upgrade.'
+    Write-Host '  Check = pre-flight + hardware check, changes nothing (with an ISO path it also runs Setup''s compatibility scan, 5-15 min).'
+    Write-Host '  Upgrade = do it. Status = result of the last background upgrade.'
     $mode = "$(Read-Default 'Mode (Check / Upgrade / Status)' 'Check')"
     if ($mode -notmatch '^(?i)(check|upgrade|status)$') { Write-Host '  Pick Check, Upgrade or Status.' -ForegroundColor Yellow; return }
     $p = [ordered]@{ Mode = (Get-Culture).TextInfo.ToTitleCase($mode.ToLower()) }
@@ -22227,8 +22228,16 @@ $Script:Payloads['Invoke-SDSIFeatureUpgrade'] = @'
 
     Files: C:\ProgramData\SigmaDataSystems\FeatureUpgrade\  (log, state.json, cached media / installer).
 
+    Hardware (full upgrades only - 24H2 / 25H2 already run Windows 11 and only need the enablement package):
+      Quick checks, always: TPM 2.0, UEFI (Secure Boot capable), 64-bit Windows, 4 GB RAM, 64 GB system disk, and the
+      CPU / other verdicts Windows' compatibility appraiser has recorded. Any hard failure = BLOCKED, exit 10.
+      Full test, Check mode with -MediaPath: runs Windows Setup's own compatibility scan from the ISO (setup.exe
+      /compat scanonly - changes nothing, 5-15 min) which tests CPU, drivers and apps exactly like the real upgrade.
+      Set the N-central task timeout to 30+ minutes for Check runs with -MediaPath (or use -SkipCompatScan).
+
     Exit codes: 0 ok (current / ready / started / done)  10 hardware not eligible  11 not enough disk space
-                12 on battery  13 restart pending  14 upgrade already running  20 failed  21 no update source.
+                12 on battery  13 restart pending  14 upgrade already running  15 blocked by an app / edition / disk
+                layout (Setup compatibility scan)  20 failed  21 no update source.
 
 .PARAMETER Mode
     Check   - pre-flight only: says what it WOULD do and whether the device can. Changes nothing.  (default)
@@ -22261,7 +22270,9 @@ param(
     [switch]$Reboot,
     [int]$RebootDelayMinutes = 10,
     [switch]$RemoveVersionLock,                 # delete a TargetReleaseVersion pin (a GPO may put it back)
-    [switch]$IgnoreHardwareCheck,               # full upgrade: let setup decide instead of stopping on TPM / Secure Boot / appraiser
+    [switch]$IgnoreHardwareCheck,               # full upgrade: let setup decide instead of stopping on TPM / BIOS / RAM / disk / CPU
+    [switch]$SkipCompatScan,                    # Check mode: skip the Windows Setup compatibility scan (needs -MediaPath)
+    [int]$CompatScanMinutes = 30,
     [int]$MaxHours = 6,                         # background upgrade gives up after this long
     [string]$WorkDir = "$env:ProgramData\SigmaDataSystems\FeatureUpgrade"
 )
@@ -22351,22 +22362,42 @@ if ($wuPol -and [int]"$($wuPol.TargetReleaseVersion)" -eq 1 -and "$($wuPol.Targe
 }
 
 # Windows 11 hardware requirements (only matter for a full upgrade)
+# Hard blocks (stop with exit 10): no TPM / TPM 1.2, legacy BIOS, 32-bit Windows, under 4 GB RAM, system disk under
+# 64 GB, or a CPU that Windows' own compatibility appraiser flags. Warnings only: Secure Boot capable but off, other
+# appraiser reasons. -IgnoreHardwareCheck turns the blocks into warnings and lets Windows Setup decide.
 if ($Act -eq 'Full') {
-    $hw = @()
+    $hw = @(); $hard = @()
     try { $tpm = Get-CimInstance -Namespace 'root\cimv2\Security\MicrosoftTpm' -ClassName Win32_Tpm -ErrorAction Stop } catch { $tpm = $null }
-    if (-not $tpm) { $hw += 'no TPM' } elseif ("$($tpm.SpecVersion)" -notmatch '^2\.') { $hw += "TPM $(("$($tpm.SpecVersion)" -split ',')[0])" }
+    if (-not $tpm) { $hard += 'no TPM' } elseif ("$($tpm.SpecVersion)" -notmatch '^2\.') { $hard += "TPM $(("$($tpm.SpecVersion)" -split ',')[0]) (needs 2.0)" }
     $sb = $null; try { $sb = Confirm-SecureBootUEFI -ErrorAction Stop } catch { }
-    if ($null -eq $sb) { $hw += 'legacy BIOS (no Secure Boot)' } elseif (-not $sb) { $hw += 'Secure Boot off' }
-    # the compatibility appraiser's own verdict for Windows 11 (RedReason = what blocks it)
+    if ($null -eq $sb) { $hard += 'legacy BIOS (no UEFI / Secure Boot)' } elseif (-not $sb) { $hw += 'Secure Boot capable but off' }
+    if (-not [Environment]::Is64BitOperatingSystem) { $hard += '32-bit Windows (Windows 11 is 64-bit only - needs a clean install)' }
+    $ramGB = [math]::Round(((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory) / 1GB, 1)
+    if ($ramGB -and $ramGB -lt 3.8) { $hard += "$ramGB GB RAM (needs 4 GB)" }
+    $sysGB = [math]::Round(((Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue).Size) / 1GB, 0)
+    if ($sysGB -and $sysGB -lt 60) { $hard += "system disk $sysGB GB (needs 64 GB)" }
+    $cpu = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1).Name
+    # the compatibility appraiser's own verdict for Windows 11 (RedReason = what blocks it; Cpu* = unsupported processor)
     $ind = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\TargetVersionUpgradeExperienceIndicators'
-    $red = @(Get-ChildItem $ind -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^(NI|GE|CU)' } | ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).RedReason } | Where-Object { $_ -and $_ -ne 'None' } | Select-Object -Unique)
-    if ($red.Count) { $hw += ('appraiser: ' + ($red -join ', ')) }
-    if ($hw.Count) {
-        Log ('hardware: ' + ($hw -join '; '))
-        if (-not $IgnoreHardwareCheck -and ($hw -match 'no TPM|legacy BIOS|TPM 1')) { Finish 'BLOCKED' 'Full' ('Not eligible for Windows 11: ' + ($hw -join '; ')) 10 }
-        $why += ('hardware warnings: ' + ($hw -join '; '))
-    } else { Log 'hardware: TPM 2.0 and Secure Boot OK' }
+    $red = @(Get-ChildItem $ind -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^(NI|GE|CU|ZN|BR)' } | ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).RedReason } | Where-Object { $_ -and $_ -ne 'None' } | ForEach-Object { "$_" -split '[ ,]+' } | Where-Object { $_ } | Select-Object -Unique)
+    if (@($red | Where-Object { $_ -match '(?i)^cpu|processor' }).Count) { $hard += "processor not supported for Windows 11 ($cpu)" }
+    $other = @($red | Where-Object { $_ -notmatch '(?i)^cpu|processor' })
+    if ($other.Count) { $hw += ('appraiser: ' + ($other -join ', ')) }
+    if (-not $red.Count) { Log "appraiser: no Windows 11 verdict recorded on this PC yet - CPU $cpu not checked by Windows$(if ($MediaPath) { ' (the setup compatibility scan below covers it)' })" }
+    if ($hard.Count) {
+        Log ('hardware: NOT ELIGIBLE - ' + ($hard -join '; '))
+        if (-not $IgnoreHardwareCheck) { Finish 'BLOCKED' 'Full' ('Not eligible for Windows 11: ' + ($hard -join '; ')) 10 }
+        $hw = @($hard) + @($hw)
+    }
+    if ($hw.Count) { Log ('hardware warnings: ' + ($hw -join '; ')); $why += ('hardware warnings: ' + ($hw -join '; ')) }
+    elseif (-not $hard.Count) { Log "hardware: TPM 2.0, UEFI, $ramGB GB RAM, $sysGB GB disk OK$(if ($red.Count) { ', appraiser OK' })" }
 }
+
+$SetupCodes = @{ '0xC1900210' = 'compatible - no issues found'; '0xC1900208' = 'an installed app blocks the upgrade'; '0xC1900209' = 'an installed app blocks the upgrade'
+    '0xC1900204' = 'upgrade path not available for this edition / language'; '0xC1900200' = 'hardware does not meet Windows 11 requirements'
+    '0xC1900202' = 'hardware does not meet Windows 11 requirements'; '0xC190020E' = 'not enough disk space'; '0x80070070' = 'not enough disk space'
+    '0xC1900107' = 'a cleanup from a previous upgrade is pending - restart and retry'; '0xC1900101' = 'a driver failed'; '0xC1900201' = 'the system reserved partition is too small' }
+function Get-SetupWhy([int64]$rc) { $h = '0x{0:X8}' -f ($rc -band 0xFFFFFFFFL); if ($SetupCodes[$h]) { "$h $($SetupCodes[$h])" } else { "setup exit $h" } }
 
 # ---------------------------------------------------------------- source
 function Test-Src([string]$p) { if (-not $p) { return $false }; try { return (Test-Path -LiteralPath $p) } catch { return $false } }
@@ -22380,7 +22411,31 @@ if ($Act -eq 'eKB') {
 }
 Log "plan: $Act from $($script:FromName) to $TargetName using $src"
 
-if ($Mode -eq 'Check') { Finish 'READY' $Act (("Would upgrade $($script:FromName) -> $TargetName via $Act from $src") + $(if ($why.Count) { ' | ' + ($why -join ' | ') })) 0 }
+# Windows Setup's own compatibility test (Check mode, full upgrades, when the ISO / setup folder is reachable):
+# setup.exe /compat scanonly changes nothing and checks CPU, RAM, drivers and apps exactly like the real upgrade.
+if ($Mode -eq 'Check' -and $Act -eq 'Full' -and $src -like 'media *' -and -not $SkipCompatScan) {
+    $setup = $null; $isoMounted = $null
+    if ($MediaPath -match '\.iso$') {
+        try { $img = Mount-DiskImage -ImagePath $MediaPath -PassThru -ErrorAction Stop; $isoMounted = $MediaPath; Start-Sleep -Seconds 3
+              $dl = ($img | Get-Volume -ErrorAction SilentlyContinue).DriveLetter; if (-not $dl) { $dl = (Get-DiskImage -ImagePath $MediaPath | Get-Volume).DriveLetter }
+              if ($dl) { $setup = "$($dl):\setup.exe" } }
+        catch { Log "compatibility scan skipped: can't mount the ISO from the share as SYSTEM ($($_.Exception.Message)) - the upgrade itself copies it locally first" }
+    } else { $setup = Join-Path $MediaPath 'setup.exe' }
+    if ($setup -and (Test-Path -LiteralPath $setup)) {
+        $clog = Join-Path $WorkDir 'compat-logs'; New-Item -ItemType Directory -Path $clog -Force | Out-Null
+        Log "running Windows Setup compatibility scan (no changes; up to $CompatScanMinutes min)..."
+        $cp = Start-Process -FilePath $setup -ArgumentList @('/auto', 'upgrade', '/quiet', '/compat', 'scanonly', '/eula', 'accept', '/noreboot', '/dynamicupdate', 'disable', '/telemetry', 'disable', '/copylogs', "`"$clog`"") -PassThru
+        if (-not $cp.WaitForExit($CompatScanMinutes * 60000)) { try { $cp.Kill() } catch { }; $scan = "compatibility scan didn't finish in $CompatScanMinutes min" }
+        else { $rc = [int64]$cp.ExitCode; $scan = Get-SetupWhy $rc }
+        if ($isoMounted) { try { Dismount-DiskImage -ImagePath $isoMounted -ErrorAction SilentlyContinue | Out-Null } catch { } }
+        Log "compatibility scan: $scan"
+        if ($scan -match '0xC1900200|0xC1900202') { Finish 'BLOCKED' 'Full' "Windows Setup: $scan (logs: $clog)" 10 }
+        if ($scan -match '0xC1900208|0xC1900209|0xC1900204|0xC190020E|0x80070070|0xC1900201|0xC1900107') { Finish 'BLOCKED' 'Full' "Windows Setup: $scan (logs: $clog)" 15 }
+        if ($scan -notmatch '0xC1900210') { $why += "compatibility scan: $scan" } else { $why += 'Windows Setup compatibility scan passed' }
+    } elseif ($isoMounted) { try { Dismount-DiskImage -ImagePath $isoMounted -ErrorAction SilentlyContinue | Out-Null } catch { } }
+}
+
+if ($Mode -eq 'Check') { Finish 'READY' $Act (("Would upgrade $($script:FromName) to $TargetName via $Act from $src") + $(if ($why.Count) { ' | ' + ($why -join ' | ') })) 0 }
 
 # ---------------------------------------------------------------- upgrade: enablement package (24H2 / 25H2 -> 26H2)
 function Start-RebootWarned([string]$what) {
@@ -22536,7 +22591,7 @@ try {
     Finish 'FAILED' 'Full' $state.Why 20
 }
 Log "background upgrade started (scheduled task $TaskName) - check later with -Mode Status"
-Finish 'STARTED' 'Full' (("Full upgrade $($script:FromName) -> $TargetName started in the background from $src" + $(if ($Reboot) { ', restarts when staged' } else { ', finishes at the next restart' })) + $(if ($why.Count) { ' | ' + ($why -join ' | ') })) 0
+Finish 'STARTED' 'Full' (("Full upgrade $($script:FromName) to $TargetName started in the background from $src" + $(if ($Reboot) { ', restarts when staged' } else { ', finishes at the next restart' })) + $(if ($why.Count) { ' | ' + ($why -join ' | ') })) 0
 '@
 
 # ======================= Troubleshoot-Win11Upgrade.ps1 =======================

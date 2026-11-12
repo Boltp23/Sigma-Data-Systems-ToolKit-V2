@@ -2,7 +2,7 @@
 
 *Prepared by [Sigma Data Systems Inc.](https://sigmadatainc.com/)*
 
-<!-- AUTO-VERSION -->**Current version: v2.0.4** | 144 options | updated 2026-11-11<!-- /AUTO-VERSION -->
+<!-- AUTO-VERSION -->**Current version: v2.0.4** | 144 options | updated 2026-11-12<!-- /AUTO-VERSION -->
 
 ```
   _____ _____ _____ __  __            _____       _______
@@ -110,7 +110,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 ## All options
 
 <!-- AUTO-OPTIONS:START -->
-<details><summary><b>Quick index of all 144 options</b> (auto-generated from the script, 2026-11-11)</summary>
+<details><summary><b>Quick index of all 144 options</b> (auto-generated from the script, 2026-11-12)</summary>
 
 **A. SYSTEM HEALTH**
 
