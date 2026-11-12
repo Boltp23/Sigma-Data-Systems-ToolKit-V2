@@ -22285,6 +22285,15 @@ $StatePath = Join-Path $WorkDir 'state.json'
 $TaskName = 'SDSI-FeatureUpgrade'
 $Lines = New-Object System.Collections.Generic.List[string]
 
+# Starts a program WITHOUT the Windows shell. Start-Process uses the shell, and a file marked "downloaded from the
+# internet" (Mark of the Web - inherited by everything inside an ISO downloaded from Microsoft) then shows an invisible
+# "Open File - Security Warning" prompt in the SYSTEM session and hangs forever. CreateProcess never prompts.
+function Start-NoPrompt([string]$File, [string[]]$ArgList) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $File; $psi.Arguments = ($ArgList -join ' '); $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $wd = Split-Path -Parent $File; if ($wd) { $psi.WorkingDirectory = $wd }
+    [System.Diagnostics.Process]::Start($psi)
+}
 function Log([string]$m) { $t = "{0:yyyy-MM-dd HH:mm:ss}  {1}" -f (Get-Date), $m; try { Add-Content -LiteralPath $LogFile -Value $t -Encoding UTF8 } catch { }; $Lines.Add($m) }
 function Save-State($h) { try { ($h | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $StatePath -Encoding UTF8 } catch { } }
 function Read-State { if (Test-Path -LiteralPath $StatePath) { try { return (Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json) } catch { } }; $null }
@@ -22298,6 +22307,7 @@ function Finish([string]$fRes, [string]$fAct, [string]$fWhy, [int]$code) {
     exit $code
 }
 
+# (a process named "setup" only counts when it's Windows Setup - an install.wim / .esd next to it)
 # ---------------------------------------------------------------- what is this machine
 $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
 $Build = [int]"$($cv.CurrentBuildNumber)"; $Ubr = [int]"$($cv.UBR)"
@@ -22311,7 +22321,7 @@ Log ("{0} {1} {2} build {3} on {4}" -f $OsName, $Edition, $script:FromName, $scr
 
 if ($Mode -eq 'Status') {
     $st = Read-State
-    $running = Get-Process -Name 'SetupHost', 'Windows10UpgraderApp', 'Windows11InstallationAssistant', 'setupprep' -ErrorAction SilentlyContinue
+    $running = Get-Process -Name 'setup', 'SetupHost', 'Windows10UpgraderApp', 'Windows11InstallationAssistant', 'setupprep' -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'setup' -or ($_.Path -and ((Test-Path (Join-Path (Split-Path $_.Path) 'sources\install.wim')) -or (Test-Path (Join-Path (Split-Path $_.Path) 'sources\install.esd')))) }
     if ($Build -ge $TargetBuild) { Finish 'UPGRADED' $(if ($st) { "$($st.Act)" } else { 'None' }) "Now on $OsName build $script:BuildStr" 0 }
     if ($running) { Finish 'RUNNING' $(if ($st) { "$($st.Act)" } else { 'Full' }) ("Upgrade in progress: " + (($running | Select-Object -ExpandProperty Name -Unique) -join ', ')) 0 }
     if (-not $st) { Finish 'NONE' 'None' 'No upgrade has been started on this device by this script' 0 }
@@ -22328,7 +22338,7 @@ if ($Act -eq 'eKB' -and $Ubr -lt $EkbMinUbr) { Finish 'BLOCKED' 'eKB' "Build $sc
 if ($Act -eq 'Full' -and $Build -lt 19041) { Finish 'BLOCKED' 'Full' "Windows 10 build $Build is too old for a direct upgrade - needs 19041 (2004) or newer" 10 }
 $why = @()
 
-$busy = Get-Process -Name 'SetupHost', 'Windows10UpgraderApp', 'Windows11InstallationAssistant', 'setupprep' -ErrorAction SilentlyContinue
+$busy = Get-Process -Name 'setup', 'SetupHost', 'Windows10UpgraderApp', 'Windows11InstallationAssistant', 'setupprep' -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'setup' -or ($_.Path -and ((Test-Path (Join-Path (Split-Path $_.Path) 'sources\install.wim')) -or (Test-Path (Join-Path (Split-Path $_.Path) 'sources\install.esd')))) }
 if ($busy) { Finish 'RUNNING' $Act ("An upgrade is already running: " + (($busy | Select-Object -ExpandProperty Name -Unique) -join ', ')) 14 }
 
 $need = if ($MinFreeGB -gt 0) { $MinFreeGB } elseif ($Act -eq 'Full') { 25 } else { 3 }
@@ -22424,8 +22434,10 @@ if ($Mode -eq 'Check' -and $Act -eq 'Full' -and $src -like 'media *' -and -not $
     if ($setup -and (Test-Path -LiteralPath $setup)) {
         $clog = Join-Path $WorkDir 'compat-logs'; New-Item -ItemType Directory -Path $clog -Force | Out-Null
         Log "running Windows Setup compatibility scan (no changes; up to $CompatScanMinutes min)..."
-        $cp = Start-Process -FilePath $setup -ArgumentList @('/auto', 'upgrade', '/quiet', '/compat', 'scanonly', '/eula', 'accept', '/noreboot', '/dynamicupdate', 'disable', '/telemetry', 'disable', '/copylogs', "`"$clog`"") -PassThru
-        if (-not $cp.WaitForExit($CompatScanMinutes * 60000)) { try { $cp.Kill() } catch { }; $scan = "compatibility scan didn't finish in $CompatScanMinutes min" }
+        $cp = Start-NoPrompt $setup @('/auto', 'upgrade', '/quiet', '/compat', 'scanonly', '/eula', 'accept', '/noreboot', '/dynamicupdate', 'disable', '/telemetry', 'disable', '/copylogs', "`"$clog`"")
+        if ($cp) { Log "setup started (PID $($cp.Id))" } else { Log 'setup did not start' }
+        if (-not $cp) { $scan = "couldn't start $setup" }
+        elseif (-not $cp.WaitForExit($CompatScanMinutes * 60000)) { try { $cp.Kill() } catch { }; $scan = "compatibility scan didn't finish in $CompatScanMinutes min" }
         else { $rc = [int64]$cp.ExitCode; $scan = Get-SetupWhy $rc }
         if ($isoMounted) { try { Dismount-DiskImage -ImagePath $isoMounted -ErrorAction SilentlyContinue | Out-Null } catch { } }
         Log "compatibility scan: $scan"
@@ -22457,11 +22469,12 @@ if ($Act -eq 'eKB') {
     }
     if ($msu -and (Test-Path -LiteralPath $msu)) {
         Log "installing $msu (wusa)"
-        $p = Start-Process -FilePath "$env:SystemRoot\System32\wusa.exe" -ArgumentList "`"$msu`" /quiet /norestart" -Wait -PassThru
+        try { Unblock-File -LiteralPath $msu -ErrorAction SilentlyContinue } catch { }
+        $p = Start-NoPrompt "$env:SystemRoot\System32\wusa.exe" @("`"$msu`"", '/quiet', '/norestart'); $p.WaitForExit()
         $rc = $p.ExitCode
         if ($rc -notin 0, 3010, 2359302) {
             Log "wusa exit $rc - trying DISM"
-            $d = Start-Process -FilePath "$env:SystemRoot\System32\dism.exe" -ArgumentList "/Online /Add-Package /PackagePath:`"$msu`" /Quiet /NoRestart" -Wait -PassThru
+            $d = Start-NoPrompt "$env:SystemRoot\System32\dism.exe" @('/Online', '/Add-Package', "/PackagePath:`"$msu`"", '/Quiet', '/NoRestart'); $d.WaitForExit()
             $rc = $d.ExitCode
         }
         $ok = $rc -in 0, 3010, 2359302; $detail = "installer exit $rc$(if ($rc -eq 2359302) { ' (already installed)' })"
@@ -22509,6 +22522,15 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $c = Get-Content -LiteralPath (Join-Path $dir 'runner.json') -Raw | ConvertFrom-Json
 $log = Join-Path $dir 'feature-upgrade.log'; $sp = Join-Path $dir 'state.json'
+# Starts a program WITHOUT the Windows shell. Start-Process uses the shell, and a file marked "downloaded from the
+# internet" (Mark of the Web - inherited by everything inside an ISO downloaded from Microsoft) then shows an invisible
+# "Open File - Security Warning" prompt in the SYSTEM session and hangs forever. CreateProcess never prompts.
+function Start-NoPrompt([string]$File, [string[]]$ArgList) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $File; $psi.Arguments = ($ArgList -join ' '); $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $wd = Split-Path -Parent $File; if ($wd) { $psi.WorkingDirectory = $wd }
+    [System.Diagnostics.Process]::Start($psi)
+}
 function L([string]$m) { Add-Content -LiteralPath $log -Value ("{0:yyyy-MM-dd HH:mm:ss}  [runner] {1}" -f (Get-Date), $m) -Encoding UTF8 }
 $st = [ordered]@{ Started = (Get-Date).ToString('s'); Act = 'Full'; From = $c.From; Build = $c.Build; Source = ''; Res = 'RUNNING'; Why = '' }
 function S { ($st | ConvertTo-Json) | Set-Content -LiteralPath $sp -Encoding UTF8 }
@@ -22551,7 +22573,8 @@ if ($c.MediaPath) {
     $args2 = @('/auto', 'upgrade', '/quiet', '/eula', 'accept', '/noreboot', '/dynamicupdate', 'disable', '/showoobe', 'none', '/telemetry', 'disable', '/copylogs', "`"$logs`"")
     if ($c.IgnoreHardwareCheck) { $args2 += @('/compat', 'ignorewarning') }
     L "running $setup $($args2 -join ' ')"
-    $p = Start-Process -FilePath $setup -ArgumentList $args2 -PassThru
+    $p = Start-NoPrompt $setup $args2
+    if (-not $p) { Done 'FAILED' "couldn't start $setup" }; L "setup started (PID $($p.Id))"
     while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 30 }
     if (-not $p.HasExited) { Done 'FAILED' "setup still running after $($c.MaxHours) h - check $logs" }
     $rc = [int64]$p.ExitCode
@@ -22564,7 +22587,9 @@ $st.Source = 'Installation Assistant'; S
 $exe = Join-Path $dir 'Windows11InstallationAssistant.exe'
 try { Invoke-WebRequest -Uri $c.AssistantUrl -OutFile $exe -UseBasicParsing -ErrorAction Stop } catch { Done 'FAILED' "Installation Assistant download failed: $($_.Exception.Message)" }
 L 'starting the Installation Assistant (downloads ~4 GB itself)'
-$p = Start-Process -FilePath $exe -ArgumentList @('/QuietInstall', '/SkipEULA', '/Auto', 'Upgrade', '/NoRestartUI', '/CopyLogs', "`"$dir`"") -PassThru
+try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch { }
+$p = Start-NoPrompt $exe @('/QuietInstall', '/SkipEULA', '/Auto', 'Upgrade', '/NoRestartUI', '/CopyLogs', "`"$dir`"")
+if (-not $p) { Done 'FAILED' "couldn't start the Installation Assistant" }; L "Installation Assistant started (PID $($p.Id))"
 Start-Sleep -Seconds 120
 $names = 'Windows11InstallationAssistant', 'Windows10UpgraderApp', 'SetupHost', 'setupprep'
 while ((Get-Process -Name $names -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 60 }
