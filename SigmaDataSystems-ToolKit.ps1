@@ -461,10 +461,11 @@ function Invoke-FeatureUpgrade {
     Write-Title 'Windows 11 feature upgrade to 26H2 (enablement package from 24H2/25H2, full upgrade from 21H2-23H2 / Windows 10)'
     Write-Host '  Check = pre-flight + hardware check, changes nothing (with an ISO path it also runs Setup''s compatibility scan, 5-15 min).'
     Write-Host '  Upgrade = do it. Status = result of the last background upgrade.'
-    $mode = "$(Read-Default 'Mode (Check / Upgrade / Status)' 'Check')"
-    if ($mode -notmatch '^(?i)(check|upgrade|status)$') { Write-Host '  Pick Check, Upgrade or Status.' -ForegroundColor Yellow; return }
+    Write-Host '  Also: Watch, Log, SetupLog, Errors, History, Reboot, Cancel  (the same as the "fu" command on the machine).'
+    $mode = "$(Read-Default 'Mode (Check / Upgrade / Status / Watch / Log / SetupLog / Errors / History / Reboot / Cancel)' 'Check')"
+    if ($mode -notmatch '^(?i)(check|upgrade|status|watch|log|setuplog|errors|history|reboot|cancel)$') { Write-Host '  Pick one of the modes listed.' -ForegroundColor Yellow; return }
     $p = [ordered]@{ Mode = (Get-Culture).TextInfo.ToTitleCase($mode.ToLower()) }
-    if ($p.Mode -ne 'Status') {
+    if ($p.Mode -in 'Check', 'Upgrade') {
         $p.MediaPath = "$(Read-Default 'Windows 11 ISO or setup folder on a share (blank = Installation Assistant download)' '')"
         $p.EkbPath   = "$(Read-Default 'Enablement package .msu (KB5121794) on a share for 24H2/25H2 machines (blank = Windows Update)' '')"
     }
@@ -22187,80 +22188,94 @@ $Script:Payloads['Invoke-SDSIFeatureUpgrade'] = @'
 <#
 .SYNOPSIS
     Upgrades a Windows 10 / Windows 11 workstation to the current Windows 11 feature release (default 26H2) in ONE
-    step - no version-by-version hops. Built for N-central Automation Manager script tasks (runs as SYSTEM).
+    step - no version-by-version hops. Built for N-central Automation Manager script tasks (runs as SYSTEM), with a
+    short "fu" command left on the machine to check on it from N-central's command line.
 
 .DESCRIPTION
-    Prepared by Sigma Data Systems Inc.  Universal - no client or machine specific values.
+    Prepared by Sigma Data Systems Inc.  Universal - no client or machine specific values.   Version 2.
 
     How each starting version is upgraded:
       Windows 11 24H2 / 25H2 (26100 / 26200) -> 26H2 enablement package (KB5121794): ~200 KB, ~5 min, ONE restart.
                                                  Needs the Sept 2026 cumulative update or later (build .9278+).
-      Windows 11 21H2 / 22H2 / 23H2           -> full in-place upgrade (apps, files and settings kept), ~45-90 min.
+      Windows 11 21H2 / 22H2 / 23H2           -> full in-place upgrade (apps, files and settings kept), ~1-2 hours
+                                                 plus 15-30 min at the restart.
       Windows 10 (22H2)                       -> the same full in-place upgrade, straight to Windows 11 26H2,
                                                  if the hardware meets Windows 11's requirements.
-      Already on 26H2 or newer                -> nothing to do.
+      Already on 26H2 or newer                -> nothing to do.      Windows Server -> never touched.
     To stop at 25H2 instead: -TargetBuild 26200 -TargetName 25H2 -EkbKB KB5054156 (then only 24H2 uses the package).
-      Windows Server                          -> never touched (exit 0, "server - skipped").
 
     Where the update comes from (first one that works):
       Enablement package : -EkbPath (file share or local .msu)  ->  -EkbUrl  ->  Windows Update (searches for KB5121794)
-      Full upgrade       : -MediaPath (file share: the current Windows 11 ISO from microsoft.com/software-download/windows11, or a folder holding the ISO's files with
-                           setup.exe)  ->  download the Windows 11 Installation Assistant from Microsoft (-AssistantUrl)
-      Use a file share for sites with several machines: one 5 GB download per site instead of one per PC. The share
-      must be readable by the computer account (grant "Domain Computers" Read) because N-central runs as SYSTEM.
+      Full upgrade       : -MediaPath (file share: the Windows 11 ISO from microsoft.com/software-download/windows11, or
+                           a folder with the ISO's files)  ->  the Windows 11 Installation Assistant from Microsoft.
+      The share must be readable by the computer account ("Domain Computers" Read) - N-central runs as SYSTEM.
+      Run Unblock-File on an ISO / .msu downloaded from the internet before putting it on the share.
+      -MediaPath / -EkbPath / -ResultShare are remembered on the machine, so later runs and "fu" commands reuse them.
 
-    The full upgrade runs in the background as a one-time SYSTEM scheduled task ("SDSI-FeatureUpgrade"), so the
-    N-central task returns within a minute (status STARTED) instead of being tied up for an hour. Run again with
-    -Mode Status to see how it went: it reads the result file and the current build.
+    What happens during a full upgrade:
+      1. Upgrade mode checks the machine, then starts the upgrade in the background (one-time SYSTEM scheduled task
+         "SDSI-FeatureUpgrade") and returns within a minute: STARTED.
+      2. The background task runs Windows Setup and every minute records Setup's progress and current step in the log
+         and state.json. When Setup finishes: DONE (restart needed) or FAILED with the reason (+ SetupDiag's analysis).
+      3. After the restart a one-time startup task ("SDSI-FeatureUpgrade-Verify") confirms the new build: UPGRADED,
+         or FAILED "Windows rolled the upgrade back" with SetupDiag's reason.
+      Nothing restarts unless you pass -Reboot (10-minute warning to the user) or run "fu reboot".
 
-    Restarts: nothing restarts unless you pass -Reboot. With -Reboot, logged-on users get a warning and the PC
-    restarts -RebootDelayMinutes later (default 10). Without it the upgrade finishes at the next restart - e.g. your
-    N-central reboot window.
+    CHECKING ON IT - the "fu" command (installed on the machine by every Check / Upgrade / Status run):
+      fu                    status: version, state, progress %, Setup's current step, elapsed time, what to do next
+      fu watch [min]        live status every 15 s for [min] minutes (default 5) - stops early when it finishes
+      fu log [n]            last n lines of this script's log (default 25)
+      fu setuplog [n]       last n lines of Windows Setup's own log (setupact.log)
+      fu errors             why it failed: Setup's error log, SetupDiag's analysis, the result
+      fu history            every check / upgrade / result on this machine
+      fu reboot [min]       restart to finish a staged upgrade (default 10 min warning)  |  fu abortreboot
+      fu cancel             stop a running upgrade (Setup, background task, mounted ISO) - nothing is changed yet
+      fu check  /  fu upgrade [-Reboot]     run again with the remembered media / package paths
+      fu help
+    From N-central's command line (cmd) just type fu ...  (it is installed as C:\Windows\fu.cmd).
+    From PowerShell: & fu status, or powershell -NoProfile -Command "fu status".
 
-    Pre-flight checks (all modes): Windows Server, already current, pending restart (full upgrade only), free space on
-    C: (-MinFreeGB, default 25 for a full upgrade, 3 for the enablement package), laptop on battery under 40%,
-    an upgrade already running, Windows 11 hardware requirements (TPM 2.0, Secure Boot, the compatibility appraiser's
-    own verdict), and a TargetReleaseVersion policy that pins the device to an older version.
+    Pre-flight checks: Windows Server, already current, pending restart (full upgrade), free space on C: (-MinFreeGB,
+    default 25 / 3 GB), laptop on battery under 40%, an upgrade already running, Windows 11 hardware (TPM 2.0, UEFI,
+    64-bit, 4 GB RAM, 64 GB disk, CPU per Windows' appraiser), a TargetReleaseVersion pin, and in Check mode with
+    -MediaPath Windows Setup's own compatibility scan (setup.exe /compat scanonly - changes nothing, 5-15 min;
+    set the N-central task timeout to 45 min, or -SkipCompatScan).
 
     First line of output is one compact line for the NOC / N-central (fits the 500-character limit):
-      FEATUPG,{"V":1,"From":"23H2","B":"22631.6199","To":"26H2","Act":"Full","Res":"STARTED","Why":"..."}
-    Res values: CURRENT, SERVER, READY, STARTED, DONE (restart needed), UPGRADED, BLOCKED, FAILED, RUNNING, NONE.
+      FEATUPG,{"V":2,"From":"23H2","B":"22631.6199","To":"26H2","Act":"Full","Res":"RUNNING","Pct":62,"Why":"..."}
+    Res: CURRENT, SERVER, READY, STARTED, RUNNING, DONE (restart needed), UPGRADED, BLOCKED, FAILED, CANCELLED,
+         INTERRUPTED (the background upgrade stopped without a result), NONE.
 
-    Files: C:\ProgramData\SigmaDataSystems\FeatureUpgrade\  (log, state.json, cached media / installer).
+    -ResultShare \\server\share\folder : every result is also written there as <computer>.json (the computer account
+    needs Modify on that folder) - one folder to read the whole client's progress from.
 
-    Hardware (full upgrades only - 24H2 / 25H2 already run Windows 11 and only need the enablement package):
-      Quick checks, always: TPM 2.0, UEFI (Secure Boot capable), 64-bit Windows, 4 GB RAM, 64 GB system disk, and the
-      CPU / other verdicts Windows' compatibility appraiser has recorded. Any hard failure = BLOCKED, exit 10.
-      Full test, Check mode with -MediaPath: runs Windows Setup's own compatibility scan from the ISO (setup.exe
-      /compat scanonly - changes nothing, 5-15 min) which tests CPU, drivers and apps exactly like the real upgrade.
-      Set the N-central task timeout to 30+ minutes for Check runs with -MediaPath (or use -SkipCompatScan).
+    Files on the machine: C:\ProgramData\SigmaDataSystems\FeatureUpgrade\
+      feature-upgrade.log   everything this script did, with Setup's progress while it runs
+      state.json            the current / last upgrade (state, progress, step, times, result)
+      history.csv           one line per check / upgrade / result
+      compat-logs\  setup-logs\  setupdiag\     Windows Setup's and SetupDiag's logs
 
-    Exit codes: 0 ok (current / ready / started / done)  10 hardware not eligible  11 not enough disk space
-                12 on battery  13 restart pending  14 upgrade already running  15 blocked by an app / edition / disk
-                layout (Setup compatibility scan)  20 failed  21 no update source.
-
-.PARAMETER Mode
-    Check   - pre-flight only: says what it WOULD do and whether the device can. Changes nothing.  (default)
-    Upgrade - does it.
-    Status  - reports the result of the last background upgrade and the current version.
+    Exit codes: 0 ok   10 hardware not eligible   11 not enough disk space   12 on battery   13 restart pending
+                14 upgrade already running   15 blocked by an app / edition / disk layout   20 failed   21 no source.
 
 .EXAMPLE
-    .\Invoke-SDSIFeatureUpgrade.ps1                                   # check only - run fleet-wide first
+    .\Invoke-SDSIFeatureUpgrade.ps1 -Mode Check -MediaPath '\\server\share\Win11_26H2_x64.iso'       # changes nothing
 .EXAMPLE
-    .\Invoke-SDSIFeatureUpgrade.ps1 -Mode Upgrade -MediaPath '\\server\share\Win11_26H2_x64.iso' -EkbPath '\\server\share\Windows11.0-KB5121794-x64.msu'
+    .\Invoke-SDSIFeatureUpgrade.ps1 -Mode Upgrade -MediaPath '\\server\share\Win11_26H2_x64.iso' -EkbPath '\\server\share\Windows11.0-KB5121794-x64.msu' -Reboot
 .EXAMPLE
-    .\Invoke-SDSIFeatureUpgrade.ps1 -Mode Upgrade -Reboot             # sources from Microsoft, restart when done
-.EXAMPLE
-    .\Invoke-SDSIFeatureUpgrade.ps1 -Mode Status
+    fu watch 10
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Check', 'Upgrade', 'Status')]
+    [ValidateSet('Check', 'Upgrade', 'Status', 'Watch', 'Log', 'SetupLog', 'Errors', 'History', 'Reboot', 'AbortReboot', 'Cancel', 'Help', 'Background', 'Verify')]
     [string]$Mode = 'Check',
+    [int]$Count = 0,                            # fu log / setuplog: lines; fu watch / reboot: minutes; fu history: entries
     [string]$MediaPath,                         # ISO, or folder with setup.exe (UNC or local) - full upgrades
     [string]$EkbPath,                           # enablement package .msu (UNC or local) - 24H2/25H2 -> 26H2
     [string]$EkbUrl,                            # direct download URL for the .msu
+    [string]$ResultShare,                       # optional: also write each result to <share>\<computer>.json
     [string]$AssistantUrl = 'https://go.microsoft.com/fwlink/?linkid=2171764',   # Windows 11 Installation Assistant
+    [string]$SetupDiagUrl = 'https://go.microsoft.com/fwlink/?linkid=870142',    # Microsoft SetupDiag
     [int]$TargetBuild = 26300,                  # 26H2   (25H2 = 26200)
     [string]$TargetName = '26H2',
     [string]$EkbKB = 'KB5121794',               # 26H2 enablement package (25H2's is KB5054156)
@@ -22271,20 +22286,32 @@ param(
     [int]$RebootDelayMinutes = 10,
     [switch]$RemoveVersionLock,                 # delete a TargetReleaseVersion pin (a GPO may put it back)
     [switch]$IgnoreHardwareCheck,               # full upgrade: let setup decide instead of stopping on TPM / BIOS / RAM / disk / CPU
-    [switch]$SkipCompatScan,                    # Check mode: skip the Windows Setup compatibility scan (needs -MediaPath)
+    [switch]$SkipCompatScan,                    # Check mode: skip the Windows Setup compatibility scan
     [int]$CompatScanMinutes = 30,
     [int]$MaxHours = 6,                         # background upgrade gives up after this long
+    [switch]$NoHelper,                          # don't install the "fu" command
+    [switch]$Force,                             # fu reboot / cancel without the state checks
     [string]$WorkDir = "$env:ProgramData\SigmaDataSystems\FeatureUpgrade"
 )
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+$SelfText = if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) { [IO.File]::ReadAllText($PSCommandPath) } else { "$($MyInvocation.MyCommand.ScriptBlock)" }
 New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
 $LogFile = Join-Path $WorkDir 'feature-upgrade.log'
 $StatePath = Join-Path $WorkDir 'state.json'
-$TaskName = 'SDSI-FeatureUpgrade'
+$HistPath = Join-Path $WorkDir 'history.csv'
+$SettingsPath = Join-Path $WorkDir 'settings.json'
+$RunnerCfg = Join-Path $WorkDir 'runner.json'
+$SelfCopy = Join-Path $WorkDir 'Invoke-SDSIFeatureUpgrade.ps1'
+$TaskName = 'SDSI-FeatureUpgrade'; $VerifyTask = 'SDSI-FeatureUpgrade-Verify'
+$SetupAct = "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setupact.log"
+$SetupErr = "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setuperr.log"
 $Lines = New-Object System.Collections.Generic.List[string]
+$Tag = if ($Mode -in 'Background', 'Verify') { "[$($Mode.ToLower())] " } else { '' }
+$ReadOnly = $Mode -in 'Status', 'Watch', 'Log', 'SetupLog', 'Errors', 'History', 'Help'
 
+# ================================================================ shared helpers
 # Starts a program WITHOUT the Windows shell. Start-Process uses the shell, and a file marked "downloaded from the
 # internet" (Mark of the Web - inherited by everything inside an ISO downloaded from Microsoft) then shows an invisible
 # "Open File - Security Warning" prompt in the SYSTEM session and hangs forever. CreateProcess never prompts.
@@ -22294,21 +22321,111 @@ function Start-NoPrompt([string]$File, [string[]]$ArgList) {
     $wd = Split-Path -Parent $File; if ($wd) { $psi.WorkingDirectory = $wd }
     [System.Diagnostics.Process]::Start($psi)
 }
-function Log([string]$m) { $t = "{0:yyyy-MM-dd HH:mm:ss}  {1}" -f (Get-Date), $m; try { Add-Content -LiteralPath $LogFile -Value $t -Encoding UTF8 } catch { }; $Lines.Add($m) }
-function Save-State($h) { try { ($h | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $StatePath -Encoding UTF8 } catch { } }
+function Log([string]$m) {
+    if (-not $ReadOnly) { $t = "{0:yyyy-MM-dd HH:mm:ss}  {1}{2}" -f (Get-Date), $Tag, $m; try { Add-Content -LiteralPath $LogFile -Value $t -Encoding UTF8 } catch { } }
+    $Lines.Add($m)
+}
 function Read-State { if (Test-Path -LiteralPath $StatePath) { try { return (Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json) } catch { } }; $null }
+function Save-State($h) {
+    $h.Updated = (Get-Date).ToString('s')
+    try { ($h | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath $StatePath -Encoding UTF8 } catch { }
+    Publish-Result $h
+}
+function ConvertTo-Ordered($o) { $h = [ordered]@{}; if ($o) { foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = $p.Value } }; $h }
+function Add-History([string]$hRes, [string]$hAct, [string]$hWhy) {
+    $row = [pscustomobject][ordered]@{ Time = (Get-Date).ToString('yyyy-MM-dd HH:mm'); Mode = $Mode; Action = $hAct; From = $script:FromName; Build = $script:BuildStr; Result = $hRes; Detail = $hWhy }
+    try { $row | Export-Csv -LiteralPath $HistPath -Append -NoTypeInformation -Encoding UTF8 } catch { }
+}
+function Publish-Result($h) {
+    if (-not $script:Share) { return }
+    try {
+        $o = [ordered]@{ Computer = $env:COMPUTERNAME; Windows = "$OsName $Edition $($script:FromName)"; Build = $script:BuildStr; Target = $TargetName; Written = (Get-Date).ToString('s') }
+        foreach ($k in @($h.Keys)) { $o[$k] = $h[$k] }
+        ($o | ConvertTo-Json -Depth 4) | Set-Content -LiteralPath (Join-Path $script:Share "$($env:COMPUTERNAME).json") -Encoding UTF8 -ErrorAction Stop
+    } catch { if (-not $script:ShareWarned) { $script:ShareWarned = $true; Log "couldn't write to ResultShare $($script:Share): $($_.Exception.Message) (the computer account needs Modify)" } }
+}
 function Finish([string]$fRes, [string]$fAct, [string]$fWhy, [int]$code) {
-    $j = [ordered]@{ V = 1; From = $script:FromName; B = $script:BuildStr; To = $TargetName; Act = $fAct; Res = $fRes }
-    if ($fWhy) { $j.Why = $(if ($fWhy.Length -gt 220) { $fWhy.Substring(0, 217) + '...' } else { $fWhy }) }
+    $j = [ordered]@{ V = 2; From = $script:FromName; B = $script:BuildStr; To = $TargetName; Act = $fAct; Res = $fRes }
+    if ($null -ne $script:Pct) { $j.Pct = $script:Pct }
+    if ($fWhy) { $j.Why = $(if ($fWhy.Length -gt 200) { $fWhy.Substring(0, 197) + '...' } else { $fWhy }) }
     Write-Output ('FEATUPG,' + ($j | ConvertTo-Json -Compress))
     Write-Output ''
     foreach ($l in $Lines) { Write-Output $l }
-    Log "result: $fRes ($fAct) exit $code"
+    if (-not $ReadOnly) { Log "result: $fRes ($fAct) exit $code"; Add-History $fRes $fAct $fWhy }
+    if ($Mode -in 'Check') { Publish-Result ([ordered]@{ Res = $fRes; Act = $fAct; Why = $fWhy; Mode = 'Check' }) }
     exit $code
 }
+# Last part of a (possibly huge, still-open) log file without reading it all - setupact.log reaches 700+ MB.
+function Read-Tail([string]$Path, [int]$KB = 256) {
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    try {
+        $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+        try { $len = $fs.Length; $n = [Math]::Min($len, [int64]$KB * 1024); [void]$fs.Seek(-$n, [IO.SeekOrigin]::End)
+              $buf = New-Object byte[] ([int]$n); [void]$fs.Read($buf, 0, $n) } finally { $fs.Dispose() }
+        $txt = [Text.Encoding]::UTF8.GetString($buf); if ($txt.IndexOf([char]0) -ge 0) { $txt = [Text.Encoding]::Unicode.GetString($buf) }
+        return @($txt -split "`r?`n" | Select-Object -Skip $(if ($n -lt $len) { 1 } else { 0 }) | Where-Object { $_.Trim() })   # first line is partial only when we cut into the file
+    } catch { return @() }
+}
+# Windows Setup processes (a process named "setup" only counts when it's Windows Setup - install.wim / .esd next to it)
+function Get-SetupProcs {
+    @(Get-Process -Name 'setup', 'SetupHost', 'Windows10UpgraderApp', 'Windows11InstallationAssistant', 'setupprep' -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -ne 'setup' -or ($_.Path -and ((Test-Path (Join-Path (Split-Path $_.Path) 'sources\install.wim')) -or (Test-Path (Join-Path (Split-Path $_.Path) 'sources\install.esd')))) })
+}
+# Setup's progress and current step from the end of setupact.log
+function Get-SetupProgress {
+    $r = [ordered]@{ Pct = $null; Activity = ''; ActivityTime = ''; LogUpdated = '' }
+    if (-not (Test-Path -LiteralPath $SetupAct)) { return $r }
+    $r.LogUpdated = (Get-Item -LiteralPath $SetupAct).LastWriteTime.ToString('s')
+    $tail = Read-Tail $SetupAct 384
+    for ($i = $tail.Count - 1; $i -ge 0; $i--) {
+        if ($null -eq $r.Pct -and $tail[$i] -match '(?i)(?:overall|global|total)\s+progress\D{0,20}?(\d{1,3})\s*%') { $r.Pct = [int]$Matches[1] }
+        if (-not $r.Activity -and $tail[$i] -match '^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d), \w+\s+(MOUPG|SP|CONX)\s+(.+)$') {
+            $a = $Matches[3].Trim(); if ($a -notmatch '(?i)^\*+|logging (start|end)') { $r.Activity = $(if ($a.Length -gt 140) { $a.Substring(0, 137) + '...' } else { $a }); $r.ActivityTime = $Matches[1] } }
+        if ($null -ne $r.Pct -and $r.Activity) { break }
+    }
+    if ($null -ne $r.Pct -and $r.Pct -gt 100) { $r.Pct = $null }
+    $r
+}
+$SetupCodes = @{ '0xC1900210' = 'compatible - no issues found'; '0xC1900208' = 'an installed app blocks the upgrade'; '0xC1900209' = 'an installed app blocks the upgrade'
+    '0xC1900204' = 'upgrade path not available for this edition / language'; '0xC1900200' = 'hardware does not meet Windows 11 requirements'
+    '0xC1900202' = 'hardware does not meet Windows 11 requirements'; '0xC190020E' = 'not enough disk space'; '0x80070070' = 'not enough disk space'
+    '0xC1900107' = 'a cleanup from a previous upgrade is pending - restart and retry'; '0xC1900101' = 'a driver failed - Windows rolled back'
+    '0xC1900201' = 'the system reserved partition is too small'; '0xC1800118' = 'WSUS / N-central upgrade metadata problem' }
+function Get-SetupWhy([int64]$rc) { $h = '0x{0:X8}' -f ($rc -band 0xFFFFFFFFL); if ($SetupCodes[$h]) { "$h $($SetupCodes[$h])" } else { "setup exit $h" } }
+function Start-RebootWarned([int]$min, [string]$what) {
+    $msg = "Your computer will restart in $min minutes to finish $what. Please save your work. - Sigma Data Systems"
+    try { & msg.exe * /TIME:600 $msg 2>$null } catch { }
+    & shutdown.exe /r /t ($min * 60) /c $msg /d p:2:17 2>$null | Out-Null
+    Log "restart scheduled in $min minutes"
+}
+# Microsoft SetupDiag: reads Setup's logs and names the reason an upgrade failed or rolled back (best effort)
+function Invoke-SetupDiag {
+    $dd = Join-Path $WorkDir 'setupdiag'; New-Item -ItemType Directory -Path $dd -Force | Out-Null
+    $exe = Join-Path $dd 'SetupDiag.exe'; $out = Join-Path $dd 'SetupDiagResults.log'
+    try { if (-not (Test-Path $exe)) { Invoke-WebRequest -Uri $SetupDiagUrl -OutFile $exe -UseBasicParsing -ErrorAction Stop }; Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch { Log "SetupDiag download failed: $($_.Exception.Message)"; return '' }
+    Log 'running SetupDiag to find the failure reason...'
+    $p = Start-NoPrompt $exe @("/Output:`"$out`"", '/Format:text')
+    if ($p -and -not $p.WaitForExit(600000)) { try { $p.Kill() } catch { } }
+    if (-not (Test-Path $out)) { return '' }
+    $txt = @(Get-Content -LiteralPath $out -ErrorAction SilentlyContinue)
+    $keep = @($txt | Where-Object { $_ -match '(?i)matching profile|^\s*(error|reason|failure|last phase|remediation|setupdiag found)|0x[0-9a-f]{8}' } | Select-Object -First 6 | ForEach-Object { $_.Trim() })
+    $s = ($keep -join ' | '); if ($s.Length -gt 400) { $s = $s.Substring(0, 397) + '...' }
+    if ($s) { Log "SetupDiag: $s" } else { Log "SetupDiag found no known failure profile (full report: $out)" }
+    $s
+}
+function Register-Verify {
+    try {
+        $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfCopy`" -Mode Verify"
+        $t = New-ScheduledTaskTrigger -AtStartup; $t.Delay = 'PT3M'
+        $pr = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $se = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+        Register-ScheduledTask -TaskName $VerifyTask -Action $a -Trigger $t -Principal $pr -Settings $se -Force -ErrorAction Stop | Out-Null
+        Log 'after the restart a startup check will confirm the new version'
+    } catch { Log "couldn't register the after-restart check: $($_.Exception.Message) - use fu status after the restart" }
+}
+function Format-Span([datetime]$from) { $s = (Get-Date) - $from; if ($s.TotalHours -ge 1) { '{0} h {1} min' -f [int][Math]::Floor($s.TotalHours), $s.Minutes } else { '{0} min' -f [int][Math]::Floor($s.TotalMinutes) } }
 
-# (a process named "setup" only counts when it's Windows Setup - an install.wim / .esd next to it)
-# ---------------------------------------------------------------- what is this machine
+# ================================================================ this machine
 $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
 $Build = [int]"$($cv.CurrentBuildNumber)"; $Ubr = [int]"$($cv.UBR)"
 $script:BuildStr = "$Build.$Ubr"
@@ -22317,19 +22434,275 @@ $IsServer = "$($cv.InstallationType)" -match '(?i)server' -or "$($cv.ProductName
 $OsName = if ($Build -ge 22000) { 'Windows 11' } else { 'Windows 10' }
 $script:FromName = switch ($Build) { 26100 { '24H2' } 26200 { '25H2' } 26300 { '26H2' } default { if ($Display) { $Display } else { "$Build" } } }
 $Edition = "$($cv.EditionID)"
-Log ("{0} {1} {2} build {3} on {4}" -f $OsName, $Edition, $script:FromName, $script:BuildStr, $env:COMPUTERNAME)
 
-if ($Mode -eq 'Status') {
-    $st = Read-State
-    $running = Get-Process -Name 'setup', 'SetupHost', 'Windows10UpgraderApp', 'Windows11InstallationAssistant', 'setupprep' -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'setup' -or ($_.Path -and ((Test-Path (Join-Path (Split-Path $_.Path) 'sources\install.wim')) -or (Test-Path (Join-Path (Split-Path $_.Path) 'sources\install.esd')))) }
-    if ($Build -ge $TargetBuild) { Finish 'UPGRADED' $(if ($st) { "$($st.Act)" } else { 'None' }) "Now on $OsName build $script:BuildStr" 0 }
-    if ($running) { Finish 'RUNNING' $(if ($st) { "$($st.Act)" } else { 'Full' }) ("Upgrade in progress: " + (($running | Select-Object -ExpandProperty Name -Unique) -join ', ')) 0 }
-    if (-not $st) { Finish 'NONE' 'None' 'No upgrade has been started on this device by this script' 0 }
-    Log "last run: $($st.Started) - $($st.Act) - $($st.Res) $($st.Why)"
-    Finish "$($st.Res)" "$($st.Act)" "$($st.Why)" $(if ("$($st.Res)" -eq 'FAILED') { 20 } else { 0 })
+# remembered settings: paths given once are reused by later runs and by "fu check" / "fu upgrade"
+$Saved = $null; if (Test-Path -LiteralPath $SettingsPath) { try { $Saved = Get-Content -LiteralPath $SettingsPath -Raw | ConvertFrom-Json } catch { } }
+foreach ($k in 'MediaPath', 'EkbPath', 'ResultShare') {
+    if (-not $PSBoundParameters.ContainsKey($k) -and $Saved -and "$($Saved.$k)") { Set-Variable -Name $k -Value "$($Saved.$k)" }
+}
+$script:Share = $ResultShare
+if ($Mode -in 'Check', 'Upgrade' -and ($PSBoundParameters.ContainsKey('MediaPath') -or $PSBoundParameters.ContainsKey('EkbPath') -or $PSBoundParameters.ContainsKey('ResultShare'))) {
+    try { ([ordered]@{ MediaPath = $MediaPath; EkbPath = $EkbPath; ResultShare = $ResultShare; Saved = (Get-Date).ToString('s') } | ConvertTo-Json) | Set-Content -LiteralPath $SettingsPath -Encoding UTF8 } catch { }
 }
 
-# ---------------------------------------------------------------- pre-flight
+# the "fu" command: a copy of this script + fu.cmd (C:\Windows is on every PATH, incl. N-central's command line)
+if ($Mode -in 'Check', 'Upgrade', 'Status' -and -not $NoHelper) {
+    try {
+        if ($SelfText -and $PSCommandPath -ne $SelfCopy) { [IO.File]::WriteAllText($SelfCopy, $SelfText, (New-Object Text.UTF8Encoding($true))) }
+        $cmd = @(
+            '@echo off',
+            'rem Sigma Data Systems - Windows 11 feature upgrade helper.  fu help  for the commands.',
+            'set "FUPS=%ProgramData%\SigmaDataSystems\FeatureUpgrade\Invoke-SDSIFeatureUpgrade.ps1"',
+            'if not exist "%FUPS%" ( echo The feature upgrade script isn''t on this machine yet - run it once from N-central. & exit /b 1 )',
+            'set "FUM=%~1"',
+            'if "%FUM%"=="" set "FUM=Status"',
+            'if /i "%FUM%"=="status" goto one',
+            'if /i "%FUM%"=="help" goto one',
+            'if /i "%FUM%"=="errors" goto one',
+            'if /i "%FUM%"=="cancel" goto one',
+            'if /i "%FUM%"=="abortreboot" goto one',
+            'if /i "%FUM%"=="check" goto pass',
+            'if /i "%FUM%"=="upgrade" goto pass',
+            'if "%~2"=="" goto one',
+            'set "FU2=%~2"',
+            'if "%FU2:~0,1%"=="-" goto pass',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%FUPS%" -Mode %FUM% -Count %~2',
+            'exit /b %ERRORLEVEL%',
+            ':one',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%FUPS%" -Mode %FUM%',
+            'exit /b %ERRORLEVEL%',
+            ':pass',
+            'shift',
+            'powershell -NoProfile -ExecutionPolicy Bypass -File "%FUPS%" -Mode %FUM% %1 %2 %3 %4 %5 %6 %7 %8 %9',
+            'exit /b %ERRORLEVEL%'
+        ) -join "`r`n"
+        foreach ($d in $WorkDir, $env:SystemRoot) { try { [IO.File]::WriteAllText((Join-Path $d 'fu.cmd'), ($cmd + "`r`n"), (New-Object Text.ASCIIEncoding)) } catch { } }
+    } catch { }
+}
+
+# ================================================================ fu: read-only commands
+if ($Mode -eq 'Help') {
+    $h = @(
+        'fu                    status: version, state, progress, Setup''s current step, elapsed time, next step',
+        'fu watch [min]        live status every 15 s for [min] minutes (default 5)',
+        'fu log [n]            last n lines of the upgrade log (default 25)',
+        'fu setuplog [n]       last n lines of Windows Setup''s own log',
+        'fu errors             why it failed: result, Setup''s error log, SetupDiag''s analysis',
+        'fu history [n]        last n checks / upgrades / results on this machine',
+        'fu reboot [min]       restart to finish a staged upgrade (default 10 min warning)',
+        'fu abortreboot        cancel a scheduled restart',
+        'fu cancel             stop a running upgrade (nothing has been changed until the restart)',
+        'fu check              re-check with the remembered media / package paths',
+        'fu upgrade [-Reboot]  start the upgrade with the remembered paths'
+    )
+    $h | ForEach-Object { Write-Output $_ }; exit 0
+}
+
+function Get-StatusInfo {
+    $st = Read-State; $procs = Get-SetupProcs; $prog = Get-SetupProgress
+    $res = if ($Build -ge $TargetBuild) { 'UPGRADED' } elseif ($procs.Count) { 'RUNNING' } elseif ($st) { "$($st.Res)" } else { 'NONE' }
+    if ($res -in 'STARTED') { $res = $(if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) { 'RUNNING' } else { 'STARTED' }) }
+    # state says it's running, but there's no Setup process and no background task: it died without a result
+    if ($res -eq 'RUNNING' -and -not $procs.Count -and -not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) { $res = 'INTERRUPTED' }
+    [pscustomobject]@{ State = $st; Procs = $procs; Prog = $prog; Res = $res }
+}
+function Get-NextStep($i) {
+    switch ($i.Res) {
+        'RUNNING'   { 'Wait - Setup is working. Check again with: fu watch' }
+        'STARTED'   { 'The background task is starting Setup - check again in a minute' }
+        'DONE'      { if ($i.State.Act -eq 'eKB') { 'Restart to finish (one restart, ~5 min): fu reboot' } else { 'Restart to finish (15-30 min of "Working on updates"): fu reboot' } }
+        'UPGRADED'  { "Done - now on $TargetName. Check the user's apps." }
+        'FAILED'    { 'See why: fu errors' }
+        'BLOCKED'   { 'Fix what blocked it, then: fu check' }
+        'READY'     { 'Ready - start it with: fu upgrade   (add -Reboot to restart automatically)' }
+        'CANCELLED' { 'Cancelled - start again with: fu upgrade' }
+        'INTERRUPTED' { 'The background upgrade stopped without a result (restarted? killed?) - see fu log, then start again: fu upgrade' }
+        default     { 'Run a check first: fu check' }
+    }
+}
+function Show-Status {
+    $i = Get-StatusInfo; $st = $i.State
+    $script:Pct = if ($i.Res -eq 'UPGRADED') { 100 } elseif ($null -ne $i.Prog.Pct -and $i.Res -eq 'RUNNING') { $i.Prog.Pct } elseif ($st -and $null -ne $st.Pct) { [int]$st.Pct } else { $null }
+    $Lines.Add("Feature upgrade - $env:COMPUTERNAME")
+    $Lines.Add(("  Windows      : {0} {1} {2}  build {3}   (target {4})" -f $OsName, $Edition, $script:FromName, $script:BuildStr, $TargetName))
+    $Lines.Add(("  State        : {0}{1}" -f $i.Res, $(if ($st -and $st.Act) { "   ($($st.Act) upgrade from $($st.Source))" })))
+    if ($st -and $st.Started) {
+        $s = [datetime]$st.Started; $e = if ($st.Ended) { [datetime]$st.Ended } else { $null }
+        $Lines.Add(("  Started      : {0:MMM d HH:mm}   {1}" -f $s, $(if ($e) { "finished {0:HH:mm} after {1:N0} min" -f $e, ($e - $s).TotalMinutes } else { 'running for ' + (Format-Span $s) })))
+    }
+    if ($null -ne $script:Pct) { $Lines.Add("  Progress     : $($script:Pct)%") }
+    if ($i.Prog.Activity -and $i.Res -in 'RUNNING', 'STARTED', 'DONE', 'FAILED') { $Lines.Add(("  Setup step   : [{0}] {1}" -f ($i.Prog.ActivityTime -replace '^\d{4}-\d\d-\d\d ', ''), $i.Prog.Activity)) }
+    if ($i.Prog.LogUpdated -and $i.Res -eq 'RUNNING') { $Lines.Add(("  Setup log    : last written {0:HH:mm:ss}{1}" -f [datetime]$i.Prog.LogUpdated, $(if (((Get-Date) - [datetime]$i.Prog.LogUpdated).TotalMinutes -gt 20) { '   <- nothing new for 20+ min, may be stuck' }))) }
+    foreach ($p in $i.Procs) { $Lines.Add(("  Process      : {0} (PID {1}) CPU {2:N0} s" -f $p.Name, $p.Id, $p.CPU)) }
+    if ($st -and $st.Why) { $Lines.Add("  Detail       : $($st.Why)") }
+    if ($st -and $st.Diag) { $Lines.Add("  SetupDiag    : $($st.Diag)") }
+    if ($Saved -and $Saved.MediaPath) { $Lines.Add("  Media        : $($Saved.MediaPath)") }
+    $Lines.Add("  Next         : $(Get-NextStep $i)")
+    $i
+}
+
+if ($Mode -eq 'Status') {
+    $i = Show-Status
+    $why = if ($i.State -and $i.State.Why) { "$($i.State.Why)" } elseif ($i.Res -eq 'UPGRADED') { "Now on $OsName build $script:BuildStr" } else { '' }
+    if ($i.Res -eq 'RUNNING' -and $i.Prog.Activity) { $why = "Setup: $($i.Prog.Activity)" }
+    $Lines.Add(''); $Lines.Add('Last log lines:'); foreach ($l in @(Get-Content -LiteralPath $LogFile -Tail 5 -ErrorAction SilentlyContinue)) { $Lines.Add("  $l") }
+    Finish $i.Res $(if ($i.State) { "$($i.State.Act)" } else { 'None' }) $why $(if ($i.Res -eq 'FAILED') { 20 } else { 0 })
+}
+if ($Mode -eq 'Watch') {
+    $min = if ($Count -gt 0) { $Count } else { 5 }; $end = (Get-Date).AddMinutes($min)
+    Write-Output "Watching for $min min (every 15 s) - Ctrl+C to stop"
+    do {
+        $i = Get-StatusInfo
+        $pctTxt = if ($null -ne $i.Prog.Pct -and $i.Res -eq 'RUNNING') { "$($i.Prog.Pct)%" } elseif ($i.State -and $null -ne $i.State.Pct) { "$($i.State.Pct)%" } else { '--' }
+        $cpu = if ($i.Procs.Count) { ($i.Procs | ForEach-Object { '{0} {1:N0}s' -f $_.Name, $_.CPU }) -join ', ' } else { 'no Setup process' }
+        Write-Output ("{0:HH:mm:ss}  {1,-9} {2,4}  {3}  |  {4}" -f (Get-Date), $i.Res, $pctTxt, $cpu, $(if ($i.Prog.Activity) { $i.Prog.Activity } elseif ($i.State) { $i.State.Why } else { '' }))
+        if ($i.Res -in 'DONE', 'UPGRADED', 'FAILED', 'CANCELLED', 'INTERRUPTED', 'NONE', 'READY', 'BLOCKED' -and -not $i.Procs.Count) { Write-Output "Finished: $($i.Res). Next: $(Get-NextStep $i)"; break }
+        Start-Sleep -Seconds 15
+    } while ((Get-Date) -lt $end)
+    exit 0
+}
+if ($Mode -eq 'Log') { Get-Content -LiteralPath $LogFile -Tail $(if ($Count -gt 0) { $Count } else { 25 }) -ErrorAction SilentlyContinue; if (-not (Test-Path $LogFile)) { 'No log yet - the script has not run on this machine.' }; exit 0 }
+if ($Mode -eq 'SetupLog') {
+    $n = if ($Count -gt 0) { $Count } else { 30 }
+    $src = if (Test-Path -LiteralPath $SetupAct) { $SetupAct } else { Get-ChildItem (Join-Path $WorkDir 'setup-logs'), (Join-Path $WorkDir 'compat-logs') -Recurse -Filter 'setupact.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
+    if (-not $src) { 'No Windows Setup log on this machine (Setup has not run, or its folder was cleaned up).'; exit 0 }
+    "== $src  (last written $((Get-Item -LiteralPath $src).LastWriteTime))"; Read-Tail $src 128 | Select-Object -Last $n; exit 0
+}
+if ($Mode -eq 'Errors') {
+    $st = Read-State
+    if ($st) { "Result : $($st.Res) - $($st.Why)"; if ($st.Diag) { "SetupDiag : $($st.Diag)" } } else { 'No upgrade recorded on this machine.' }
+    $err = if (Test-Path -LiteralPath $SetupErr) { $SetupErr } else { Get-ChildItem (Join-Path $WorkDir 'setup-logs'), (Join-Path $WorkDir 'compat-logs') -Recurse -Filter 'setuperr.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
+    if ($err) { ''; "== $err (last 15 lines)"; Read-Tail $err 64 | Select-Object -Last 15 }
+    $sdr = Join-Path $WorkDir 'setupdiag\SetupDiagResults.log'
+    if (Test-Path -LiteralPath $sdr) { ''; "== SetupDiag report ($sdr)"; Get-Content -LiteralPath $sdr -TotalCount 30 }
+    ''; 'Last log lines:'; Get-Content -LiteralPath $LogFile -Tail 8 -ErrorAction SilentlyContinue
+    exit 0
+}
+if ($Mode -eq 'History') {
+    if (-not (Test-Path -LiteralPath $HistPath)) { 'No history yet.'; exit 0 }
+    Import-Csv -LiteralPath $HistPath | Select-Object -Last $(if ($Count -gt 0) { $Count } else { 15 }) | Format-Table Time, Mode, Action, From, Result, Detail -AutoSize -Wrap | Out-String -Width 220
+    exit 0
+}
+
+# ================================================================ fu: reboot / abortreboot / cancel
+if ($Mode -eq 'AbortReboot') { & shutdown.exe /a 2>$null | Out-Null; Log 'scheduled restart cancelled (shutdown /a)'; Write-Output 'Scheduled restart cancelled (if there was one).'; exit 0 }
+if ($Mode -eq 'Reboot') {
+    $i = Get-StatusInfo
+    if ($i.Res -ne 'DONE' -and -not $Force) { Write-Output "The upgrade isn't staged (state: $($i.Res)) - nothing to finish. Use fu reboot -Force to restart anyway."; exit 1 }
+    Start-RebootWarned $(if ($Count -gt 0) { $Count } else { $RebootDelayMinutes }) "the Windows 11 $TargetName upgrade"
+    Write-Output ("Restart scheduled in {0} min, users warned. Undo with: fu abortreboot. After the restart: fu" -f $(if ($Count -gt 0) { $Count } else { $RebootDelayMinutes })); exit 0
+}
+if ($Mode -eq 'Cancel') {
+    $st = Read-State; $did = @()
+    foreach ($w in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match '-Mode Background' -and $_.ProcessId -ne $PID })) { try { Stop-Process -Id $w.ProcessId -Force -ErrorAction Stop; $did += "background task PID $($w.ProcessId)" } catch { } }
+    foreach ($p in (Get-SetupProcs)) { try { Stop-Process -Id $p.Id -Force -ErrorAction Stop; $did += "$($p.Name) PID $($p.Id)" } catch { } }
+    foreach ($t in $TaskName, $VerifyTask) { if (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue; $did += "task $t" } }
+    & shutdown.exe /a 2>$null | Out-Null
+    $rc = $null; if (Test-Path -LiteralPath $RunnerCfg) { try { $rc = Get-Content -LiteralPath $RunnerCfg -Raw | ConvertFrom-Json } catch { } }
+    foreach ($img in @("$($rc.MediaPath)", (Join-Path $WorkDir ([IO.Path]::GetFileName("$($rc.MediaPath)"))))) { if ($img -match '\.iso$') { try { if ((Get-DiskImage -ImagePath $img -ErrorAction Stop).Attached) { Dismount-DiskImage -ImagePath $img -ErrorAction SilentlyContinue | Out-Null; $did += 'unmounted the ISO' } } catch { } } }
+    $h = ConvertTo-Ordered $st; if (-not $h.Contains('Started')) { $h.Started = (Get-Date).ToString('s') }
+    $h.Res = 'CANCELLED'; $h.Why = "Cancelled by a technician$(if ($did.Count) { ': stopped ' + ($did -join ', ') })"; $h.Ended = (Get-Date).ToString('s'); Save-State $h
+    Log $h.Why; Add-History 'CANCELLED' "$($h.Act)" $h.Why
+    Write-Output $h.Why; Write-Output 'Windows has not been changed (an upgrade only takes effect at the restart). Setup''s leftover files in C:\$WINDOWS.~BT are reused or cleaned up by the next attempt.'
+    exit 0
+}
+
+# ================================================================ after the restart: confirm the new version
+if ($Mode -eq 'Verify') {
+    Start-Sleep -Seconds 30
+    $h = ConvertTo-Ordered (Read-State); if (-not $h.Contains('Started')) { $h.Started = (Get-Date).ToString('s') }
+    try { Unregister-ScheduledTask -TaskName $VerifyTask -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+    $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).LastBootUpTime
+    if ($Build -ge $TargetBuild) {
+        $mins = [int]((Get-Date) - [datetime]$h.Started).TotalMinutes
+        $h.Res = 'UPGRADED'; $h.Pct = 100; $h.Why = "Now on $OsName $($script:FromName) build $script:BuildStr - confirmed after the restart ($boot)"; $h.Verified = (Get-Date).ToString('s'); $h.TotalMinutes = $mins
+        Save-State $h; Log "$($h.Why), $mins min from start to finish"; Add-History 'UPGRADED' "$($h.Act)" $h.Why; exit 0
+    }
+    $rolled = (Test-Path "$env:SystemDrive\`$WINDOWS.~BT\Sources\Rollback") -or (@(Read-Tail $SetupAct 256 | Where-Object { $_ -match '(?i)rollback' }).Count -gt 0)
+    $h.Res = 'FAILED'; $h.Pct = $null
+    $h.Why = $(if ($rolled) { "Windows rolled the upgrade back at the restart - still on build $script:BuildStr" } else { "Still on build $script:BuildStr after the restart - the upgrade didn't apply" })
+    Log $h.Why; $h.Diag = Invoke-SetupDiag; Save-State $h; Add-History 'FAILED' "$($h.Act)" $h.Why
+    exit 0
+}
+
+# ================================================================ background: run Windows Setup and follow it
+if ($Mode -eq 'Background') {
+    $c = Get-Content -LiteralPath $RunnerCfg -Raw | ConvertFrom-Json
+    if ($c.ResultShare) { $script:Share = "$($c.ResultShare)" }
+    $h = ConvertTo-Ordered (Read-State); $h.Res = 'RUNNING'; $h.Pct = 0; $h.Why = ''; Save-State $h
+    $mounted = $null
+    function Stop-Bg([string]$res, [string]$why, [string]$diag) {
+        $h.Res = $res; $h.Why = $why; $h.Ended = (Get-Date).ToString('s'); if ($diag) { $h.Diag = $diag }
+        $h.Minutes = [int]((Get-Date) - [datetime]$h.Started).TotalMinutes
+        if ($res -eq 'DONE') { $h.Pct = 100 }
+        Save-State $h; Log "$res - $why"; Add-History $res 'Full' $why
+        if ($res -eq 'DONE') { Register-Verify; if ($c.Reboot) { Start-RebootWarned ([int]$c.RebootDelayMinutes) "the Windows 11 $($c.TargetName) upgrade" } }
+        try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+        if ($mounted) { try { Dismount-DiskImage -ImagePath $mounted -ErrorAction SilentlyContinue | Out-Null } catch { } }
+        exit 0
+    }
+    # follow a running Setup: record progress / step every minute, log when the step or 10% mark changes
+    function Wait-Setup($proc, [string[]]$names) {
+        $deadline = (Get-Date).AddHours([double]$c.MaxHours); $lastPct = -10; $lastAct = ''; $lastLog = Get-Date
+        while ((Get-Date) -lt $deadline) {
+            $alive = if ($proc) { -not $proc.HasExited } else { $false }
+            if (-not $alive -and $names) { $alive = [bool](Get-Process -Name $names -ErrorAction SilentlyContinue) }
+            if (-not $alive) { return $true }
+            $pg = Get-SetupProgress
+            if ($null -ne $pg.Pct) { $h.Pct = $pg.Pct }; $h.Activity = $pg.Activity; $h.ActivityTime = $pg.ActivityTime; $h.SetupLogUpdated = $pg.LogUpdated; Save-State $h
+            $step = ($pg.Activity -replace '\d+', '#')
+            if (($null -ne $pg.Pct -and $pg.Pct -ge $lastPct + 10) -or (((Get-Date) - $lastLog).TotalMinutes -ge 10 -and $step -ne $lastAct)) {
+                Log ("progress {0}  |  {1}" -f $(if ($null -ne $pg.Pct) { "$($pg.Pct)%" } else { '--' }), $pg.Activity)
+                if ($null -ne $pg.Pct) { $lastPct = $pg.Pct - ($pg.Pct % 10) }; $lastAct = $step; $lastLog = Get-Date
+            }
+            Start-Sleep -Seconds 60
+        }
+        $false
+    }
+    if ($c.MediaPath) {
+        $setup = $null; $mp = "$($c.MediaPath)"
+        if ($mp -match '\.iso$') {
+            try { $img = Mount-DiskImage -ImagePath $mp -PassThru -ErrorAction Stop; $mounted = $mp } catch {
+                Log "can't mount the ISO from the share ($($_.Exception.Message)) - copying it locally first"
+                $loc = Join-Path $WorkDir ([IO.Path]::GetFileName($mp)); Copy-Item -LiteralPath $mp -Destination $loc -Force
+                try { $img = Mount-DiskImage -ImagePath $loc -PassThru -ErrorAction Stop; $mounted = $loc } catch { Stop-Bg 'FAILED' "Can't mount $mp : $($_.Exception.Message)" }
+            }
+            Start-Sleep -Seconds 3
+            $vol = ($img | Get-Volume -ErrorAction SilentlyContinue).DriveLetter
+            if (-not $vol) { $vol = (Get-DiskImage -ImagePath $mounted | Get-Volume).DriveLetter }
+            $setup = "$($vol):\setup.exe"
+        } else { $setup = Join-Path $mp 'setup.exe' }
+        if (-not (Test-Path -LiteralPath $setup)) { Stop-Bg 'FAILED' "setup.exe not found in $mp" }
+        $logs = Join-Path $WorkDir 'setup-logs'; New-Item -ItemType Directory -Path $logs -Force | Out-Null
+        $sa = @('/auto', 'upgrade', '/quiet', '/eula', 'accept', '/noreboot', '/dynamicupdate', 'disable', '/showoobe', 'none', '/telemetry', 'disable', '/copylogs', "`"$logs`"")
+        if ($c.IgnoreHardwareCheck) { $sa += @('/compat', 'ignorewarning') }
+        Log "running $setup $($sa -join ' ')"
+        $p = Start-NoPrompt $setup $sa
+        if (-not $p) { Stop-Bg 'FAILED' "couldn't start $setup" }
+        Log "setup started (PID $($p.Id))"; $h.SetupPid = $p.Id; Save-State $h
+        if (-not (Wait-Setup $p @())) { Stop-Bg 'FAILED' "Setup still running after $($c.MaxHours) h - check fu setuplog" }
+        $rc = [int64]$p.ExitCode; $h.SetupExit = '0x{0:X8}' -f ($rc -band 0xFFFFFFFFL)
+        if ($rc -in 0, 3010) { Stop-Bg 'DONE' "Upgrade staged (setup exit $rc) - becomes Windows 11 $($c.TargetName) at the next restart (takes 15-30 min)" }
+        $why = "Setup failed: $(Get-SetupWhy $rc)"; Log $why
+        Stop-Bg 'FAILED' "$why - fu errors for details" (Invoke-SetupDiag)
+    }
+    # ---- no media: Windows 11 Installation Assistant from Microsoft
+    $h.Source = 'Installation Assistant'; Save-State $h
+    $exe = Join-Path $WorkDir 'Windows11InstallationAssistant.exe'
+    try { Invoke-WebRequest -Uri $c.AssistantUrl -OutFile $exe -UseBasicParsing -ErrorAction Stop } catch { Stop-Bg 'FAILED' "Installation Assistant download failed: $($_.Exception.Message)" }
+    try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch { }
+    $p = Start-NoPrompt $exe @('/QuietInstall', '/SkipEULA', '/Auto', 'Upgrade', '/NoRestartUI', '/CopyLogs', "`"$WorkDir`"")
+    if (-not $p) { Stop-Bg 'FAILED' "couldn't start the Installation Assistant" }
+    Log "Installation Assistant started (PID $($p.Id)) - it downloads ~4 GB itself"
+    Start-Sleep -Seconds 120
+    if (-not (Wait-Setup $null @('Windows11InstallationAssistant', 'Windows10UpgraderApp', 'SetupHost', 'setupprep'))) { Stop-Bg 'FAILED' "Installation Assistant still running after $($c.MaxHours) h" }
+    $staged = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path "$env:SystemDrive\`$WINDOWS.~BT\Sources\SafeOS") -or (@(Read-Tail $SetupAct 64 | Where-Object { $_ -match '(?i)reboot.*prevented|rebooting system' }).Count -gt 0)
+    if ($staged) { Stop-Bg 'DONE' "Installation Assistant finished staging - becomes Windows 11 $($c.TargetName) at the next restart" }
+    Stop-Bg 'FAILED' 'Installation Assistant ended without staging the upgrade (no TPM 2.0 / Secure Boot? use -MediaPath with setup.exe) - fu errors' (Invoke-SetupDiag)
+}
+
+# ================================================================ Check / Upgrade: pre-flight
+Log ("{0} {1} {2} build {3} on {4}" -f $OsName, $Edition, $script:FromName, $script:BuildStr, $env:COMPUTERNAME)
 if ($IsServer) { Finish 'SERVER' 'None' 'Windows Server - feature upgrades are not done by this script' 0 }
 if ($Build -ge $TargetBuild) { Finish 'CURRENT' 'None' "Already on $TargetName or newer ($script:BuildStr)" 0 }
 # 24H2 / 25H2 / 26H2 share one servicing branch: anything on it below the target only needs the enablement package
@@ -22338,8 +22711,10 @@ if ($Act -eq 'eKB' -and $Ubr -lt $EkbMinUbr) { Finish 'BLOCKED' 'eKB' "Build $sc
 if ($Act -eq 'Full' -and $Build -lt 19041) { Finish 'BLOCKED' 'Full' "Windows 10 build $Build is too old for a direct upgrade - needs 19041 (2004) or newer" 10 }
 $why = @()
 
-$busy = Get-Process -Name 'setup', 'SetupHost', 'Windows10UpgraderApp', 'Windows11InstallationAssistant', 'setupprep' -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'setup' -or ($_.Path -and ((Test-Path (Join-Path (Split-Path $_.Path) 'sources\install.wim')) -or (Test-Path (Join-Path (Split-Path $_.Path) 'sources\install.esd')))) }
-if ($busy) { Finish 'RUNNING' $Act ("An upgrade is already running: " + (($busy | Select-Object -ExpandProperty Name -Unique) -join ', ')) 14 }
+$busy = Get-SetupProcs
+if ($busy.Count) { Finish 'RUNNING' $Act ("An upgrade is already running: " + (($busy | Select-Object -ExpandProperty Name -Unique) -join ', ') + ' - fu watch') 14 }
+$prevSt = Read-State
+if ($Mode -eq 'Upgrade' -and $prevSt -and "$($prevSt.Res)" -eq 'DONE' -and -not $Force) { Finish 'DONE' "$($prevSt.Act)" "An upgrade is already staged and waiting for a restart ($($prevSt.Ended)) - fu reboot" 0 }
 
 $need = if ($MinFreeGB -gt 0) { $MinFreeGB } elseif ($Act -eq 'Full') { 25 } else { 3 }
 $freeGB = [math]::Round(((Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue).FreeSpace) / 1GB, 1)
@@ -22387,13 +22762,12 @@ if ($Act -eq 'Full') {
     $sysGB = [math]::Round(((Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue).Size) / 1GB, 0)
     if ($sysGB -and $sysGB -lt 60) { $hard += "system disk $sysGB GB (needs 64 GB)" }
     $cpu = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1).Name
-    # the compatibility appraiser's own verdict for Windows 11 (RedReason = what blocks it; Cpu* = unsupported processor)
     $ind = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\TargetVersionUpgradeExperienceIndicators'
     $red = @(Get-ChildItem $ind -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^(NI|GE|CU|ZN|BR)' } | ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).RedReason } | Where-Object { $_ -and $_ -ne 'None' } | ForEach-Object { "$_" -split '[ ,]+' } | Where-Object { $_ } | Select-Object -Unique)
     if (@($red | Where-Object { $_ -match '(?i)^cpu|processor' }).Count) { $hard += "processor not supported for Windows 11 ($cpu)" }
     $other = @($red | Where-Object { $_ -notmatch '(?i)^cpu|processor' })
     if ($other.Count) { $hw += ('appraiser: ' + ($other -join ', ')) }
-    if (-not $red.Count) { Log "appraiser: no Windows 11 verdict recorded on this PC yet - CPU $cpu not checked by Windows$(if ($MediaPath) { ' (the setup compatibility scan below covers it)' })" }
+    if (-not $red.Count) { Log "appraiser: no Windows 11 verdict recorded on this PC yet - CPU $cpu not checked by Windows$(if ($MediaPath) { ' (the setup compatibility scan covers it)' })" }
     if ($hard.Count) {
         Log ('hardware: NOT ELIGIBLE - ' + ($hard -join '; '))
         if (-not $IgnoreHardwareCheck) { Finish 'BLOCKED' 'Full' ('Not eligible for Windows 11: ' + ($hard -join '; ')) 10 }
@@ -22402,12 +22776,6 @@ if ($Act -eq 'Full') {
     if ($hw.Count) { Log ('hardware warnings: ' + ($hw -join '; ')); $why += ('hardware warnings: ' + ($hw -join '; ')) }
     elseif (-not $hard.Count) { Log "hardware: TPM 2.0, UEFI, $ramGB GB RAM, $sysGB GB disk OK$(if ($red.Count) { ', appraiser OK' })" }
 }
-
-$SetupCodes = @{ '0xC1900210' = 'compatible - no issues found'; '0xC1900208' = 'an installed app blocks the upgrade'; '0xC1900209' = 'an installed app blocks the upgrade'
-    '0xC1900204' = 'upgrade path not available for this edition / language'; '0xC1900200' = 'hardware does not meet Windows 11 requirements'
-    '0xC1900202' = 'hardware does not meet Windows 11 requirements'; '0xC190020E' = 'not enough disk space'; '0x80070070' = 'not enough disk space'
-    '0xC1900107' = 'a cleanup from a previous upgrade is pending - restart and retry'; '0xC1900101' = 'a driver failed'; '0xC1900201' = 'the system reserved partition is too small' }
-function Get-SetupWhy([int64]$rc) { $h = '0x{0:X8}' -f ($rc -band 0xFFFFFFFFL); if ($SetupCodes[$h]) { "$h $($SetupCodes[$h])" } else { "setup exit $h" } }
 
 # ---------------------------------------------------------------- source
 function Test-Src([string]$p) { if (-not $p) { return $false }; try { return (Test-Path -LiteralPath $p) } catch { return $false } }
@@ -22434,13 +22802,14 @@ if ($Mode -eq 'Check' -and $Act -eq 'Full' -and $src -like 'media *' -and -not $
     if ($setup -and (Test-Path -LiteralPath $setup)) {
         $clog = Join-Path $WorkDir 'compat-logs'; New-Item -ItemType Directory -Path $clog -Force | Out-Null
         Log "running Windows Setup compatibility scan (no changes; up to $CompatScanMinutes min)..."
+        $t0 = Get-Date
         $cp = Start-NoPrompt $setup @('/auto', 'upgrade', '/quiet', '/compat', 'scanonly', '/eula', 'accept', '/noreboot', '/dynamicupdate', 'disable', '/telemetry', 'disable', '/copylogs', "`"$clog`"")
         if ($cp) { Log "setup started (PID $($cp.Id))" } else { Log 'setup did not start' }
         if (-not $cp) { $scan = "couldn't start $setup" }
         elseif (-not $cp.WaitForExit($CompatScanMinutes * 60000)) { try { $cp.Kill() } catch { }; $scan = "compatibility scan didn't finish in $CompatScanMinutes min" }
         else { $rc = [int64]$cp.ExitCode; $scan = Get-SetupWhy $rc }
         if ($isoMounted) { try { Dismount-DiskImage -ImagePath $isoMounted -ErrorAction SilentlyContinue | Out-Null } catch { } }
-        Log "compatibility scan: $scan"
+        Log ("compatibility scan: {0} ({1:N0} min)" -f $scan, ((Get-Date) - $t0).TotalMinutes)
         if ($scan -match '0xC1900200|0xC1900202') { Finish 'BLOCKED' 'Full' "Windows Setup: $scan (logs: $clog)" 10 }
         if ($scan -match '0xC1900208|0xC1900209|0xC1900204|0xC190020E|0x80070070|0xC1900201|0xC1900107') { Finish 'BLOCKED' 'Full' "Windows Setup: $scan (logs: $clog)" 15 }
         if ($scan -notmatch '0xC1900210') { $why += "compatibility scan: $scan" } else { $why += 'Windows Setup compatibility scan passed' }
@@ -22449,16 +22818,9 @@ if ($Mode -eq 'Check' -and $Act -eq 'Full' -and $src -like 'media *' -and -not $
 
 if ($Mode -eq 'Check') { Finish 'READY' $Act (("Would upgrade $($script:FromName) to $TargetName via $Act from $src") + $(if ($why.Count) { ' | ' + ($why -join ' | ') })) 0 }
 
-# ---------------------------------------------------------------- upgrade: enablement package (24H2 / 25H2 -> 26H2)
-function Start-RebootWarned([string]$what) {
-    $msg = "Your computer will restart in $RebootDelayMinutes minutes to finish $what. Please save your work. - Sigma Data Systems"
-    try { & msg.exe * /TIME:600 $msg 2>$null } catch { }
-    & shutdown.exe /r /t ($RebootDelayMinutes * 60) /c $msg /d p:2:17 2>$null | Out-Null
-    Log "restart scheduled in $RebootDelayMinutes minutes"
-}
-
+# ================================================================ upgrade: enablement package (24H2 / 25H2 -> 26H2)
 if ($Act -eq 'eKB') {
-    $state = [ordered]@{ Started = (Get-Date).ToString('s'); Act = 'eKB'; From = $script:FromName; Build = $script:BuildStr; Source = $src; Res = 'RUNNING'; Why = '' }
+    $state = [ordered]@{ Started = (Get-Date).ToString('s'); Act = 'eKB'; From = $script:FromName; Build = $script:BuildStr; Source = $src; Res = 'RUNNING'; Pct = $null; Why = '' }
     Save-State $state
     $ok = $false; $detail = ''
     $msu = $null
@@ -22483,7 +22845,7 @@ if ($Act -eq 'eKB') {
         try {
             $ses = New-Object -ComObject Microsoft.Update.Session
             $srch = $ses.CreateUpdateSearcher(); $srch.ServerSelection = 2     # 2 = Windows Update online, not WSUS / N-central
-            Log 'searching Windows Update for the enablement package...'
+            Log 'searching Windows Update for the enablement package (2-5 min)...'
             $res = $srch.Search("IsInstalled=0 and IsHidden=0")
             $kbNum = $EkbKB -replace '\D', ''
             $hit = @($res.Updates | Where-Object { @($_.KBArticleIDs) -contains $kbNum -or "$($_.Title)" -match "version $TargetName" }) | Select-Object -First 1
@@ -22497,116 +22859,33 @@ if ($Act -eq 'eKB') {
         } catch { $detail = "Windows Update error: $($_.Exception.Message)" }
     }
     Log $detail
+    $state.Ended = (Get-Date).ToString('s')
     if ($ok) {
-        $state.Res = 'DONE'; $state.Why = "Enablement package installed ($detail) - becomes $TargetName after one restart"; Save-State $state
-        if ($Reboot) { Start-RebootWarned "the Windows 11 $TargetName update" }
+        $state.Res = 'DONE'; $state.Pct = 100; $state.Why = "Enablement package installed ($detail) - becomes $TargetName after one restart"; Save-State $state
+        if ($SelfText) { try { [IO.File]::WriteAllText($SelfCopy, $SelfText, (New-Object Text.UTF8Encoding($true))) } catch { } }
+        Register-Verify
+        if ($Reboot) { Start-RebootWarned $RebootDelayMinutes "the Windows 11 $TargetName update" }
         Finish 'DONE' 'eKB' $state.Why 0
     }
     $state.Res = 'FAILED'; $state.Why = "Enablement package failed: $detail"; Save-State $state
     Finish 'FAILED' 'eKB' $state.Why 20
 }
 
-# ---------------------------------------------------------------- upgrade: full in-place upgrade, in the background
-# A small runner script is written next to the log and started as a one-time SYSTEM scheduled task. It mounts / copies
-# the media (or downloads the Installation Assistant), runs setup, waits for it, records the result and restarts if
-# -Reboot was given, then removes its own scheduled task.
-$cfg = [ordered]@{ Act = 'Full'; From = $script:FromName; Build = $script:BuildStr; MediaPath = $(if ($src -like 'media *') { $MediaPath } else { '' })
-    AssistantUrl = $AssistantUrl; Reboot = [bool]$Reboot; RebootDelayMinutes = $RebootDelayMinutes; MaxHours = $MaxHours; TargetName = $TargetName
-    WorkDir = $WorkDir; TaskName = $TaskName; IgnoreHardwareCheck = [bool]$IgnoreHardwareCheck }
-($cfg | ConvertTo-Json) | Set-Content -LiteralPath (Join-Path $WorkDir 'runner.json') -Encoding UTF8
-
-# (a script block, not a here-string, so this file can itself be embedded in the ToolKit's here-strings)
-$runner = {
-$ErrorActionPreference = 'Continue'; $ProgressPreference = 'SilentlyContinue'
-try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
-$dir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$c = Get-Content -LiteralPath (Join-Path $dir 'runner.json') -Raw | ConvertFrom-Json
-$log = Join-Path $dir 'feature-upgrade.log'; $sp = Join-Path $dir 'state.json'
-# Starts a program WITHOUT the Windows shell. Start-Process uses the shell, and a file marked "downloaded from the
-# internet" (Mark of the Web - inherited by everything inside an ISO downloaded from Microsoft) then shows an invisible
-# "Open File - Security Warning" prompt in the SYSTEM session and hangs forever. CreateProcess never prompts.
-function Start-NoPrompt([string]$File, [string[]]$ArgList) {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = $File; $psi.Arguments = ($ArgList -join ' '); $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
-    $wd = Split-Path -Parent $File; if ($wd) { $psi.WorkingDirectory = $wd }
-    [System.Diagnostics.Process]::Start($psi)
-}
-function L([string]$m) { Add-Content -LiteralPath $log -Value ("{0:yyyy-MM-dd HH:mm:ss}  [runner] {1}" -f (Get-Date), $m) -Encoding UTF8 }
-$st = [ordered]@{ Started = (Get-Date).ToString('s'); Act = 'Full'; From = $c.From; Build = $c.Build; Source = ''; Res = 'RUNNING'; Why = '' }
-function S { ($st | ConvertTo-Json) | Set-Content -LiteralPath $sp -Encoding UTF8 }
-function Done([string]$res, [string]$why) {
-    $st.Res = $res; $st.Why = $why; $st.Ended = (Get-Date).ToString('s'); S; L "$res - $why"
-    if ($res -eq 'DONE' -and $c.Reboot) {
-        $m = "Your computer will restart in $($c.RebootDelayMinutes) minutes to finish the Windows 11 $($c.TargetName) upgrade. Please save your work. - Sigma Data Systems"
-        try { & msg.exe * /TIME:600 $m 2>$null } catch { }
-        & shutdown.exe /r /t ([int]$c.RebootDelayMinutes * 60) /c $m /d p:2:17 2>$null | Out-Null; L 'restart scheduled'
-    }
-    try { Unregister-ScheduledTask -TaskName $c.TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-    if ($mounted) { try { Dismount-DiskImage -ImagePath $mounted -ErrorAction SilentlyContinue | Out-Null } catch { } }
-    exit 0
-}
-S; $mounted = $null
-$codes = @{ '0xC1900210' = 'compatible (no issues)'; '0xC1900208' = 'an installed app blocks the upgrade'; '0xC1900204' = 'upgrade path not available for this edition / language'
-    '0xC1900200' = 'hardware does not meet Windows 11 requirements'; '0xC1900202' = 'hardware does not meet Windows 11 requirements'; '0xC190020E' = 'not enough disk space'
-    '0xC1900107' = 'a cleanup from a previous upgrade is pending - restart and retry'; '0xC1900101' = 'a driver failed - rolled back'; '0xC1800118' = 'WSUS / N-central upgrade metadata problem'
-    '0x80070070' = 'not enough disk space'; '0xC1900209' = 'an installed app blocks the upgrade' }
-function Why-Code([int64]$rc) { $h = '0x{0:X8}' -f ($rc -band 0xFFFFFFFFL); if ($codes[$h]) { "$h $($codes[$h])" } else { "exit $h" } }
-$deadline = (Get-Date).AddHours([double]$c.MaxHours)
-
-if ($c.MediaPath) {
-    # ---- setup.exe from the share (ISO or extracted folder)
-    $setup = $null; $mp = $c.MediaPath
-    if ($mp -match '\.iso$') {
-        try { $img = Mount-DiskImage -ImagePath $mp -PassThru -ErrorAction Stop; $mounted = $mp } catch {
-            L "can't mount the ISO from the share ($($_.Exception.Message)) - copying it locally first"
-            $loc = Join-Path $dir ([IO.Path]::GetFileName($mp)); Copy-Item -LiteralPath $mp -Destination $loc -Force
-            try { $img = Mount-DiskImage -ImagePath $loc -PassThru -ErrorAction Stop; $mounted = $loc } catch { Done 'FAILED' "Can't mount $mp : $($_.Exception.Message)" }
-        }
-        Start-Sleep -Seconds 3
-        $vol = ($img | Get-Volume -ErrorAction SilentlyContinue).DriveLetter
-        if (-not $vol) { $vol = (Get-DiskImage -ImagePath $mounted | Get-Volume).DriveLetter }
-        $setup = "$($vol):\setup.exe"
-    } else { $setup = Join-Path $mp 'setup.exe' }
-    if (-not (Test-Path -LiteralPath $setup)) { Done 'FAILED' "setup.exe not found in $mp" }
-    $st.Source = "media $mp"; S
-    $logs = Join-Path $dir 'setup-logs'; New-Item -ItemType Directory -Path $logs -Force | Out-Null
-    $args2 = @('/auto', 'upgrade', '/quiet', '/eula', 'accept', '/noreboot', '/dynamicupdate', 'disable', '/showoobe', 'none', '/telemetry', 'disable', '/copylogs', "`"$logs`"")
-    if ($c.IgnoreHardwareCheck) { $args2 += @('/compat', 'ignorewarning') }
-    L "running $setup $($args2 -join ' ')"
-    $p = Start-NoPrompt $setup $args2
-    if (-not $p) { Done 'FAILED' "couldn't start $setup" }; L "setup started (PID $($p.Id))"
-    while (-not $p.HasExited -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 30 }
-    if (-not $p.HasExited) { Done 'FAILED' "setup still running after $($c.MaxHours) h - check $logs" }
-    $rc = [int64]$p.ExitCode
-    if ($rc -in 0, 3010) { Done 'DONE' "Upgrade staged (setup exit $rc) - becomes Windows 11 $($c.TargetName) at the next restart (takes 15-30 min)" }
-    Done 'FAILED' ("Setup failed: " + (Why-Code $rc) + " - logs in $logs")
-}
-
-# ---- no media: Windows 11 Installation Assistant from Microsoft
-$st.Source = 'Installation Assistant'; S
-$exe = Join-Path $dir 'Windows11InstallationAssistant.exe'
-try { Invoke-WebRequest -Uri $c.AssistantUrl -OutFile $exe -UseBasicParsing -ErrorAction Stop } catch { Done 'FAILED' "Installation Assistant download failed: $($_.Exception.Message)" }
-L 'starting the Installation Assistant (downloads ~4 GB itself)'
-try { Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue } catch { }
-$p = Start-NoPrompt $exe @('/QuietInstall', '/SkipEULA', '/Auto', 'Upgrade', '/NoRestartUI', '/CopyLogs', "`"$dir`"")
-if (-not $p) { Done 'FAILED' "couldn't start the Installation Assistant" }; L "Installation Assistant started (PID $($p.Id))"
-Start-Sleep -Seconds 120
-$names = 'Windows11InstallationAssistant', 'Windows10UpgraderApp', 'SetupHost', 'setupprep'
-while ((Get-Process -Name $names -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 60 }
-if (Get-Process -Name $names -ErrorAction SilentlyContinue) { Done 'FAILED' "Installation Assistant still running after $($c.MaxHours) h" }
-$pend = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or (Test-Path "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\setupact.log" -NewerThan (Get-Date).AddMinutes(-90))
-$sd = Get-ChildItem "$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther" -Filter 'setuperr.log' -ErrorAction SilentlyContinue | Select-Object -First 1
-if ($pend) { Done 'DONE' "Installation Assistant finished staging - becomes Windows 11 $($c.TargetName) at the next restart" }
-Done 'FAILED' ("Installation Assistant ended without staging the upgrade" + $(if ($sd) { " - see $($sd.FullName)" }) + ' (no TPM 2.0 / Secure Boot? use -MediaPath with setup.exe)')
-}.ToString()
-$runPath = Join-Path $WorkDir 'Run-FeatureUpgrade.ps1'
-Set-Content -LiteralPath $runPath -Value $runner -Encoding UTF8
-
-$state = [ordered]@{ Started = (Get-Date).ToString('s'); Act = 'Full'; From = $script:FromName; Build = $script:BuildStr; Source = $src; Res = 'STARTED'; Why = '' }
+# ================================================================ upgrade: full in-place upgrade, in the background
+# The background work is this same script (the copy in the work folder) run with -Mode Background by a one-time SYSTEM
+# scheduled task: it runs Windows Setup, records progress every minute, then sets DONE / FAILED, registers the
+# after-restart check, restarts if -Reboot was given, and removes its own task.
+if (-not $SelfText) { Finish 'FAILED' 'Full' "Couldn't read this script's own text to run it in the background" 20 }
+try { [IO.File]::WriteAllText($SelfCopy, $SelfText, (New-Object Text.UTF8Encoding($true))) } catch { Finish 'FAILED' 'Full' "Couldn't save the background copy to $SelfCopy : $($_.Exception.Message)" 20 }
+$cfg = [ordered]@{ MediaPath = $(if ($src -like 'media *') { $MediaPath } else { '' }); AssistantUrl = $AssistantUrl; Reboot = [bool]$Reboot
+    RebootDelayMinutes = $RebootDelayMinutes; MaxHours = $MaxHours; TargetName = $TargetName; IgnoreHardwareCheck = [bool]$IgnoreHardwareCheck; ResultShare = $script:Share }
+($cfg | ConvertTo-Json) | Set-Content -LiteralPath $RunnerCfg -Encoding UTF8
+$state = [ordered]@{ Started = (Get-Date).ToString('s'); Act = 'Full'; From = $script:FromName; Build = $script:BuildStr; Source = $src; Res = 'STARTED'; Pct = 0; Why = '' }
 Save-State $state
 try {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runPath`""
+    Unregister-ScheduledTask -TaskName $VerifyTask -Confirm:$false -ErrorAction SilentlyContinue
+    $a = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfCopy`" -Mode Background"
     $pr = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     $se = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours ($MaxHours + 1)) -StartWhenAvailable
     Register-ScheduledTask -TaskName $TaskName -Action $a -Principal $pr -Settings $se -Force -ErrorAction Stop | Out-Null
@@ -22615,7 +22894,7 @@ try {
     $state.Res = 'FAILED'; $state.Why = "Couldn't start the background task: $($_.Exception.Message)"; Save-State $state
     Finish 'FAILED' 'Full' $state.Why 20
 }
-Log "background upgrade started (scheduled task $TaskName) - check later with -Mode Status"
+Log "background upgrade started (scheduled task $TaskName) - check on it with: fu   or   fu watch"
 Finish 'STARTED' 'Full' (("Full upgrade $($script:FromName) to $TargetName started in the background from $src" + $(if ($Reboot) { ', restarts when staged' } else { ', finishes at the next restart' })) + $(if ($why.Count) { ' | ' + ($why -join ' | ') })) 0
 '@
 
