@@ -22528,7 +22528,8 @@ function Show-Status {
     $Lines.Add(("  State        : {0}{1}" -f $i.Res, $(if ($st -and $st.Act) { "   ($($st.Act) upgrade from $($st.Source))" })))
     if ($st -and $st.Started) {
         $s = [datetime]$st.Started; $e = if ($st.Ended) { [datetime]$st.Ended } else { $null }
-        $Lines.Add(("  Started      : {0:MMM d HH:mm}   {1}" -f $s, $(if ($e) { "finished {0:HH:mm} after {1:N0} min" -f $e, ($e - $s).TotalMinutes } else { 'running for ' + (Format-Span $s) })))
+        $done = "$($i.Res)" -notin 'RUNNING', 'STARTED'
+        $Lines.Add(("  Started      : {0:MMM d HH:mm}   {1}" -f $s, $(if ($e) { "finished {0:MMM d HH:mm} after {1:N0} min" -f $e, ($e - $s).TotalMinutes } elseif ($done) { 'ended (' + (Format-Span $s) + ' ago)' } else { 'running for ' + (Format-Span $s) })))
     }
     if ($null -ne $script:Pct) { $Lines.Add("  Progress     : $($script:Pct)%") }
     if ($i.Prog.Activity -and $i.Res -in 'RUNNING', 'STARTED', 'DONE', 'FAILED') { $Lines.Add(("  Setup step   : [{0}] {1}" -f ($i.Prog.ActivityTime -replace '^\d{4}-\d\d-\d\d ', ''), $i.Prog.Activity)) }
@@ -22816,6 +22817,7 @@ if ($Mode -eq 'Check' -and $Act -eq 'Full' -and $src -like 'media *' -and -not $
     } elseif ($isoMounted) { try { Dismount-DiskImage -ImagePath $isoMounted -ErrorAction SilentlyContinue | Out-Null } catch { } }
 }
 
+if ($Mode -eq 'Check' -and $Act -eq 'eKB' -and $src -eq 'Windows Update') { $why += $(if (Test-Src $MediaPath) { 'if Windows Update does not offer the enablement package, falls back to a full upgrade from the ISO' } else { 'Windows Update must offer the enablement package (policy can hold it back) - add -MediaPath (ISO) as a fallback' }) }
 if ($Mode -eq 'Check') { Finish 'READY' $Act (("Would upgrade $($script:FromName) to $TargetName via $Act from $src") + $(if ($why.Count) { ' | ' + ($why -join ' | ') })) 0 }
 
 # ================================================================ upgrade: enablement package (24H2 / 25H2 -> 26H2)
@@ -22849,15 +22851,26 @@ if ($Act -eq 'eKB') {
             $res = $srch.Search("IsInstalled=0 and IsHidden=0")
             $kbNum = $EkbKB -replace '\D', ''
             $hit = @($res.Updates | Where-Object { @($_.KBArticleIDs) -contains $kbNum -or "$($_.Title)" -match "version $TargetName" }) | Select-Object -First 1
-            if (-not $hit) { $state.Res = 'FAILED'; $state.Why = "Windows Update did not offer $EkbKB - pass -EkbPath (file share) or -EkbUrl"; Save-State $state; Finish 'FAILED' 'eKB' $state.Why 21 }
+            if (-not $hit) {
+                # Windows Update only offers the enablement package when update policy allows feature updates (N-central / GPO
+                # deferrals and version pins hold it back). With an ISO given, do the full upgrade instead - same end result.
+                if (Test-Src $MediaPath) {
+                    Log "Windows Update did not offer $EkbKB (feature updates held back by policy?) - falling back to a full upgrade from $MediaPath"
+                    $script:EkbFallback = $true
+                } else {
+                    $state.Res = 'FAILED'; $state.Ended = (Get-Date).ToString('s'); $state.Why = "Windows Update did not offer $EkbKB (feature updates held back by policy?) - pass -MediaPath (ISO), -EkbPath (file share) or -EkbUrl"; Save-State $state; Finish 'FAILED' 'eKB' $state.Why 21
+                }
+            } else {
             Log "found: $($hit.Title)"
             if (-not $hit.EulaAccepted) { $hit.AcceptEula() }
             $col = New-Object -ComObject Microsoft.Update.UpdateColl; [void]$col.Add($hit)
             $dl = $ses.CreateUpdateDownloader(); $dl.Updates = $col; [void]$dl.Download()
             $ins = $ses.CreateUpdateInstaller(); $ins.Updates = $col; $r = $ins.Install()
             $ok = $r.ResultCode -in 2, 3; $detail = "Windows Update result $($r.ResultCode), HResult 0x{0:X8}" -f ([int64]$r.HResult -band 0xFFFFFFFFL)
+            }
         } catch { $detail = "Windows Update error: $($_.Exception.Message)" }
     }
+  if (-not $script:EkbFallback) {
     Log $detail
     $state.Ended = (Get-Date).ToString('s')
     if ($ok) {
@@ -22867,8 +22880,19 @@ if ($Act -eq 'eKB') {
         if ($Reboot) { Start-RebootWarned $RebootDelayMinutes "the Windows 11 $TargetName update" }
         Finish 'DONE' 'eKB' $state.Why 0
     }
-    $state.Res = 'FAILED'; $state.Why = "Enablement package failed: $detail"; Save-State $state
-    Finish 'FAILED' 'eKB' $state.Why 20
+    if (Test-Src $MediaPath) {
+        Log "enablement package failed ($detail) - falling back to a full upgrade from $MediaPath"; $script:EkbFallback = $true
+    } else {
+        $state.Res = 'FAILED'; $state.Why = "Enablement package failed: $detail"; Save-State $state
+        Finish 'FAILED' 'eKB' $state.Why 20
+    }
+  }
+    if ($script:EkbFallback) {
+        $Act = 'Full'; $src = "media $MediaPath"
+        $freeGB = [math]::Round(((Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$($env:SystemDrive)'" -ErrorAction SilentlyContinue).FreeSpace) / 1GB, 1)
+        if ($freeGB -lt 25) { $state.Res = 'FAILED'; $state.Ended = (Get-Date).ToString('s'); $state.Why = "Enablement package not available and only $freeGB GB free for a full upgrade (needs 25 GB)"; Save-State $state; Finish 'BLOCKED' 'Full' $state.Why 11 }
+        Log "plan: Full from $($script:FromName) to $TargetName using $src"
+    }
 }
 
 # ================================================================ upgrade: full in-place upgrade, in the background
