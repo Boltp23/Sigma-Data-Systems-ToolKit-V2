@@ -477,17 +477,27 @@ function Invoke-FeatureUpgrade {
 }
 
 function Invoke-RemoveBlockKB {
-    Write-Title '[!] Uninstall + block (hide) a bad Windows Update KB'
-    Write-Host '  Hides the KB(s) in Windows Update, uninstalls them (DISM for combined SSU+LCU, wusa fallback),'
-    Write-Host '  and adds a one-time startup task that re-hides them after the reboot.'
-    Write-Host '  Default (blank/ALL) = all 20 Nov 2026 KBs from Sage KB 261111142308050; ones not installed are skipped.'
-    Write-Host '  ALSO set the KB(s) to Declined in N-central Patch Approvals, or N-central can push them again.' -ForegroundColor Yellow
-    $kbs = "$(Read-Default 'KB(s) to remove/block, comma separated (ALL = full Sage list)' 'ALL')"
+    Write-Title '[!] Uninstall + block a bad Windows Update KB (cumulative + hotpatch, permanent guard)'
+    Write-Host '  Hides the KB(s), uninstalls them (DISM, hotpatch match by install date, wusa fallback) and installs'
+    Write-Host '  a SYSTEM guard task that removes them again if they get re-installed (e.g. approved by mistake).'
+    Write-Host '  Guard alerts: Application log, source SigmaDataSystems, event 4100 (removed) / 4101 (could not remove).'
+    Write-Host '  Default (ALL) = all 20 Nov 2026 KBs from Sage KB 261111142308050; ones not installed are skipped.'
+    Write-Host '  Mode REMOVE-GUARD = undo (remove guard task + resume updates) once the fix ships.'
+    Write-Host '  ALSO set the KB(s) to Declined in N-central Patch Approvals.' -ForegroundColor Yellow
+    $kbs = "$(Read-Default 'KB(s) to remove/block, comma separated (ALL = full Sage list, REMOVE-GUARD = undo)' 'ALL')"
+    $p = [ordered]@{}
+    if ($kbs -match '^(?i)remove-guard$') {
+        if (-not (Confirm-Change 'Remove the KB block guard and resume Windows updates on this PC.')) { return }
+        $p.RemoveGuard = $true; $p.ResumeUpdates = $true
+        Invoke-Tool 'Remove-BlockWindowsUpdateKB' $p | Out-Null; return
+    }
     $list = @($kbs -split '[,; ]+' | Where-Object { $_ })
     if (-not $list) { Write-Host '  No KB entered.' -ForegroundColor Yellow; return }
-    $p = [ordered]@{}
-    if (-not ($list.Count -eq 1 -and $list[0] -eq 'ALL')) { $p.KB = $list }
+    if (-not ($list.Count -eq 1 -and $list[0] -match '^(?i)all$')) { $p.KB = $list }
     $p.HideOnly = Read-YesNo 'Hide/block only (do NOT uninstall)?' $false
+    $p.NoGuard  = -not (Read-YesNo 'Install the permanent guard (re-removes the KBs if they come back)?' $true)
+    $days = "$(Read-Default 'Also pause ALL Windows updates for how many days? (0 = no, max 35)' '0')"
+    if ($days -match '^\d+$' -and [int]$days -gt 0) { $p.PauseUpdatesDays = [Math]::Min(35, [int]$days) }
     if (-not $p.HideOnly) { $p.Reboot = Read-YesNo 'Reboot automatically when done (60 s warning)?' $false }
     if (-not (Confirm-Change "Remove/block $(if ($p.KB) { $list -join ', ' } else { 'all Sage-listed Nov 2026 KBs' }) on this PC.")) { return }
     Invoke-Tool 'Remove-BlockWindowsUpdateKB' $p | Out-Null
@@ -4155,7 +4165,7 @@ $Script:Menu = @(
     @{               Text = '[!] Reset Windows Update components (Windows 10/11)';                           Action = { Invoke-WUReset } }
     @{               Text = '[!] Repair Windows Update (Windows Server 2016+)';                              Action = { Invoke-WURepairServer } }
     @{               Text = '[!] System file repair (DISM RestoreHealth + SFC)';                             Action = { Invoke-SfcDism } }
-    @{               Text = '[!] Uninstall + block (hide) a bad Windows Update KB (e.g. Sage 50 crash)';    Action = { Invoke-RemoveBlockKB } }
+    @{               Text = '[!] Uninstall + block a bad Windows Update KB (guard, hotpatch, e.g. Sage 50)';    Action = { Invoke-RemoveBlockKB } }
     @{               Text = '[!] Windows 11 feature upgrade to 26H2 (check / upgrade / status)';             Action = { Invoke-FeatureUpgrade } }
     @{ Test='safe'; Text = 'Windows 11 upgrade troubleshooter (status, SetupDiag, logs...)';                Action = { Invoke-Win11Troubleshooter } }
     @{ Test='net';  Text = 'Microsoft SetupDiag - why did an upgrade fail? (downloads from Microsoft)';     Action = { Invoke-SetupDiag } }
@@ -26196,34 +26206,58 @@ try {
 $Script:Payloads['Remove-BlockWindowsUpdateKB'] = @'
 <#
 .SYNOPSIS
-    Uninstalls one or more Windows Update KBs and blocks (hides) them so Windows Update won't reinstall them.
+    Uninstalls problem Windows Update KBs (cumulative AND hotpatch) and keeps them blocked,
+    even if they are later approved by mistake in N-central or Windows Update.
 
 .DESCRIPTION
     Sigma Data Systems Inc. - universal script (no client/machine-specific values).
-    1. Hides each KB in Windows Update (WUA "IsHidden") so it isn't offered again.
-    2. Uninstalls the KB: DISM package removal first (works for combined SSU+LCU
-       cumulative updates that wusa can't remove), wusa.exe as fallback.
-    3. Registers a one-time SYSTEM startup task that re-hides the KB after the
-       reboot (an uninstalled update often only shows up as "available" again
-       after the restart), then deletes itself.
 
-    NOTE: If N-central Patch Management has the KB approved, N-central can still push it.
-    Also set the KB to "Declined" in N-central Patch Approvals for these devices.
+    1. HIDE     Hides each KB in Windows Update (WUA IsHidden) so it isn't offered.
+    2. REMOVE   Uninstalls each installed KB:
+                  - DISM package removal (works for combined SSU+LCU cumulative updates)
+                  - Hotpatch: if no package names the KB, the hotpatch package is found by
+                    matching its DISM install date to the KB's install date (one match only,
+                    otherwise it lists the candidates and changes nothing)
+                  - wusa.exe as a last fallback
+    3. GUARD    (default ON) Installs a permanent SYSTEM scheduled task "SDSI-KBBlock-Guard" that
+                re-runs this script in guard mode:
+                  - 5 minutes after every startup
+                  - every 2 hours
+                  - right after ANY Windows update installs (System event 19 / Setup event 2)
+                If a blocked KB shows up (e.g. accidentally approved in N-central), the guard
+                removes it again and writes an Application event (source "SigmaDataSystems"):
+                  4100 Warning  blocked KB was found and removed (reboot pending)
+                  4101 Error    blocked KB was found but could NOT be removed (once per day)
+                  4102 Info     guard installed / updated
+                  4103 Info     guard removed
+                Add an N-central Event Log service for Application source SigmaDataSystems,
+                IDs 4100/4101, to get alerted.
+    4. PAUSE    (optional) -PauseUpdatesDays 1-35 pauses ALL Windows updates (quality + feature)
+                via the Windows Update pause settings. -ResumeUpdates removes the pause.
+
+    NOTE: Still set the KBs to "Declined" in N-central Patch Approvals - the guard is the safety net.
 
 .PARAMETER KB
-    KB IDs to remove/block. Default = all 20 November 2026 updates listed in Sage KB 261111142308050 (Win10/11/Server, all versions).
-    KBs not installed on the machine are skipped.
-
-.PARAMETER Reboot
-    Reboot automatically when done (60s delay).
-
-.PARAMETER HideOnly
-    Only hide/block the KBs; don't uninstall anything.
+    KBs to remove/block. Default = all 20 November 2026 updates listed in
+    Sage KB 261111142308050 (Win10/11/Server, all versions). KBs not installed are skipped.
+.PARAMETER Reboot          Reboot automatically when removal needs it (60 s warning).
+.PARAMETER HideOnly        Only hide the KBs; don't uninstall anything (guard still installed unless -NoGuard).
+.PARAMETER NoGuard         Don't install the permanent guard task.
+.PARAMETER RemoveGuard     Remove the guard task + its files and stop (use when Sage/Microsoft fix ships).
+.PARAMETER SkipHotpatch    Don't try the install-date match for hotpatch packages.
+.PARAMETER PauseUpdatesDays  Pause all Windows updates for 1-35 days.
+.PARAMETER ResumeUpdates   Clear a pause set by this script (or the Settings app).
+.PARAMETER GuardRun        Internal - used by the guard task.
 
 .EXAMPLE
-    .\Remove-BlockWindowsUpdateKB.ps1
+    .\Remove-BlockWindowsUpdateKB.ps1                         # remove + hide + install guard
 .EXAMPLE
-    .\Remove-BlockWindowsUpdateKB.ps1 -KB KB5132061 -Reboot
+    .\Remove-BlockWindowsUpdateKB.ps1 -Reboot -PauseUpdatesDays 14
+.EXAMPLE
+    .\Remove-BlockWindowsUpdateKB.ps1 -RemoveGuard -ResumeUpdates   # undo when the fix is out
+.NOTES
+    Prepared by Sigma Data Systems Inc.   Version 2026.11.18.2
+    Run as Administrator or SYSTEM. Exit code 0 = ran, 1 = not admin.
 #>
 [CmdletBinding()]
 param(
@@ -26235,91 +26269,154 @@ param(
         'KB5131091','KB5131098','KB5135883','KB5132688','KB5127936'
     ),
     [switch]$Reboot,
-    [switch]$HideOnly
+    [switch]$HideOnly,
+    [switch]$NoGuard,
+    [switch]$RemoveGuard,
+    [switch]$SkipHotpatch,
+    [ValidateRange(0,35)][int]$PauseUpdatesDays = 0,
+    [switch]$ResumeUpdates,
+    [switch]$GuardRun
 )
 
 $ErrorActionPreference = 'Continue'
-$LogDir = 'C:\Windows\Temp\SigmaDataSystems'
+$LogDir    = 'C:\Windows\Temp\SigmaDataSystems'
+$GuardDir  = Join-Path $env:ProgramData 'SigmaDataSystems\KBBlock'
+$GuardTask = 'SDSI-KBBlock-Guard'
+$KBFile    = Join-Path $GuardDir 'blocked-kbs.txt'
+$StateFile = Join-Path $GuardDir 'state.json'
+$EvSource  = 'SigmaDataSystems'
 New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
-$Log = Join-Path $LogDir ("Remove-BlockKB_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+$Log = Join-Path $LogDir ("{0}_{1:yyyyMMdd_HHmmss}.log" -f $(if ($GuardRun) { 'KBBlock-Guard' } else { 'Remove-BlockKB' }), (Get-Date))
 
 function Write-Log([string]$Msg, [string]$Level = 'INFO') {
     $line = "{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}" -f (Get-Date), $Level, $Msg
     Write-Host $line
     Add-Content -Path $Log -Value $line
 }
+function Write-Ev([int]$Id, [string]$Type, [string]$Msg) {
+    try {
+        if (-not [Diagnostics.EventLog]::SourceExists($EvSource)) { New-EventLog -LogName Application -Source $EvSource -ErrorAction Stop }
+        Write-EventLog -LogName Application -Source $EvSource -EventId $Id -EntryType $Type -Message $Msg -ErrorAction Stop
+    } catch { Write-Log "Could not write event $Id : $($_.Exception.Message)" 'WARN' }
+}
 
 # --- Admin check ---
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) { Write-Log 'Must run as Administrator / SYSTEM.' 'ERROR'; exit 1 }
 
-# Normalize KB list (accept "5132061" or "KB5132061")
-$KB = $KB | ForEach-Object { 'KB' + ($_ -replace '^(?i)KB','').Trim() } | Select-Object -Unique
-$KBNums = $KB | ForEach-Object { $_ -replace '^KB','' }
-Write-Log ("Target KBs: {0}  | Computer: {1}  | OS build: {2}" -f ($KB -join ', '), $env:COMPUTERNAME, [Environment]::OSVersion.Version)
+# =========================================================
+# Pause / resume Windows Update
+# =========================================================
+$UX = 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings'
+$PauseNames = 'PauseUpdatesStartTime','PauseUpdatesExpiryTime','PauseQualityUpdatesStartTime','PauseQualityUpdatesEndTime','PauseFeatureUpdatesStartTime','PauseFeatureUpdatesEndTime'
+if ($ResumeUpdates) {
+    foreach ($n in $PauseNames) { Remove-ItemProperty -Path $UX -Name $n -ErrorAction SilentlyContinue }
+    Write-Log 'Windows Update pause cleared (updates resume).'
+}
+if ($PauseUpdatesDays -gt 0) {
+    New-Item -Path $UX -Force | Out-Null
+    $start = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $end   = (Get-Date).AddDays($PauseUpdatesDays).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    foreach ($n in 'PauseUpdatesStartTime','PauseQualityUpdatesStartTime','PauseFeatureUpdatesStartTime') { Set-ItemProperty -Path $UX -Name $n -Value $start -Type String }
+    foreach ($n in 'PauseUpdatesExpiryTime','PauseQualityUpdatesEndTime','PauseFeatureUpdatesEndTime')  { Set-ItemProperty -Path $UX -Name $n -Value $end   -Type String }
+    Write-Log "Windows Update paused for $PauseUpdatesDays day(s) (until $end UTC). Note: an RMM patch engine may not honor this - the guard is the backstop."
+}
 
 # =========================================================
-# 1. HIDE (block) via Windows Update Agent
+# Remove guard
+# =========================================================
+if ($RemoveGuard) {
+    Unregister-ScheduledTask -TaskName $GuardTask -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName 'SDSI-ReHide-BlockedKBs' -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item -Path $GuardDir -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Log "Guard task '$GuardTask' and files removed. Blocked KBs can install again (unhide them in Windows Update if needed)."
+    Write-Ev 4103 Information "Sigma Data Systems KB block guard removed from $env:COMPUTERNAME."
+    exit 0
+}
+
+# Guard mode reads its KB list from disk
+if ($GuardRun -and (Test-Path $KBFile)) { $KB = Get-Content $KBFile | Where-Object { $_.Trim() } }
+
+# Normalize KB list (accept "5132061" or "KB5132061")
+$KB = @($KB | ForEach-Object { 'KB' + ($_ -replace '^(?i)KB','').Trim() } | Select-Object -Unique)
+$KBNums = @($KB | ForEach-Object { $_ -replace '^KB','' })
+Write-Log ("{0}Target KBs: {1}  | Computer: {2}  | OS build: {3}" -f $(if ($GuardRun) { 'GUARD RUN - ' } else { '' }), ($KB -join ', '), $env:COMPUTERNAME, [Environment]::OSVersion.Version)
+
+# =========================================================
+# 1. HIDE via Windows Update Agent
 # =========================================================
 function Hide-KBs([string[]]$Nums) {
     $hidden = 0
     try {
-        $session  = New-Object -ComObject Microsoft.Update.Session
-        $searcher = $session.CreateUpdateSearcher()
-        # Search installed + not-installed, not already hidden
+        $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
         foreach ($crit in @("IsInstalled=0 and IsHidden=0", "IsInstalled=1 and IsHidden=0")) {
             try { $res = $searcher.Search($crit) } catch { Write-Log "WUA search '$crit' failed: $($_.Exception.Message)" 'WARN'; continue }
             foreach ($u in $res.Updates) {
-                $match = $false
-                foreach ($id in $u.KBArticleIDs) { if ($Nums -contains $id) { $match = $true } }
-                if ($match) {
+                if (@($u.KBArticleIDs | Where-Object { $Nums -contains $_ }).Count) {
                     try { $u.IsHidden = $true; $hidden++; Write-Log "Hidden in Windows Update: $($u.Title)" }
                     catch { Write-Log "Could not hide '$($u.Title)': $($_.Exception.Message)" 'WARN' }
                 }
             }
         }
     } catch { Write-Log "Windows Update Agent unavailable: $($_.Exception.Message)" 'WARN' }
-    if ($hidden -eq 0) { Write-Log 'No matching updates offered by Windows Update right now (will retry after reboot).' }
-    return $hidden
+    if ($hidden -eq 0) { Write-Log 'No matching updates offered by Windows Update right now (installed updates are handled by removal + guard).' }
 }
-
 Write-Log '--- Step 1: Hiding KBs in Windows Update ---'
-Hide-KBs $KBNums | Out-Null
+Hide-KBs $KBNums
 
 # =========================================================
-# 2. UNINSTALL
+# 2. REMOVE
 # =========================================================
 $rebootNeeded = $false
-$script:PermanentKBs = @()
+$PermanentKBs = @(); $RemovedKBs = @(); $FailedKBs = @()
 if (-not $HideOnly) {
     Write-Log '--- Step 2: Uninstalling KBs ---'
-
-    # Candidate DISM packages (cumulative rollups + KB-named packages)
     $pkgTable = dism.exe /online /get-packages /format:table /english
-    # RollupFix = normal cumulative update, HotPatch = Windows 11 hotpatch cumulative update
-    $candidates = $pkgTable | Where-Object { $_ -match 'Package_for_RollupFix|HotPatch|Package_for_KB|Package_for_DotNetRollup' } |
-                  ForEach-Object { ($_ -split '\|')[0].Trim() } | Where-Object { $_ }
+    $candidates = @($pkgTable | Where-Object { $_ -match 'Package_for_RollupFix|HotPatch|Package_for_KB|Package_for_DotNetRollup' } |
+                    ForEach-Object { ($_ -split '\|')[0].Trim() } | Where-Object { $_ })
+    $wPkgs = $null
+    try { $wPkgs = @(Get-WindowsPackage -Online -ErrorAction Stop | Where-Object { $_.PackageName -match 'RollupFix|HotPatch' -and "$($_.PackageState)" -match 'Installed' }) }
+    catch { Write-Log "Get-WindowsPackage unavailable: $($_.Exception.Message)" 'WARN' }
+    $claimed = @()   # packages already matched to a KB in this run
 
     foreach ($k in $KB) {
         $num = $k -replace '^KB',''
         $installed = Get-HotFix -Id $k -ErrorAction SilentlyContinue
-        if (-not $installed) { Write-Log "$k is not installed - skipping uninstall."; continue }
+        if (-not $installed) { if (-not $GuardRun) { Write-Log "$k is not installed - skipping uninstall." }; continue }
         Write-Log "$k is installed (InstalledOn: $($installed.InstalledOn))"
 
-        # Find the DISM package(s) whose package info references this KB number
+        # a) package info names the KB
         $pkgs = @()
         foreach ($p in $candidates) {
+            if ($claimed -contains $p) { continue }
             if ($p -match "KB$num") { $pkgs += $p; continue }
             if ($p -match 'RollupFix|HotPatch') {
                 $info = dism.exe /online /get-packageinfo /packagename:$p /english
                 if ($info -match "kbid=$num|/$num\b|KB$num|help/$num") { $pkgs += $p }
             }
         }
-        $pkgs = $pkgs | Select-Object -Unique
-        if (-not $pkgs) {
-            Write-Log "No DISM package matched $k. Cumulative/hotpatch packages on this PC (for manual removal):" 'WARN'
-            foreach ($p in ($candidates | Where-Object { $_ -match 'RollupFix|HotPatch' })) { Write-Log "    $p" 'WARN' }
+        $pkgs = @($pkgs | Select-Object -Unique)
+
+        # b) hotpatch: match by install date
+        if (-not $pkgs.Count -and -not $SkipHotpatch -and $wPkgs -and $installed.InstalledOn) {
+            $day = ([datetime]$installed.InstalledOn).Date
+            $byDate = @($wPkgs | Where-Object {
+                $claimed -notcontains $_.PackageName -and $_.InstallTime -and
+                ([datetime]$_.InstallTime).Date -ge $day.AddDays(-1) -and ([datetime]$_.InstallTime).Date -le $day.AddDays(1) })
+            if ($byDate.Count -eq 1) {
+                $pkgs = @($byDate[0].PackageName)
+                Write-Log "No package names $k - matched by install date ($($byDate[0].InstallTime)): $($pkgs[0]) (hotpatch)"
+            } elseif ($byDate.Count -gt 1) {
+                Write-Log "No package names $k and $($byDate.Count) packages were installed around $($day.ToShortDateString()) - not guessing:" 'WARN'
+                foreach ($b in $byDate) { Write-Log "    $($b.PackageName)  installed $($b.InstallTime)" 'WARN' }
+            }
         }
+        if (-not $pkgs.Count) {
+            Write-Log "No DISM package matched $k. Cumulative/hotpatch packages on this PC:" 'WARN'
+            if ($wPkgs) { foreach ($w in $wPkgs) { Write-Log "    $($w.PackageName)  installed $($w.InstallTime)" 'WARN' } }
+            else { foreach ($p in ($candidates | Where-Object { $_ -match 'RollupFix|HotPatch' })) { Write-Log "    $p" 'WARN' } }
+        }
+        $claimed += $pkgs
 
         $removed = $false; $permanent = $false
         foreach ($p in $pkgs) {
@@ -26327,62 +26424,90 @@ if (-not $HideOnly) {
             $out = dism.exe /online /remove-package /packagename:$p /quiet /norestart /english
             $code = $LASTEXITCODE
             $out | Add-Content -Path $Log
-            if ($code -eq 0 -or $code -eq 3010) {
-                Write-Log "DISM removed $p (exit $code)"; $removed = $true; $rebootNeeded = $true
-            } elseif ($code -eq -2146498523) {
-                Write-Log "DISM: $p is PERMANENT (0x800F0825) - Windows will not allow it to be uninstalled." 'ERROR'
-                $permanent = $true
-            } else { Write-Log "DISM failed on $p (exit $code)" 'WARN' }
+            if ($code -eq 0 -or $code -eq 3010) { Write-Log "DISM removed $p (exit $code)"; $removed = $true; $rebootNeeded = $true }
+            elseif ($code -eq -2146498523) { Write-Log "DISM: $p is PERMANENT (0x800F0825) - Windows will not allow it to be uninstalled." 'ERROR'; $permanent = $true }
+            else { Write-Log "DISM failed on $p (exit $code)" 'WARN' }
         }
         if ($permanent) {
-            Write-Log "$k cannot be removed. Options: System Restore to a point before the update, or an in-place repair install from older Windows media." 'ERROR'
-            $script:PermanentKBs += $k
-            continue
+            Write-Log "$k cannot be removed. Reboot and retry (a just-installed update can be locked until restart); otherwise System Restore or an in-place repair install from older media." 'ERROR'
+            $PermanentKBs += $k; continue
         }
-
         if (-not $removed) {
             Write-Log "Trying wusa.exe /uninstall for $k"
             $proc = Start-Process -FilePath wusa.exe -ArgumentList "/uninstall /kb:$num /quiet /norestart" -Wait -PassThru
             switch ($proc.ExitCode) {
-                0       { Write-Log "wusa removed $k"; $rebootNeeded = $true }
-                3010    { Write-Log "wusa removed $k (reboot required)"; $rebootNeeded = $true }
+                0       { Write-Log "wusa removed $k"; $removed = $true; $rebootNeeded = $true }
+                3010    { Write-Log "wusa removed $k (reboot required)"; $removed = $true; $rebootNeeded = $true }
                 2359303 { Write-Log "wusa: $k not installed" }
-                87      { Write-Log "wusa can't remove $k (exit 87 - combined SSU/LCU or hotpatch package). See the DISM package list above, or roll back via System Restore." 'ERROR' }
-                default { Write-Log "wusa failed for $k (exit $($proc.ExitCode)). May be permanent/SSU-only - remove manually or roll back." 'ERROR' }
+                87      { Write-Log "wusa can't remove $k (exit 87 - combined SSU/LCU or hotpatch package)." 'ERROR' }
+                default { Write-Log "wusa failed for $k (exit $($proc.ExitCode))." 'ERROR' }
             }
         }
+        if ($removed) { $RemovedKBs += $k } elseif ($proc.ExitCode -ne 2359303) { $FailedKBs += $k }
     }
 }
 
 # =========================================================
-# 3. Re-hide after reboot (one-time startup task)
+# 3. GUARD (permanent) - or one-time re-hide if -NoGuard
 # =========================================================
-Write-Log '--- Step 3: Scheduling post-reboot re-hide ---'
-$taskName = 'SDSI-ReHide-BlockedKBs'
-$scriptDir = 'C:\ProgramData\SigmaDataSystems'
-New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
-$reHide = Join-Path $scriptDir 'ReHide-BlockedKBs.ps1'
-$numsLiteral = ($KBNums | ForEach-Object { "'$_'" }) -join ','
-@"
-Start-Sleep -Seconds 120
-`$nums = @($numsLiteral)
-`$log = 'C:\Windows\Temp\SigmaDataSystems\ReHide-BlockedKBs.log'
-try {
-  `$s = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
-  `$r = `$s.Search('IsInstalled=0 and IsHidden=0')
-  foreach (`$u in `$r.Updates) { foreach (`$id in `$u.KBArticleIDs) { if (`$nums -contains `$id) { `$u.IsHidden = `$true; Add-Content `$log "`$(Get-Date) Hidden: `$(`$u.Title)" } } }
-} catch { Add-Content `$log "`$(Get-Date) Error: `$(`$_.Exception.Message)" }
-Unregister-ScheduledTask -TaskName '$taskName' -Confirm:`$false -ErrorAction SilentlyContinue
-Remove-Item -Path '$reHide' -Force -ErrorAction SilentlyContinue
-"@ | Set-Content -Path $reHide -Encoding UTF8
+if (-not $GuardRun) {
+    Unregister-ScheduledTask -TaskName 'SDSI-ReHide-BlockedKBs' -Confirm:$false -ErrorAction SilentlyContinue   # replaced by the guard
+    if (-not $NoGuard) {
+        Write-Log '--- Step 3: Installing permanent block guard ---'
+        try {
+            New-Item -ItemType Directory -Path $GuardDir -Force | Out-Null
+            $self = Join-Path $GuardDir 'Remove-BlockWindowsUpdateKB.ps1'
+            if ($PSCommandPath -and ($PSCommandPath -ne $self)) { Copy-Item -Path $PSCommandPath -Destination $self -Force }
+            Set-Content -Path $KBFile -Value $KB -Encoding ASCII
 
-try {
-    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$reHide`""
-    $trigger   = New-ScheduledTaskTrigger -AtStartup
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
-    Write-Log "Registered one-time startup task '$taskName'."
-} catch { Write-Log "Could not register startup task: $($_.Exception.Message)" 'WARN' }
+            $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$self`" -GuardRun"
+            $tBoot = New-ScheduledTaskTrigger -AtStartup; $tBoot.Delay = 'PT5M'
+            $tRep  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(15) -RepetitionInterval (New-TimeSpan -Hours 2)
+            $triggers = @($tBoot, $tRep)
+            try {   # run right after any update installs
+                $cls = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler
+                $ev = New-CimInstance -CimClass $cls -ClientOnly
+                $ev.Enabled = $true
+                $ev.Delay = 'PT2M'
+                $ev.Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-WindowsUpdateClient''] and EventID=19]]</Select><Select Path="Setup">*[System[Provider[@Name=''Microsoft-Windows-Servicing''] and EventID=2]]</Select></Query></QueryList>'
+                $triggers += $ev
+            } catch { Write-Log "Event trigger not available on this OS - startup + 2-hour checks only: $($_.Exception.Message)" 'WARN' }
+            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+            Register-ScheduledTask -TaskName $GuardTask -Description 'Sigma Data Systems Inc. - removes/hides blocked Windows Update KBs if they get installed. Remove with -RemoveGuard.' `
+                -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
+            Write-Log "Guard task '$GuardTask' installed (startup +5 min, every 2 h, after any update install). Files: $GuardDir"
+            Write-Ev 4102 Information ("Sigma Data Systems KB block guard installed on {0}. Blocked KBs: {1}" -f $env:COMPUTERNAME, ($KB -join ', '))
+        } catch { Write-Log "Could not install guard task: $($_.Exception.Message)" 'ERROR' }
+    } else {
+        Write-Log '--- Step 3: -NoGuard - guard not installed (KBs can come back if approved in N-central) ---' 'WARN'
+    }
+}
+
+# =========================================================
+# Guard-mode events (for N-central alerting)
+# =========================================================
+if ($GuardRun) {
+    if ($RemovedKBs) {
+        Write-Ev 4100 Warning ("Blocked Windows update(s) were installed and have been REMOVED on {0}: {1}. A reboot is required. Check N-central Patch Approvals - these should be Declined." -f $env:COMPUTERNAME, ($RemovedKBs -join ', '))
+    }
+    $stuck = @($PermanentKBs + $FailedKBs | Select-Object -Unique)
+    if ($stuck) {
+        $state = @{}
+        try { if (Test-Path $StateFile) { (Get-Content $StateFile -Raw | ConvertFrom-Json).psobject.Properties | ForEach-Object { $state[$_.Name] = $_.Value } } } catch {}
+        $last = $null; if ($state['Last4101']) { $last = [datetime]$state['Last4101'] }
+        if (-not $last -or ((Get-Date) - $last).TotalHours -ge 24) {
+            Write-Ev 4101 Error ("Blocked Windows update(s) are installed on {0} and could NOT be removed: {1}. Manual action needed (reboot + rerun, System Restore, or repair install)." -f $env:COMPUTERNAME, ($stuck -join ', '))
+            $state['Last4101'] = (Get-Date).ToString('o')
+            try { $state | ConvertTo-Json | Set-Content $StateFile } catch {}
+        }
+    }
+    # keep guard logs from piling up
+    Get-ChildItem $LogDir -Filter 'KBBlock-Guard_*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 30 | Remove-Item -Force -ErrorAction SilentlyContinue
+    if (-not $RemovedKBs -and -not $stuck) { Write-Log 'Guard check clean - no blocked KBs installed.' }
+    if ($rebootNeeded) { Write-Log 'Reboot required to finish removal (guard does not reboot on its own).' 'WARN' }
+    exit 0
+}
 
 # =========================================================
 # Summary
@@ -26390,10 +26515,10 @@ try {
 Write-Log '--- Summary ---'
 foreach ($k in $KB) {
     $still = Get-HotFix -Id $k -ErrorAction SilentlyContinue
-    Write-Log ("{0}: {1}" -f $k, $(if ($still) { 'still listed as installed (normal until reboot if removal succeeded)' } else { 'not installed' }))
+    $state = if ($RemovedKBs -contains $k) { 'REMOVED (still listed until reboot)' } elseif ($PermanentKBs -contains $k) { 'PERMANENT - not removable' } elseif ($FailedKBs -contains $k) { 'installed - removal FAILED' } elseif ($still) { 'installed' } else { 'not installed' }
+    Write-Log ("{0}: {1}" -f $k, $state)
 }
-if ($script:PermanentKBs) {
-    Write-Log ("Permanent (not removable): {0}" -f ($script:PermanentKBs -join ', ')) 'ERROR'
+if ($PermanentKBs) {
     try {
         $rp = Get-ComputerRestorePoint -ErrorAction Stop | Sort-Object SequenceNumber
         if ($rp) {
@@ -26402,7 +26527,7 @@ if ($script:PermanentKBs) {
         } else { Write-Log 'No System Restore points found - rollback would need an in-place repair install from older media.' 'WARN' }
     } catch { Write-Log "Could not read restore points (System Protection may be off): $($_.Exception.Message)" 'WARN' }
 }
-Write-Log 'Reminder: also set these KBs to "Declined" in N-central Patch Approvals or N-central may reinstall them.'
+Write-Log 'Reminder: also set these KBs to "Declined" in N-central Patch Approvals.'
 Write-Log "Log: $Log"
 
 if ($rebootNeeded) {

@@ -136,7 +136,7 @@ Any option marked `[!]` stops and asks you to **type `YES`** (capitals) before i
 17. [!] Reset Windows Update components (Windows 10/11)
 18. [!] Repair Windows Update (Windows Server 2016+)
 19. [!] System file repair (DISM RestoreHealth + SFC)
-20. [!] Uninstall + block (hide) a bad Windows Update KB (e.g. Sage 50 crash)
+20. [!] Uninstall + block a bad Windows Update KB (guard, hotpatch, e.g. Sage 50)
 21. [!] Windows 11 feature upgrade to 26H2 (check / upgrade / status)
 22. Windows 11 upgrade troubleshooter (status, SetupDiag, logs...)
 23. Microsoft SetupDiag - why did an upgrade fail? (downloads from Microsoft)
