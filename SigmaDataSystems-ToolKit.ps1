@@ -480,15 +480,16 @@ function Invoke-RemoveBlockKB {
     Write-Title '[!] Uninstall + block (hide) a bad Windows Update KB'
     Write-Host '  Hides the KB(s) in Windows Update, uninstalls them (DISM for combined SSU+LCU, wusa fallback),'
     Write-Host '  and adds a one-time startup task that re-hides them after the reboot.'
-    Write-Host '  Default = Nov 2026 updates that crash Sage 50 (KB5132061, KB5132059, KB5131096).'
+    Write-Host '  Default (blank/ALL) = all 20 Nov 2026 KBs from Sage KB 261111142308050; ones not installed are skipped.'
     Write-Host '  ALSO set the KB(s) to Declined in N-central Patch Approvals, or N-central can push them again.' -ForegroundColor Yellow
-    $kbs = "$(Read-Default 'KB(s) to remove/block, comma separated' 'KB5132061,KB5132059,KB5131096')"
+    $kbs = "$(Read-Default 'KB(s) to remove/block, comma separated (ALL = full Sage list)' 'ALL')"
     $list = @($kbs -split '[,; ]+' | Where-Object { $_ })
     if (-not $list) { Write-Host '  No KB entered.' -ForegroundColor Yellow; return }
-    $p = [ordered]@{ KB = $list }
+    $p = [ordered]@{}
+    if (-not ($list.Count -eq 1 -and $list[0] -eq 'ALL')) { $p.KB = $list }
     $p.HideOnly = Read-YesNo 'Hide/block only (do NOT uninstall)?' $false
     if (-not $p.HideOnly) { $p.Reboot = Read-YesNo 'Reboot automatically when done (60 s warning)?' $false }
-    if (-not (Confirm-Change "Remove/block $($list -join ', ') on this PC.")) { return }
+    if (-not (Confirm-Change "Remove/block $(if ($p.KB) { $list -join ', ' } else { 'all Sage-listed Nov 2026 KBs' }) on this PC.")) { return }
     Invoke-Tool 'Remove-BlockWindowsUpdateKB' $p | Out-Null
 }
 
@@ -26210,7 +26211,8 @@ $Script:Payloads['Remove-BlockWindowsUpdateKB'] = @'
     Also set the KB to "Declined" in N-central Patch Approvals for these devices.
 
 .PARAMETER KB
-    KB IDs to remove/block. Default = the November 2026 security updates that crash Sage 50.
+    KB IDs to remove/block. Default = all 20 November 2026 updates listed in Sage KB 261111142308050 (Win10/11/Server, all versions).
+    KBs not installed on the machine are skipped.
 
 .PARAMETER Reboot
     Reboot automatically when done (60s delay).
@@ -26225,7 +26227,13 @@ $Script:Payloads['Remove-BlockWindowsUpdateKB'] = @'
 #>
 [CmdletBinding()]
 param(
-    [string[]]$KB = @('KB5132061','KB5132059','KB5131096'),
+    # Sage KB 261111142308050 (Sage 50 crashes after Nov 10 2026 Windows security updates) - all OS versions
+    [string[]]$KB = @(
+        'KB5131087','KB5132061','KB5132059','KB5132043','KB5131096',
+        'KB5131085','KB5131291','KB5131083','KB5131090','KB5131080',
+        'KB5131077','KB5131079','KB5132060','KB5132058','KB5131097',
+        'KB5131091','KB5131098','KB5135883','KB5132688','KB5127936'
+    ),
     [switch]$Reboot,
     [switch]$HideOnly
 )
@@ -26237,7 +26245,7 @@ $Log = Join-Path $LogDir ("Remove-BlockKB_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date)
 
 function Write-Log([string]$Msg, [string]$Level = 'INFO') {
     $line = "{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}" -f (Get-Date), $Level, $Msg
-    Write-Output $line
+    Write-Host $line
     Add-Content -Path $Log -Value $line
 }
 
@@ -26282,12 +26290,14 @@ Hide-KBs $KBNums | Out-Null
 # 2. UNINSTALL
 # =========================================================
 $rebootNeeded = $false
+$script:PermanentKBs = @()
 if (-not $HideOnly) {
     Write-Log '--- Step 2: Uninstalling KBs ---'
 
     # Candidate DISM packages (cumulative rollups + KB-named packages)
     $pkgTable = dism.exe /online /get-packages /format:table /english
-    $candidates = $pkgTable | Where-Object { $_ -match 'Package_for_RollupFix|Package_for_KB|Package_for_DotNetRollup' } |
+    # RollupFix = normal cumulative update, HotPatch = Windows 11 hotpatch cumulative update
+    $candidates = $pkgTable | Where-Object { $_ -match 'Package_for_RollupFix|HotPatch|Package_for_KB|Package_for_DotNetRollup' } |
                   ForEach-Object { ($_ -split '\|')[0].Trim() } | Where-Object { $_ }
 
     foreach ($k in $KB) {
@@ -26300,14 +26310,18 @@ if (-not $HideOnly) {
         $pkgs = @()
         foreach ($p in $candidates) {
             if ($p -match "KB$num") { $pkgs += $p; continue }
-            if ($p -match 'RollupFix') {
+            if ($p -match 'RollupFix|HotPatch') {
                 $info = dism.exe /online /get-packageinfo /packagename:$p /english
-                if ($info -match "kbid=$num|/$num\b|KB$num") { $pkgs += $p }
+                if ($info -match "kbid=$num|/$num\b|KB$num|help/$num") { $pkgs += $p }
             }
         }
         $pkgs = $pkgs | Select-Object -Unique
+        if (-not $pkgs) {
+            Write-Log "No DISM package matched $k. Cumulative/hotpatch packages on this PC (for manual removal):" 'WARN'
+            foreach ($p in ($candidates | Where-Object { $_ -match 'RollupFix|HotPatch' })) { Write-Log "    $p" 'WARN' }
+        }
 
-        $removed = $false
+        $removed = $false; $permanent = $false
         foreach ($p in $pkgs) {
             Write-Log "DISM removing package: $p"
             $out = dism.exe /online /remove-package /packagename:$p /quiet /norestart /english
@@ -26315,7 +26329,15 @@ if (-not $HideOnly) {
             $out | Add-Content -Path $Log
             if ($code -eq 0 -or $code -eq 3010) {
                 Write-Log "DISM removed $p (exit $code)"; $removed = $true; $rebootNeeded = $true
+            } elseif ($code -eq -2146498523) {
+                Write-Log "DISM: $p is PERMANENT (0x800F0825) - Windows will not allow it to be uninstalled." 'ERROR'
+                $permanent = $true
             } else { Write-Log "DISM failed on $p (exit $code)" 'WARN' }
+        }
+        if ($permanent) {
+            Write-Log "$k cannot be removed. Options: System Restore to a point before the update, or an in-place repair install from older Windows media." 'ERROR'
+            $script:PermanentKBs += $k
+            continue
         }
 
         if (-not $removed) {
@@ -26325,6 +26347,7 @@ if (-not $HideOnly) {
                 0       { Write-Log "wusa removed $k"; $rebootNeeded = $true }
                 3010    { Write-Log "wusa removed $k (reboot required)"; $rebootNeeded = $true }
                 2359303 { Write-Log "wusa: $k not installed" }
+                87      { Write-Log "wusa can't remove $k (exit 87 - combined SSU/LCU or hotpatch package). See the DISM package list above, or roll back via System Restore." 'ERROR' }
                 default { Write-Log "wusa failed for $k (exit $($proc.ExitCode)). May be permanent/SSU-only - remove manually or roll back." 'ERROR' }
             }
         }
@@ -26368,6 +26391,16 @@ Write-Log '--- Summary ---'
 foreach ($k in $KB) {
     $still = Get-HotFix -Id $k -ErrorAction SilentlyContinue
     Write-Log ("{0}: {1}" -f $k, $(if ($still) { 'still listed as installed (normal until reboot if removal succeeded)' } else { 'not installed' }))
+}
+if ($script:PermanentKBs) {
+    Write-Log ("Permanent (not removable): {0}" -f ($script:PermanentKBs -join ', ')) 'ERROR'
+    try {
+        $rp = Get-ComputerRestorePoint -ErrorAction Stop | Sort-Object SequenceNumber
+        if ($rp) {
+            Write-Log 'System Restore points on this PC (pick one dated BEFORE the update was installed):'
+            foreach ($r in $rp) { Write-Log ("    #{0}  {1}  {2}" -f $r.SequenceNumber, ([Management.ManagementDateTimeConverter]::ToDateTime($r.CreationTime)), $r.Description) }
+        } else { Write-Log 'No System Restore points found - rollback would need an in-place repair install from older media.' 'WARN' }
+    } catch { Write-Log "Could not read restore points (System Protection may be off): $($_.Exception.Message)" 'WARN' }
 }
 Write-Log 'Reminder: also set these KBs to "Declined" in N-central Patch Approvals or N-central may reinstall them.'
 Write-Log "Log: $Log"
