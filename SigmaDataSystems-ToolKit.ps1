@@ -22234,6 +22234,8 @@ $Script:Payloads['Invoke-SDSIFeatureUpgrade'] = @'
 
     Where the update comes from (first one that works):
       Enablement package : -EkbPath (file share or local .msu)  ->  -EkbUrl  ->  Windows Update (searches for KB5121794)
+                           -> if none of those works (Windows Update often doesn't offer it when N-central / GPO holds
+                              feature updates back) and -MediaPath is given: the full upgrade from the ISO instead.
       Full upgrade       : -MediaPath (file share: the Windows 11 ISO from microsoft.com/software-download/windows11, or
                            a folder with the ISO's files)  ->  the Windows 11 Installation Assistant from Microsoft.
       The share must be readable by the computer account ("Domain Computers" Read) - N-central runs as SYSTEM.
